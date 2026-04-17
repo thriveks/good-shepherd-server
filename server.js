@@ -4,6 +4,7 @@ const { Pool } = require("pg");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MAX_EVENTS = 50;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
 app.use(express.json());
 
@@ -28,6 +29,16 @@ async function initializeDatabase() {
       timestamp TIMESTAMPTZ NOT NULL
     )
   `);
+}
+
+function isAuthorizedWebhook(req) {
+  if (!WEBHOOK_SECRET) {
+    return true;
+  }
+
+  const incomingSecret = req.header("x-webhook-secret");
+
+  return incomingSecret && incomingSecret === WEBHOOK_SECRET;
 }
 
 app.get("/", async (req, res) => {
@@ -73,6 +84,14 @@ app.get("/events", async (req, res) => {
 app.post("/webhook", async (req, res) => {
   try {
     const { randomUUID } = require("crypto");
+
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized webhook request"
+      });
+    }
+
     const { sourceName, residentName, message, alertLevel, timeText } = req.body || {};
 
     if (!sourceName || !residentName || !message || !alertLevel) {
