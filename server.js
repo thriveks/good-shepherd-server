@@ -29,6 +29,35 @@ async function initializeDatabase() {
       timestamp TIMESTAMPTZ NOT NULL
     )
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS device_mappings (
+      source_key TEXT PRIMARY KEY,
+      source_name TEXT NOT NULL,
+      resident_name TEXT NOT NULL,
+      default_alert_level TEXT NOT NULL,
+      default_time_text TEXT NOT NULL
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO device_mappings (
+      source_key,
+      source_name,
+      resident_name,
+      default_alert_level,
+      default_time_text
+    )
+    VALUES
+      (
+        'thrive-office-wyze',
+        'Office Wyze Camera',
+        'Mary Thompson',
+        'Caution',
+        'Office Motion Event'
+      )
+    ON CONFLICT (source_key) DO NOTHING
+  `);
 }
 
 function isAuthorizedWebhook(req) {
@@ -37,8 +66,26 @@ function isAuthorizedWebhook(req) {
   }
 
   const incomingSecret = req.header("x-webhook-secret");
-
   return incomingSecret && incomingSecret === WEBHOOK_SECRET;
+}
+
+async function getDeviceMapping(sourceKey) {
+  const result = await pool.query(
+    `
+    SELECT
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      resident_name AS "residentName",
+      default_alert_level AS "defaultAlertLevel",
+      default_time_text AS "defaultTimeText"
+    FROM device_mappings
+    WHERE source_key = $1
+    LIMIT 1
+    `,
+    [sourceKey]
+  );
+
+  return result.rows[0] || null;
 }
 
 app.get("/", async (req, res) => {
@@ -81,6 +128,35 @@ app.get("/events", async (req, res) => {
   }
 });
 
+app.get("/device-mappings", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        source_key AS "sourceKey",
+        source_name AS "sourceName",
+        resident_name AS "residentName",
+        default_alert_level AS "defaultAlertLevel",
+        default_time_text AS "defaultTimeText"
+      FROM device_mappings
+      ORDER BY source_key ASC
+      `
+    );
+
+    res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      mappings: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch device mappings:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch device mappings"
+    });
+  }
+});
+
 app.post("/webhook", async (req, res) => {
   try {
     const { randomUUID } = require("crypto");
@@ -92,22 +168,69 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    const { sourceName, residentName, message, alertLevel, timeText } = req.body || {};
+    const {
+      sourceKey,
+      sourceName,
+      residentName,
+      message,
+      alertLevel,
+      timeText
+    } = req.body || {};
 
-    if (!sourceName || !residentName || !message || !alertLevel) {
+    if (!message) {
       return res.status(400).json({
         success: false,
-        error: "Missing required fields: sourceName, residentName, message, alertLevel"
+        error: "Missing required field: message"
+      });
+    }
+
+    let resolvedSourceName = sourceName ? String(sourceName).trim() : "";
+    let resolvedResidentName = residentName ? String(residentName).trim() : "";
+    let resolvedAlertLevel = alertLevel ? String(alertLevel).trim() : "";
+    let resolvedTimeText = timeText ? String(timeText).trim() : "";
+    let resolvedSourceKey = sourceKey ? String(sourceKey).trim() : "";
+
+    if (resolvedSourceKey) {
+      const mapping = await getDeviceMapping(resolvedSourceKey);
+
+      if (!mapping) {
+        return res.status(400).json({
+          success: false,
+          error: `Unknown sourceKey: ${resolvedSourceKey}`
+        });
+      }
+
+      if (!resolvedSourceName) {
+        resolvedSourceName = mapping.sourceName;
+      }
+
+      if (!resolvedResidentName) {
+        resolvedResidentName = mapping.residentName;
+      }
+
+      if (!resolvedAlertLevel) {
+        resolvedAlertLevel = mapping.defaultAlertLevel;
+      }
+
+      if (!resolvedTimeText) {
+        resolvedTimeText = mapping.defaultTimeText;
+      }
+    }
+
+    if (!resolvedSourceName || !resolvedResidentName || !resolvedAlertLevel) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields after mapping resolution: sourceName, residentName, alertLevel"
       });
     }
 
     const event = {
       id: randomUUID(),
-      sourceName: String(sourceName).trim(),
-      residentName: String(residentName).trim(),
+      sourceName: resolvedSourceName,
+      residentName: resolvedResidentName,
       message: String(message).trim(),
-      alertLevel: String(alertLevel).trim(),
-      timeText: String(timeText || "Webhook Event").trim(),
+      alertLevel: resolvedAlertLevel,
+      timeText: resolvedTimeText || "Webhook Event",
       timestamp: new Date().toISOString()
     };
 
