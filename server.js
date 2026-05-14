@@ -100,6 +100,10 @@ function isAuthorizedWebhook(req) {
   return incomingSecret && incomingSecret === WEBHOOK_SECRET;
 }
 
+function cleanText(value) {
+  return value ? String(value).trim() : "";
+}
+
 async function getDeviceMapping(sourceKey) {
   const result = await pool.query(
     `
@@ -119,6 +123,31 @@ async function getDeviceMapping(sourceKey) {
   return result.rows[0] || null;
 }
 
+async function getNodeById(nodeId) {
+  const result = await pool.query(
+    `
+    SELECT
+      node_id AS "nodeId",
+      node_name AS "nodeName",
+      location_name AS "locationName",
+      status,
+      local_ip AS "localIp",
+      local_config_port AS "localConfigPort",
+      camera_count AS "cameraCount",
+      camera_summary AS "cameraSummary",
+      software_version AS "softwareVersion",
+      first_seen_at AS "firstSeenAt",
+      last_seen_at AS "lastSeenAt"
+    FROM nodes
+    WHERE node_id = $1
+    LIMIT 1
+    `,
+    [nodeId]
+  );
+
+  return result.rows[0] || null;
+}
+
 async function upsertNodeFromRegistration({
   nodeId,
   nodeName,
@@ -129,22 +158,22 @@ async function upsertNodeFromRegistration({
   cameraSummary,
   softwareVersion
 }) {
-  const resolvedNodeId = nodeId ? String(nodeId).trim() : "";
+  const resolvedNodeId = cleanText(nodeId);
 
   if (!resolvedNodeId) {
     throw new Error("Missing required field: nodeId");
   }
 
-  const resolvedNodeName = nodeName ? String(nodeName).trim() : "Good Shepherd Local Node";
-  const resolvedLocationName = locationName ? String(locationName).trim() : "Unassigned Location";
+  const resolvedNodeName = cleanText(nodeName) || "Good Shepherd Local Node";
+  const resolvedLocationName = cleanText(locationName) || "Unassigned Location";
   const resolvedStatus =
     resolvedLocationName === "Unassigned Location" ? "Pending Setup" : "Active";
 
-  const resolvedLocalIp = localIp ? String(localIp).trim() : null;
+  const resolvedLocalIp = cleanText(localIp) || null;
   const resolvedLocalConfigPort = localConfigPort ? Number(localConfigPort) : null;
   const resolvedCameraCount = Number.isFinite(Number(cameraCount)) ? Number(cameraCount) : 0;
   const resolvedCameraSummary = Array.isArray(cameraSummary) ? cameraSummary : [];
-  const resolvedSoftwareVersion = softwareVersion ? String(softwareVersion).trim() : null;
+  const resolvedSoftwareVersion = cleanText(softwareVersion) || null;
 
   const result = await pool.query(
     `
@@ -209,7 +238,7 @@ async function upsertNodeFromRegistration({
 }
 
 async function touchNodeFromWebhook(nodeId) {
-  const resolvedNodeId = nodeId ? String(nodeId).trim() : "";
+  const resolvedNodeId = cleanText(nodeId);
 
   if (!resolvedNodeId) {
     return null;
@@ -354,6 +383,134 @@ app.post("/nodes/register", async (req, res) => {
   }
 });
 
+app.patch("/nodes/:nodeId", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized node update request"
+      });
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const existingNode = await getNodeById(nodeId);
+
+    if (!existingNode) {
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    const requestedNodeName = cleanText(req.body?.nodeName);
+    const requestedLocationName = cleanText(req.body?.locationName);
+    const requestedStatus = cleanText(req.body?.status);
+
+    const nextNodeName = requestedNodeName || existingNode.nodeName || "Good Shepherd Local Node";
+    const nextLocationName = requestedLocationName || existingNode.locationName || "Unassigned Location";
+    const nextStatus =
+      requestedStatus ||
+      (nextLocationName === "Unassigned Location" ? "Pending Setup" : "Active");
+
+    const result = await pool.query(
+      `
+      UPDATE nodes
+      SET
+        node_name = $2,
+        location_name = $3,
+        status = $4,
+        last_seen_at = NOW()
+      WHERE node_id = $1
+      RETURNING
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName",
+        status,
+        local_ip AS "localIp",
+        local_config_port AS "localConfigPort",
+        camera_count AS "cameraCount",
+        camera_summary AS "cameraSummary",
+        software_version AS "softwareVersion",
+        first_seen_at AS "firstSeenAt",
+        last_seen_at AS "lastSeenAt"
+      `,
+      [nodeId, nextNodeName, nextLocationName, nextStatus]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Node updated",
+      node: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Node update failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.delete("/nodes/:nodeId", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized node delete request"
+      });
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      DELETE FROM nodes
+      WHERE node_id = $1
+      RETURNING
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName",
+        status
+      `,
+      [nodeId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Node deleted",
+      node: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Node delete failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.get("/device-mappings", async (req, res) => {
   try {
     const result = await pool.query(
@@ -412,14 +569,14 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    const resolvedNodeId = nodeId ? String(nodeId).trim() : "";
-    const resolvedLocationName = locationName ? String(locationName).trim() : "";
-    const resolvedSourceKey = sourceKey ? String(sourceKey).trim() : "";
+    const resolvedNodeId = cleanText(nodeId);
+    const resolvedLocationName = cleanText(locationName);
+    const resolvedSourceKey = cleanText(sourceKey);
 
-    let resolvedSourceName = sourceName ? String(sourceName).trim() : "";
-    let resolvedResidentName = residentName ? String(residentName).trim() : "";
-    let resolvedAlertLevel = alertLevel ? String(alertLevel).trim() : "";
-    let resolvedTimeText = timeText ? String(timeText).trim() : "";
+    let resolvedSourceName = cleanText(sourceName);
+    let resolvedResidentName = cleanText(residentName);
+    let resolvedAlertLevel = cleanText(alertLevel);
+    let resolvedTimeText = cleanText(timeText);
 
     if (resolvedSourceKey) {
       const mapping = await getDeviceMapping(resolvedSourceKey);
