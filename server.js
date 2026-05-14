@@ -193,7 +193,12 @@ async function upsertNodeFromRegistration({
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW(), NOW())
     ON CONFLICT (node_id)
     DO UPDATE SET
-      node_name = EXCLUDED.node_name,
+      node_name = CASE
+        WHEN nodes.node_name IS NULL OR nodes.node_name = '' THEN EXCLUDED.node_name
+        WHEN nodes.node_name = 'Good Shepherd Local Node' THEN EXCLUDED.node_name
+        WHEN EXCLUDED.node_name = 'Good Shepherd Local Node' THEN nodes.node_name
+        ELSE nodes.node_name
+      END,
       location_name = CASE
         WHEN nodes.location_name = 'Unassigned Location' THEN EXCLUDED.location_name
         ELSE nodes.location_name
