@@ -46,6 +46,22 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS nodes (
+      node_id TEXT PRIMARY KEY,
+      node_name TEXT,
+      location_name TEXT NOT NULL DEFAULT 'Unassigned Location',
+      status TEXT NOT NULL DEFAULT 'Pending Setup',
+      local_ip TEXT,
+      local_config_port INTEGER,
+      camera_count INTEGER NOT NULL DEFAULT 0,
+      camera_summary JSONB,
+      software_version TEXT,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS device_mappings (
       source_key TEXT PRIMARY KEY,
       source_name TEXT NOT NULL,
@@ -103,6 +119,95 @@ async function getDeviceMapping(sourceKey) {
   return result.rows[0] || null;
 }
 
+async function upsertNodeFromPayload({
+  nodeId,
+  nodeName,
+  locationName,
+  localIp,
+  localConfigPort,
+  cameraCount,
+  cameraSummary,
+  softwareVersion
+}) {
+  const resolvedNodeId = nodeId ? String(nodeId).trim() : "";
+
+  if (!resolvedNodeId) {
+    throw new Error("Missing required field: nodeId");
+  }
+
+  const resolvedNodeName = nodeName ? String(nodeName).trim() : "Good Shepherd Local Node";
+  const resolvedLocationName = locationName ? String(locationName).trim() : "Unassigned Location";
+  const resolvedStatus =
+    resolvedLocationName === "Unassigned Location" ? "Pending Setup" : "Active";
+
+  const resolvedLocalIp = localIp ? String(localIp).trim() : null;
+  const resolvedLocalConfigPort = localConfigPort ? Number(localConfigPort) : null;
+  const resolvedCameraCount = Number.isFinite(Number(cameraCount)) ? Number(cameraCount) : 0;
+  const resolvedCameraSummary = Array.isArray(cameraSummary) ? cameraSummary : [];
+  const resolvedSoftwareVersion = softwareVersion ? String(softwareVersion).trim() : null;
+
+  const result = await pool.query(
+    `
+    INSERT INTO nodes (
+      node_id,
+      node_name,
+      location_name,
+      status,
+      local_ip,
+      local_config_port,
+      camera_count,
+      camera_summary,
+      software_version,
+      first_seen_at,
+      last_seen_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW(), NOW())
+    ON CONFLICT (node_id)
+    DO UPDATE SET
+      node_name = EXCLUDED.node_name,
+      location_name = CASE
+        WHEN nodes.location_name = 'Unassigned Location' THEN EXCLUDED.location_name
+        ELSE nodes.location_name
+      END,
+      status = CASE
+        WHEN nodes.location_name = 'Unassigned Location' THEN EXCLUDED.status
+        ELSE nodes.status
+      END,
+      local_ip = EXCLUDED.local_ip,
+      local_config_port = EXCLUDED.local_config_port,
+      camera_count = EXCLUDED.camera_count,
+      camera_summary = EXCLUDED.camera_summary,
+      software_version = EXCLUDED.software_version,
+      last_seen_at = NOW()
+    RETURNING
+      node_id AS "nodeId",
+      node_name AS "nodeName",
+      location_name AS "locationName",
+      status,
+      local_ip AS "localIp",
+      local_config_port AS "localConfigPort",
+      camera_count AS "cameraCount",
+      camera_summary AS "cameraSummary",
+      software_version AS "softwareVersion",
+      first_seen_at AS "firstSeenAt",
+      last_seen_at AS "lastSeenAt"
+    `,
+    [
+      resolvedNodeId,
+      resolvedNodeName,
+      resolvedLocationName,
+      resolvedStatus,
+      resolvedLocalIp,
+      resolvedLocalConfigPort,
+      resolvedCameraCount,
+      JSON.stringify(resolvedCameraSummary),
+      resolvedSoftwareVersion
+    ]
+  );
+
+  return result.rows[0];
+}
+
 app.get("/", async (req, res) => {
   res.json({
     success: true,
@@ -142,6 +247,69 @@ app.get("/events", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to fetch events"
+    });
+  }
+});
+
+app.get("/nodes", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName",
+        status,
+        local_ip AS "localIp",
+        local_config_port AS "localConfigPort",
+        camera_count AS "cameraCount",
+        camera_summary AS "cameraSummary",
+        software_version AS "softwareVersion",
+        first_seen_at AS "firstSeenAt",
+        last_seen_at AS "lastSeenAt"
+      FROM nodes
+      ORDER BY last_seen_at DESC
+      `
+    );
+
+    res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      nodes: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch nodes:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch nodes"
+    });
+  }
+});
+
+app.post("/nodes/register", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized node registration request"
+      });
+    }
+
+    const node = await upsertNodeFromPayload(req.body || {});
+
+    console.log("Node registered/updated:");
+    console.log(JSON.stringify(node, null, 2));
+
+    return res.status(200).json({
+      success: true,
+      message: "Node registered/updated",
+      node
+    });
+  } catch (error) {
+    console.error("Node registration failed:", error);
+    return res.status(400).json({
+      success: false,
+      error: error.message
     });
   }
 });
@@ -239,6 +407,16 @@ app.post("/webhook", async (req, res) => {
       return res.status(400).json({
         success: false,
         error: "Missing required fields after mapping resolution: sourceName, residentName, alertLevel"
+      });
+    }
+
+    if (resolvedNodeId) {
+      await upsertNodeFromPayload({
+        nodeId: resolvedNodeId,
+        locationName: resolvedLocationName || "Unassigned Location",
+        cameraCount: 0,
+        cameraSummary: [],
+        softwareVersion: null
       });
     }
 
