@@ -119,7 +119,7 @@ async function getDeviceMapping(sourceKey) {
   return result.rows[0] || null;
 }
 
-async function upsertNodeFromPayload({
+async function upsertNodeFromRegistration({
   nodeId,
   nodeName,
   locationName,
@@ -203,6 +203,46 @@ async function upsertNodeFromPayload({
       JSON.stringify(resolvedCameraSummary),
       resolvedSoftwareVersion
     ]
+  );
+
+  return result.rows[0];
+}
+
+async function touchNodeFromWebhook(nodeId) {
+  const resolvedNodeId = nodeId ? String(nodeId).trim() : "";
+
+  if (!resolvedNodeId) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+    INSERT INTO nodes (
+      node_id,
+      node_name,
+      location_name,
+      status,
+      first_seen_at,
+      last_seen_at
+    )
+    VALUES ($1, 'Good Shepherd Local Node', 'Unassigned Location', 'Pending Setup', NOW(), NOW())
+    ON CONFLICT (node_id)
+    DO UPDATE SET
+      last_seen_at = NOW()
+    RETURNING
+      node_id AS "nodeId",
+      node_name AS "nodeName",
+      location_name AS "locationName",
+      status,
+      local_ip AS "localIp",
+      local_config_port AS "localConfigPort",
+      camera_count AS "cameraCount",
+      camera_summary AS "cameraSummary",
+      software_version AS "softwareVersion",
+      first_seen_at AS "firstSeenAt",
+      last_seen_at AS "lastSeenAt"
+    `,
+    [resolvedNodeId]
   );
 
   return result.rows[0];
@@ -295,7 +335,7 @@ app.post("/nodes/register", async (req, res) => {
       });
     }
 
-    const node = await upsertNodeFromPayload(req.body || {});
+    const node = await upsertNodeFromRegistration(req.body || {});
 
     console.log("Node registered/updated:");
     console.log(JSON.stringify(node, null, 2));
@@ -411,13 +451,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (resolvedNodeId) {
-      await upsertNodeFromPayload({
-        nodeId: resolvedNodeId,
-        locationName: resolvedLocationName || "Unassigned Location",
-        cameraCount: 0,
-        cameraSummary: [],
-        softwareVersion: null
-      });
+      await touchNodeFromWebhook(resolvedNodeId);
     }
 
     const event = {
