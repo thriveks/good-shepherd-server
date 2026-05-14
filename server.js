@@ -31,6 +31,21 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    ALTER TABLE webhook_events
+    ADD COLUMN IF NOT EXISTS node_id TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE webhook_events
+    ADD COLUMN IF NOT EXISTS location_name TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE webhook_events
+    ADD COLUMN IF NOT EXISTS source_key TEXT
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS device_mappings (
       source_key TEXT PRIMARY KEY,
       source_name TEXT NOT NULL,
@@ -101,6 +116,9 @@ app.get("/events", async (req, res) => {
       `
       SELECT
         id,
+        node_id AS "nodeId",
+        location_name AS "locationName",
+        source_key AS "sourceKey",
         source_name AS "sourceName",
         resident_name AS "residentName",
         message,
@@ -169,6 +187,8 @@ app.post("/webhook", async (req, res) => {
     }
 
     const {
+      nodeId,
+      locationName,
       sourceKey,
       sourceName,
       residentName,
@@ -184,36 +204,34 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
+    const resolvedNodeId = nodeId ? String(nodeId).trim() : "";
+    const resolvedLocationName = locationName ? String(locationName).trim() : "";
+    const resolvedSourceKey = sourceKey ? String(sourceKey).trim() : "";
+
     let resolvedSourceName = sourceName ? String(sourceName).trim() : "";
     let resolvedResidentName = residentName ? String(residentName).trim() : "";
     let resolvedAlertLevel = alertLevel ? String(alertLevel).trim() : "";
     let resolvedTimeText = timeText ? String(timeText).trim() : "";
-    let resolvedSourceKey = sourceKey ? String(sourceKey).trim() : "";
 
     if (resolvedSourceKey) {
       const mapping = await getDeviceMapping(resolvedSourceKey);
 
-      if (!mapping) {
-        return res.status(400).json({
-          success: false,
-          error: `Unknown sourceKey: ${resolvedSourceKey}`
-        });
-      }
+      if (mapping) {
+        if (!resolvedSourceName) {
+          resolvedSourceName = mapping.sourceName;
+        }
 
-      if (!resolvedSourceName) {
-        resolvedSourceName = mapping.sourceName;
-      }
+        if (!resolvedResidentName) {
+          resolvedResidentName = mapping.residentName;
+        }
 
-      if (!resolvedResidentName) {
-        resolvedResidentName = mapping.residentName;
-      }
+        if (!resolvedAlertLevel) {
+          resolvedAlertLevel = mapping.defaultAlertLevel;
+        }
 
-      if (!resolvedAlertLevel) {
-        resolvedAlertLevel = mapping.defaultAlertLevel;
-      }
-
-      if (!resolvedTimeText) {
-        resolvedTimeText = mapping.defaultTimeText;
+        if (!resolvedTimeText) {
+          resolvedTimeText = mapping.defaultTimeText;
+        }
       }
     }
 
@@ -226,6 +244,9 @@ app.post("/webhook", async (req, res) => {
 
     const event = {
       id: randomUUID(),
+      nodeId: resolvedNodeId || null,
+      locationName: resolvedLocationName || null,
+      sourceKey: resolvedSourceKey || null,
       sourceName: resolvedSourceName,
       residentName: resolvedResidentName,
       message: String(message).trim(),
@@ -238,6 +259,9 @@ app.post("/webhook", async (req, res) => {
       `
       INSERT INTO webhook_events (
         id,
+        node_id,
+        location_name,
+        source_key,
         source_name,
         resident_name,
         message,
@@ -245,10 +269,13 @@ app.post("/webhook", async (req, res) => {
         time_text,
         timestamp
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       `,
       [
         event.id,
+        event.nodeId,
+        event.locationName,
+        event.sourceKey,
         event.sourceName,
         event.residentName,
         event.message,
