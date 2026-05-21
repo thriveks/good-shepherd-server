@@ -62,6 +62,21 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    ALTER TABLE nodes
+    ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE nodes
+    ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE nodes
+    ADD COLUMN IF NOT EXISTS archived_reason TEXT
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS device_mappings (
       source_key TEXT PRIMARY KEY,
       source_name TEXT NOT NULL,
@@ -104,6 +119,11 @@ function cleanText(value) {
   return value ? String(value).trim() : "";
 }
 
+function parseBooleanQuery(value) {
+  const cleanValue = cleanText(value).toLowerCase();
+  return cleanValue === "true" || cleanValue === "1" || cleanValue === "yes";
+}
+
 async function getDeviceMapping(sourceKey) {
   const result = await pool.query(
     `
@@ -137,7 +157,10 @@ async function getNodeById(nodeId) {
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
       first_seen_at AS "firstSeenAt",
-      last_seen_at AS "lastSeenAt"
+      last_seen_at AS "lastSeenAt",
+      is_archived AS "isArchived",
+      archived_at AS "archivedAt",
+      archived_reason AS "archivedReason"
     FROM nodes
     WHERE node_id = $1
     LIMIT 1
@@ -188,9 +211,12 @@ async function upsertNodeFromRegistration({
       camera_summary,
       software_version,
       first_seen_at,
-      last_seen_at
+      last_seen_at,
+      is_archived,
+      archived_at,
+      archived_reason
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW(), NOW())
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW(), NOW(), FALSE, NULL, NULL)
     ON CONFLICT (node_id)
     DO UPDATE SET
       node_name = CASE
@@ -224,7 +250,10 @@ async function upsertNodeFromRegistration({
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
       first_seen_at AS "firstSeenAt",
-      last_seen_at AS "lastSeenAt"
+      last_seen_at AS "lastSeenAt",
+      is_archived AS "isArchived",
+      archived_at AS "archivedAt",
+      archived_reason AS "archivedReason"
     `,
     [
       resolvedNodeId,
@@ -257,9 +286,12 @@ async function touchNodeFromWebhook(nodeId) {
       location_name,
       status,
       first_seen_at,
-      last_seen_at
+      last_seen_at,
+      is_archived,
+      archived_at,
+      archived_reason
     )
-    VALUES ($1, 'Good Shepherd Local Node', 'Unassigned Location', 'Pending Setup', NOW(), NOW())
+    VALUES ($1, 'Good Shepherd Local Node', 'Unassigned Location', 'Pending Setup', NOW(), NOW(), FALSE, NULL, NULL)
     ON CONFLICT (node_id)
     DO UPDATE SET
       last_seen_at = NOW()
@@ -274,7 +306,10 @@ async function touchNodeFromWebhook(nodeId) {
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
       first_seen_at AS "firstSeenAt",
-      last_seen_at AS "lastSeenAt"
+      last_seen_at AS "lastSeenAt",
+      is_archived AS "isArchived",
+      archived_at AS "archivedAt",
+      archived_reason AS "archivedReason"
     `,
     [resolvedNodeId]
   );
@@ -327,6 +362,8 @@ app.get("/events", async (req, res) => {
 
 app.get("/nodes", async (req, res) => {
   try {
+    const includeArchived = parseBooleanQuery(req.query.includeArchived);
+
     const result = await pool.query(
       `
       SELECT
@@ -340,14 +377,20 @@ app.get("/nodes", async (req, res) => {
         camera_summary AS "cameraSummary",
         software_version AS "softwareVersion",
         first_seen_at AS "firstSeenAt",
-        last_seen_at AS "lastSeenAt"
+        last_seen_at AS "lastSeenAt",
+        is_archived AS "isArchived",
+        archived_at AS "archivedAt",
+        archived_reason AS "archivedReason"
       FROM nodes
-      ORDER BY last_seen_at DESC
-      `
+      WHERE ($1::boolean = TRUE OR is_archived = FALSE)
+      ORDER BY is_archived ASC, last_seen_at DESC
+      `,
+      [includeArchived]
     );
 
     res.status(200).json({
       success: true,
+      includeArchived,
       count: result.rows.length,
       nodes: result.rows
     });
@@ -445,7 +488,10 @@ app.patch("/nodes/:nodeId", async (req, res) => {
         camera_summary AS "cameraSummary",
         software_version AS "softwareVersion",
         first_seen_at AS "firstSeenAt",
-        last_seen_at AS "lastSeenAt"
+        last_seen_at AS "lastSeenAt",
+        is_archived AS "isArchived",
+        archived_at AS "archivedAt",
+        archived_reason AS "archivedReason"
       `,
       [nodeId, nextNodeName, nextLocationName, nextStatus]
     );
@@ -457,6 +503,151 @@ app.patch("/nodes/:nodeId", async (req, res) => {
     });
   } catch (error) {
     console.error("Node update failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.patch("/nodes/:nodeId/archive", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized node archive request"
+      });
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+    const archivedReason = cleanText(req.body?.reason) || "Archived from Good Shepherd admin";
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE nodes
+      SET
+        is_archived = TRUE,
+        archived_at = NOW(),
+        archived_reason = $2,
+        status = CASE
+          WHEN status = 'Archived' THEN status
+          ELSE 'Archived'
+        END,
+        last_seen_at = NOW()
+      WHERE node_id = $1
+      RETURNING
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName",
+        status,
+        local_ip AS "localIp",
+        local_config_port AS "localConfigPort",
+        camera_count AS "cameraCount",
+        camera_summary AS "cameraSummary",
+        software_version AS "softwareVersion",
+        first_seen_at AS "firstSeenAt",
+        last_seen_at AS "lastSeenAt",
+        is_archived AS "isArchived",
+        archived_at AS "archivedAt",
+        archived_reason AS "archivedReason"
+      `,
+      [nodeId, archivedReason]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Node archived",
+      node: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Node archive failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.patch("/nodes/:nodeId/restore", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized node restore request"
+      });
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const existingNode = await getNodeById(nodeId);
+
+    if (!existingNode) {
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    const restoredStatus =
+      existingNode.locationName === "Unassigned Location" ? "Pending Setup" : "Active";
+
+    const result = await pool.query(
+      `
+      UPDATE nodes
+      SET
+        is_archived = FALSE,
+        archived_at = NULL,
+        archived_reason = NULL,
+        status = $2,
+        last_seen_at = NOW()
+      WHERE node_id = $1
+      RETURNING
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName",
+        status,
+        local_ip AS "localIp",
+        local_config_port AS "localConfigPort",
+        camera_count AS "cameraCount",
+        camera_summary AS "cameraSummary",
+        software_version AS "softwareVersion",
+        first_seen_at AS "firstSeenAt",
+        last_seen_at AS "lastSeenAt",
+        is_archived AS "isArchived",
+        archived_at AS "archivedAt",
+        archived_reason AS "archivedReason"
+      `,
+      [nodeId, restoredStatus]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Node restored",
+      node: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Node restore failed:", error);
     return res.status(500).json({
       success: false,
       error: error.message
@@ -490,7 +681,10 @@ app.delete("/nodes/:nodeId", async (req, res) => {
         node_id AS "nodeId",
         node_name AS "nodeName",
         location_name AS "locationName",
-        status
+        status,
+        is_archived AS "isArchived",
+        archived_at AS "archivedAt",
+        archived_reason AS "archivedReason"
       `,
       [nodeId]
     );
