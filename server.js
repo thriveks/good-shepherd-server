@@ -46,6 +46,21 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    ALTER TABLE webhook_events
+    ADD COLUMN IF NOT EXISTS acknowledged BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE webhook_events
+    ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE webhook_events
+    ADD COLUMN IF NOT EXISTS resolution_note TEXT
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
       node_id TEXT PRIMARY KEY,
       node_name TEXT,
@@ -317,6 +332,26 @@ async function touchNodeFromWebhook(nodeId) {
   return result.rows[0];
 }
 
+function eventSelectSQL() {
+  return `
+    SELECT
+      id,
+      node_id AS "nodeId",
+      location_name AS "locationName",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      resident_name AS "residentName",
+      message,
+      alert_level AS "alertLevel",
+      time_text AS "timeText",
+      timestamp,
+      acknowledged AS "isAcknowledged",
+      acknowledged_at AS "acknowledgedAt",
+      resolution_note AS "resolutionNote"
+    FROM webhook_events
+  `;
+}
+
 app.get("/", async (req, res) => {
   res.json({
     success: true,
@@ -326,9 +361,68 @@ app.get("/", async (req, res) => {
 
 app.get("/events", async (req, res) => {
   try {
+    const includeAcknowledged = parseBooleanQuery(req.query.includeAcknowledged);
+
     const result = await pool.query(
       `
-      SELECT
+      ${eventSelectSQL()}
+      WHERE ($2::boolean = TRUE OR acknowledged = FALSE)
+      ORDER BY timestamp DESC
+      LIMIT $1
+      `,
+      [MAX_EVENTS, includeAcknowledged]
+    );
+
+    res.status(200).json({
+      success: true,
+      includeAcknowledged,
+      count: result.rows.length,
+      events: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch events:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch events"
+    });
+  }
+});
+
+app.patch("/events/:eventId/acknowledge", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized event acknowledgment request"
+      });
+    }
+
+    const eventId = cleanText(req.params.eventId);
+    const resolutionNote = cleanText(req.body?.resolutionNote);
+
+    if (!eventId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing eventId"
+      });
+    }
+
+    if (!resolutionNote) {
+      return res.status(400).json({
+        success: false,
+        error: "Resolution note is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE webhook_events
+      SET
+        acknowledged = TRUE,
+        acknowledged_at = NOW(),
+        resolution_note = $2
+      WHERE id = $1
+      RETURNING
         id,
         node_id AS "nodeId",
         location_name AS "locationName",
@@ -338,24 +432,31 @@ app.get("/events", async (req, res) => {
         message,
         alert_level AS "alertLevel",
         time_text AS "timeText",
-        timestamp
-      FROM webhook_events
-      ORDER BY timestamp DESC
-      LIMIT $1
+        timestamp,
+        acknowledged AS "isAcknowledged",
+        acknowledged_at AS "acknowledgedAt",
+        resolution_note AS "resolutionNote"
       `,
-      [MAX_EVENTS]
+      [eventId, resolutionNote]
     );
 
-    res.status(200).json({
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        success: false,
+        error: `Event not found: ${eventId}`
+      });
+    }
+
+    return res.status(200).json({
       success: true,
-      count: result.rows.length,
-      events: result.rows
+      message: "Event acknowledged",
+      event: result.rows[0]
     });
   } catch (error) {
-    console.error("Failed to fetch events:", error);
-    res.status(500).json({
+    console.error("Event acknowledgment failed:", error);
+    return res.status(500).json({
       success: false,
-      error: "Failed to fetch events"
+      error: error.message
     });
   }
 });
@@ -835,9 +936,12 @@ app.post("/webhook", async (req, res) => {
         message,
         alert_level,
         time_text,
-        timestamp
+        timestamp,
+        acknowledged,
+        acknowledged_at,
+        resolution_note
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, NULL, NULL)
       `,
       [
         event.id,
