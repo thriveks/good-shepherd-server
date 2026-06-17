@@ -1,5 +1,6 @@
 const express = require("express");
 const { Pool } = require("pg");
+const { randomUUID } = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -102,6 +103,99 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS residents (
+      id UUID PRIMARY KEY,
+      name TEXT NOT NULL,
+      location TEXT NOT NULL DEFAULT 'Unassigned location',
+      alert_level TEXT NOT NULL DEFAULT 'Normal',
+      last_activity TEXT NOT NULL DEFAULT 'Resident added. Waiting for first device event.',
+      active_warnings INTEGER NOT NULL DEFAULT 0,
+      status_text TEXT NOT NULL DEFAULT 'Monitoring setup pending',
+      is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cameras (
+      id UUID PRIMARY KEY,
+      source_key TEXT NOT NULL,
+      source_name TEXT NOT NULL,
+      resident_id UUID REFERENCES residents(id) ON DELETE SET NULL,
+      resident_name TEXT NOT NULL DEFAULT 'Unassigned',
+      rtsp_url TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      assigned_node_id TEXT,
+      is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE cameras
+    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE cameras
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE cameras
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE cameras
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE residents
+    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE residents
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE residents
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE residents
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS residents_is_deleted_idx
+    ON residents (is_deleted)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS cameras_is_deleted_idx
+    ON cameras (is_deleted)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS cameras_resident_id_idx
+    ON cameras (resident_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS cameras_assigned_node_id_idx
+    ON cameras (assigned_node_id)
+  `);
+
+  await pool.query(`
     INSERT INTO device_mappings (
       source_key,
       source_name,
@@ -130,13 +224,73 @@ function isAuthorizedWebhook(req) {
   return incomingSecret && incomingSecret === WEBHOOK_SECRET;
 }
 
+function requireAuthorizedRequest(req, res) {
+  if (!isAuthorizedWebhook(req)) {
+    res.status(401).json({
+      success: false,
+      error: "Unauthorized request"
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
 function cleanText(value) {
   return value ? String(value).trim() : "";
+}
+
+function cleanOptionalText(value) {
+  const cleaned = cleanText(value);
+  return cleaned || null;
 }
 
 function parseBooleanQuery(value) {
   const cleanValue = cleanText(value).toLowerCase();
   return cleanValue === "true" || cleanValue === "1" || cleanValue === "yes";
+}
+
+function normalizeAlertLevel(value) {
+  const cleanValue = cleanText(value);
+
+  if (!cleanValue) {
+    return "Normal";
+  }
+
+  const lowerValue = cleanValue.toLowerCase();
+
+  if (lowerValue === "critical") {
+    return "Critical";
+  }
+
+  if (lowerValue === "caution") {
+    return "Caution";
+  }
+
+  return "Normal";
+}
+
+function warningCountForAlertLevel(alertLevel) {
+  switch (normalizeAlertLevel(alertLevel)) {
+    case "Critical":
+      return 2;
+    case "Caution":
+      return 1;
+    case "Normal":
+    default:
+      return 0;
+  }
+}
+
+function validUuidOrGenerated(value) {
+  const cleanValue = cleanText(value);
+
+  if (!cleanValue) {
+    return randomUUID();
+  }
+
+  return cleanValue;
 }
 
 async function getDeviceMapping(sourceKey) {
@@ -181,6 +335,19 @@ async function getNodeById(nodeId) {
     LIMIT 1
     `,
     [nodeId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function getResidentById(residentId) {
+  const result = await pool.query(
+    `
+    ${residentSelectSQL()}
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [residentId]
   );
 
   return result.rows[0] || null;
@@ -349,6 +516,43 @@ function eventSelectSQL() {
       acknowledged_at AS "acknowledgedAt",
       resolution_note AS "resolutionNote"
     FROM webhook_events
+  `;
+}
+
+function residentSelectSQL() {
+  return `
+    SELECT
+      id,
+      name,
+      location,
+      alert_level AS "alertLevel",
+      last_activity AS "lastActivity",
+      active_warnings AS "activeWarnings",
+      status_text AS "statusText",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM residents
+  `;
+}
+
+function cameraSelectSQL() {
+  return `
+    SELECT
+      id,
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      resident_id AS "residentID",
+      resident_name AS "residentName",
+      rtsp_url AS "rtspUrl",
+      is_active AS "isActive",
+      assigned_node_id AS "assignedNodeId",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM cameras
   `;
 }
 
@@ -811,6 +1015,677 @@ app.delete("/nodes/:nodeId", async (req, res) => {
   }
 });
 
+app.get("/residents", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const includeDeleted = parseBooleanQuery(req.query.includeDeleted);
+
+    const result = await pool.query(
+      `
+      ${residentSelectSQL()}
+      WHERE ($1::boolean = TRUE OR is_deleted = FALSE)
+      ORDER BY is_deleted ASC, name ASC, created_at ASC
+      `,
+      [includeDeleted]
+    );
+
+    return res.status(200).json({
+      success: true,
+      includeDeleted,
+      count: result.rows.length,
+      residents: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch residents:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch residents"
+    });
+  }
+});
+
+app.post("/residents", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const residentId = validUuidOrGenerated(req.body?.id);
+    const name = cleanText(req.body?.name);
+    const location = cleanText(req.body?.location) || "Unassigned location";
+    const alertLevel = normalizeAlertLevel(req.body?.alertLevel);
+    const activeWarnings = Number.isFinite(Number(req.body?.activeWarnings))
+      ? Number(req.body.activeWarnings)
+      : warningCountForAlertLevel(alertLevel);
+    const lastActivity =
+      cleanText(req.body?.lastActivity) || "Resident added. Waiting for first device event.";
+    const statusText = cleanText(req.body?.statusText) || "Monitoring setup pending";
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        error: "Resident name is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO residents (
+        id,
+        name,
+        location,
+        alert_level,
+        last_activity,
+        active_warnings,
+        status_text,
+        is_deleted,
+        deleted_at,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, NULL, NOW(), NOW())
+      ON CONFLICT (id)
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        location = EXCLUDED.location,
+        alert_level = EXCLUDED.alert_level,
+        last_activity = EXCLUDED.last_activity,
+        active_warnings = EXCLUDED.active_warnings,
+        status_text = EXCLUDED.status_text,
+        is_deleted = FALSE,
+        deleted_at = NULL,
+        updated_at = NOW()
+      RETURNING
+        id,
+        name,
+        location,
+        alert_level AS "alertLevel",
+        last_activity AS "lastActivity",
+        active_warnings AS "activeWarnings",
+        status_text AS "statusText",
+        is_deleted AS "isDeleted",
+        deleted_at AS "deletedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [
+        residentId,
+        name,
+        location,
+        alertLevel,
+        lastActivity,
+        activeWarnings,
+        statusText
+      ]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Resident saved",
+      resident: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Resident save failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.patch("/residents/:residentId", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const residentId = cleanText(req.params.residentId);
+
+    if (!residentId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing residentId"
+      });
+    }
+
+    const existingResident = await getResidentById(residentId);
+
+    if (!existingResident || existingResident.isDeleted) {
+      return res.status(404).json({
+        success: false,
+        error: `Resident not found: ${residentId}`
+      });
+    }
+
+    const nextName = cleanText(req.body?.name) || existingResident.name;
+    const nextLocation = cleanText(req.body?.location) || existingResident.location;
+    const nextAlertLevel = req.body?.alertLevel
+      ? normalizeAlertLevel(req.body.alertLevel)
+      : existingResident.alertLevel;
+    const nextLastActivity = cleanText(req.body?.lastActivity) || existingResident.lastActivity;
+    const nextActiveWarnings = Number.isFinite(Number(req.body?.activeWarnings))
+      ? Number(req.body.activeWarnings)
+      : warningCountForAlertLevel(nextAlertLevel);
+    const nextStatusText = cleanText(req.body?.statusText) || existingResident.statusText;
+
+    const result = await pool.query(
+      `
+      UPDATE residents
+      SET
+        name = $2,
+        location = $3,
+        alert_level = $4,
+        last_activity = $5,
+        active_warnings = $6,
+        status_text = $7,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING
+        id,
+        name,
+        location,
+        alert_level AS "alertLevel",
+        last_activity AS "lastActivity",
+        active_warnings AS "activeWarnings",
+        status_text AS "statusText",
+        is_deleted AS "isDeleted",
+        deleted_at AS "deletedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [
+        residentId,
+        nextName,
+        nextLocation,
+        nextAlertLevel,
+        nextLastActivity,
+        nextActiveWarnings,
+        nextStatusText
+      ]
+    );
+
+    await pool.query(
+      `
+      UPDATE cameras
+      SET
+        resident_name = $2,
+        updated_at = NOW()
+      WHERE resident_id = $1
+        AND is_deleted = FALSE
+      `,
+      [residentId, nextName]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Resident updated",
+      resident: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Resident update failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.delete("/residents/:residentId", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const residentId = cleanText(req.params.residentId);
+
+    if (!residentId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing residentId"
+      });
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const residentResult = await client.query(
+        `
+        UPDATE residents
+        SET
+          is_deleted = TRUE,
+          deleted_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $1
+          AND is_deleted = FALSE
+        RETURNING
+          id,
+          name,
+          location,
+          alert_level AS "alertLevel",
+          last_activity AS "lastActivity",
+          active_warnings AS "activeWarnings",
+          status_text AS "statusText",
+          is_deleted AS "isDeleted",
+          deleted_at AS "deletedAt",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+        `,
+        [residentId]
+      );
+
+      if (!residentResult.rows[0]) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          success: false,
+          error: `Resident not found: ${residentId}`
+        });
+      }
+
+      const cameraResult = await client.query(
+        `
+        UPDATE cameras
+        SET
+          resident_id = NULL,
+          resident_name = 'Unassigned',
+          is_active = FALSE,
+          assigned_node_id = NULL,
+          updated_at = NOW()
+        WHERE resident_id = $1
+          AND is_deleted = FALSE
+        RETURNING id
+        `,
+        [residentId]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(200).json({
+        success: true,
+        message: "Resident deleted",
+        resident: residentResult.rows[0],
+        affectedCameraCount: cameraResult.rows.length
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("Resident delete failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/cameras", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const includeDeleted = parseBooleanQuery(req.query.includeDeleted);
+    const activeOnly = parseBooleanQuery(req.query.activeOnly);
+    const residentId = cleanText(req.query.residentId);
+    const nodeId = cleanText(req.query.nodeId);
+
+    const params = [includeDeleted, activeOnly, residentId || null, nodeId || null];
+
+    const result = await pool.query(
+      `
+      ${cameraSelectSQL()}
+      WHERE ($1::boolean = TRUE OR is_deleted = FALSE)
+        AND ($2::boolean = FALSE OR is_active = TRUE)
+        AND ($3::text IS NULL OR resident_id::text = $3)
+        AND ($4::text IS NULL OR assigned_node_id = $4)
+      ORDER BY is_deleted ASC, source_name ASC, created_at ASC
+      `,
+      params
+    );
+
+    return res.status(200).json({
+      success: true,
+      includeDeleted,
+      activeOnly,
+      count: result.rows.length,
+      cameras: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch cameras:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch cameras"
+    });
+  }
+});
+
+app.post("/cameras", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const cameraId = validUuidOrGenerated(req.body?.id);
+    const sourceKey = cleanText(req.body?.sourceKey);
+    const sourceName = cleanText(req.body?.sourceName);
+    const rtspUrl = cleanText(req.body?.rtspUrl);
+    const requestedResidentId = cleanOptionalText(req.body?.residentID ?? req.body?.residentId);
+    const requestedResidentName = cleanText(req.body?.residentName);
+    const requestedAssignedNodeId = cleanOptionalText(req.body?.assignedNodeId);
+    const requestedIsActive = typeof req.body?.isActive === "boolean" ? req.body.isActive : null;
+
+    if (!sourceKey) {
+      return res.status(400).json({
+        success: false,
+        error: "sourceKey is required"
+      });
+    }
+
+    if (!sourceName) {
+      return res.status(400).json({
+        success: false,
+        error: "sourceName is required"
+      });
+    }
+
+    if (!rtspUrl) {
+      return res.status(400).json({
+        success: false,
+        error: "rtspUrl is required"
+      });
+    }
+
+    let resolvedResidentId = requestedResidentId;
+    let resolvedResidentName = requestedResidentName || "Unassigned";
+
+    if (resolvedResidentId) {
+      const resident = await getResidentById(resolvedResidentId);
+
+      if (!resident || resident.isDeleted) {
+        return res.status(400).json({
+          success: false,
+          error: `Resident not found: ${resolvedResidentId}`
+        });
+      }
+
+      resolvedResidentName = resident.name;
+    } else {
+      resolvedResidentId = null;
+    }
+
+    const resolvedIsActive =
+      requestedIsActive === null ? Boolean(resolvedResidentId) : requestedIsActive;
+
+    const result = await pool.query(
+      `
+      INSERT INTO cameras (
+        id,
+        source_key,
+        source_name,
+        resident_id,
+        resident_name,
+        rtsp_url,
+        is_active,
+        assigned_node_id,
+        is_deleted,
+        deleted_at,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, NULL, NOW(), NOW())
+      ON CONFLICT (id)
+      DO UPDATE SET
+        source_key = EXCLUDED.source_key,
+        source_name = EXCLUDED.source_name,
+        resident_id = EXCLUDED.resident_id,
+        resident_name = EXCLUDED.resident_name,
+        rtsp_url = EXCLUDED.rtsp_url,
+        is_active = EXCLUDED.is_active,
+        assigned_node_id = EXCLUDED.assigned_node_id,
+        is_deleted = FALSE,
+        deleted_at = NULL,
+        updated_at = NOW()
+      RETURNING
+        id,
+        source_key AS "sourceKey",
+        source_name AS "sourceName",
+        resident_id AS "residentID",
+        resident_name AS "residentName",
+        rtsp_url AS "rtspUrl",
+        is_active AS "isActive",
+        assigned_node_id AS "assignedNodeId",
+        is_deleted AS "isDeleted",
+        deleted_at AS "deletedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [
+        cameraId,
+        sourceKey,
+        sourceName,
+        resolvedResidentId,
+        resolvedResidentName,
+        rtspUrl,
+        resolvedIsActive,
+        requestedAssignedNodeId
+      ]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Camera saved",
+      camera: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Camera save failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.patch("/cameras/:cameraId", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const cameraId = cleanText(req.params.cameraId);
+
+    if (!cameraId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing cameraId"
+      });
+    }
+
+    const existingResult = await pool.query(
+      `
+      ${cameraSelectSQL()}
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [cameraId]
+    );
+
+    const existingCamera = existingResult.rows[0];
+
+    if (!existingCamera || existingCamera.isDeleted) {
+      return res.status(404).json({
+        success: false,
+        error: `Camera not found: ${cameraId}`
+      });
+    }
+
+    const nextSourceKey = cleanText(req.body?.sourceKey) || existingCamera.sourceKey;
+    const nextSourceName = cleanText(req.body?.sourceName) || existingCamera.sourceName;
+    const nextRtspUrl = cleanText(req.body?.rtspUrl) || existingCamera.rtspUrl;
+    const requestIncludesResident =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "residentID") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "residentId");
+    const requestIncludesAssignedNode =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "assignedNodeId");
+    const requestIncludesIsActive =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "isActive");
+
+    let nextResidentId = existingCamera.residentID;
+    let nextResidentName = existingCamera.residentName;
+
+    if (requestIncludesResident) {
+      const requestedResidentId = cleanOptionalText(req.body?.residentID ?? req.body?.residentId);
+
+      if (requestedResidentId) {
+        const resident = await getResidentById(requestedResidentId);
+
+        if (!resident || resident.isDeleted) {
+          return res.status(400).json({
+            success: false,
+            error: `Resident not found: ${requestedResidentId}`
+          });
+        }
+
+        nextResidentId = requestedResidentId;
+        nextResidentName = resident.name;
+      } else {
+        nextResidentId = null;
+        nextResidentName = "Unassigned";
+      }
+    }
+
+    const nextAssignedNodeId = requestIncludesAssignedNode
+      ? cleanOptionalText(req.body?.assignedNodeId)
+      : existingCamera.assignedNodeId;
+
+    const nextIsActive = requestIncludesIsActive
+      ? Boolean(req.body?.isActive)
+      : existingCamera.isActive;
+
+    const result = await pool.query(
+      `
+      UPDATE cameras
+      SET
+        source_key = $2,
+        source_name = $3,
+        resident_id = $4,
+        resident_name = $5,
+        rtsp_url = $6,
+        is_active = $7,
+        assigned_node_id = $8,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING
+        id,
+        source_key AS "sourceKey",
+        source_name AS "sourceName",
+        resident_id AS "residentID",
+        resident_name AS "residentName",
+        rtsp_url AS "rtspUrl",
+        is_active AS "isActive",
+        assigned_node_id AS "assignedNodeId",
+        is_deleted AS "isDeleted",
+        deleted_at AS "deletedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [
+        cameraId,
+        nextSourceKey,
+        nextSourceName,
+        nextResidentId,
+        nextResidentName,
+        nextRtspUrl,
+        nextIsActive,
+        nextAssignedNodeId
+      ]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Camera updated",
+      camera: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Camera update failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.delete("/cameras/:cameraId", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const cameraId = cleanText(req.params.cameraId);
+
+    if (!cameraId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing cameraId"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE cameras
+      SET
+        is_deleted = TRUE,
+        deleted_at = NOW(),
+        is_active = FALSE,
+        assigned_node_id = NULL,
+        updated_at = NOW()
+      WHERE id = $1
+        AND is_deleted = FALSE
+      RETURNING
+        id,
+        source_key AS "sourceKey",
+        source_name AS "sourceName",
+        resident_id AS "residentID",
+        resident_name AS "residentName",
+        rtsp_url AS "rtspUrl",
+        is_active AS "isActive",
+        assigned_node_id AS "assignedNodeId",
+        is_deleted AS "isDeleted",
+        deleted_at AS "deletedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [cameraId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        success: false,
+        error: `Camera not found: ${cameraId}`
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Camera deleted",
+      camera: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Camera delete failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.get("/device-mappings", async (req, res) => {
   try {
     const result = await pool.query(
@@ -842,8 +1717,6 @@ app.get("/device-mappings", async (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
-    const { randomUUID } = require("crypto");
-
     if (!isAuthorizedWebhook(req)) {
       return res.status(401).json({
         success: false,
