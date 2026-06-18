@@ -6,6 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const MIN_IOS_APP_BUILD = 1;
 
 app.use(express.json());
 
@@ -235,6 +236,68 @@ function requireAuthorizedRequest(req, res) {
   }
 
   return true;
+}
+
+function requestAppBuild(req) {
+  const rawBuild = cleanText(req.header("x-app-build"));
+
+  if (!rawBuild) {
+    return null;
+  }
+
+  const parsedBuild = Number(rawBuild);
+
+  if (!Number.isFinite(parsedBuild)) {
+    return null;
+  }
+
+  return parsedBuild;
+}
+
+function requestAppVersion(req) {
+  return cleanText(req.header("x-app-version")) || "Unknown";
+}
+
+function requestAppClient(req) {
+  return cleanText(req.header("x-app-client")) || "Unknown";
+}
+
+function requireMinimumIOSAppBuildForSetupWrites(req, res) {
+  const build = requestAppBuild(req);
+  const version = requestAppVersion(req);
+  const client = requestAppClient(req);
+
+  if (build === null || build < MIN_IOS_APP_BUILD) {
+    console.warn("Blocked old app setup write:", {
+      path: req.path,
+      method: req.method,
+      client,
+      version,
+      build,
+      minimumRequiredBuild: MIN_IOS_APP_BUILD
+    });
+
+    res.status(426).json({
+      success: false,
+      error: "This app build is too old to change resident or camera setup. Please update the app.",
+      appBuild: build,
+      minimumRequiredBuild: MIN_IOS_APP_BUILD,
+      appVersion: version,
+      appClient: client
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
+function requireAuthorizedCurrentAppWrite(req, res) {
+  if (!requireAuthorizedRequest(req, res)) {
+    return false;
+  }
+
+  return requireMinimumIOSAppBuildForSetupWrites(req, res);
 }
 
 function cleanText(value) {
@@ -543,7 +606,7 @@ function cameraSelectSQL() {
       id,
       source_key AS "sourceKey",
       source_name AS "sourceName",
-      resident_id AS "residentID",
+      resident_id AS "residentId",
       resident_name AS "residentName",
       rtsp_url AS "rtspUrl",
       is_active AS "isActive",
@@ -556,10 +619,29 @@ function cameraSelectSQL() {
   `;
 }
 
+function cameraReturningSQL() {
+  return `
+    RETURNING
+      id,
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      rtsp_url AS "rtspUrl",
+      is_active AS "isActive",
+      assigned_node_id AS "assignedNodeId",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+  `;
+}
+
 app.get("/", async (req, res) => {
   res.json({
     success: true,
-    message: "Good Shepherd webhook server is live"
+    message: "Good Shepherd webhook server is live",
+    minimumIOSAppBuildForSetupWrites: MIN_IOS_APP_BUILD
   });
 });
 
@@ -1049,7 +1131,7 @@ app.get("/residents", async (req, res) => {
 
 app.post("/residents", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
       return;
     }
 
@@ -1138,7 +1220,7 @@ app.post("/residents", async (req, res) => {
 
 app.patch("/residents/:residentId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
       return;
     }
 
@@ -1235,7 +1317,7 @@ app.patch("/residents/:residentId", async (req, res) => {
 
 app.delete("/residents/:residentId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
       return;
     }
 
@@ -1287,20 +1369,27 @@ app.delete("/residents/:residentId", async (req, res) => {
         });
       }
 
+      const deletedResidentName = residentResult.rows[0].name;
+
       const cameraResult = await client.query(
         `
         UPDATE cameras
         SET
+          is_deleted = TRUE,
+          deleted_at = NOW(),
           resident_id = NULL,
           resident_name = 'Unassigned',
           is_active = FALSE,
           assigned_node_id = NULL,
           updated_at = NOW()
-        WHERE resident_id = $1
-          AND is_deleted = FALSE
+        WHERE is_deleted = FALSE
+          AND (
+            resident_id = $1
+            OR LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
+          )
         RETURNING id
         `,
-        [residentId]
+        [residentId, deletedResidentName]
       );
 
       await client.query("COMMIT");
@@ -1369,7 +1458,7 @@ app.get("/cameras", async (req, res) => {
 
 app.post("/cameras", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
       return;
     }
 
@@ -1453,19 +1542,7 @@ app.post("/cameras", async (req, res) => {
         is_deleted = FALSE,
         deleted_at = NULL,
         updated_at = NOW()
-      RETURNING
-        id,
-        source_key AS "sourceKey",
-        source_name AS "sourceName",
-        resident_id AS "residentID",
-        resident_name AS "residentName",
-        rtsp_url AS "rtspUrl",
-        is_active AS "isActive",
-        assigned_node_id AS "assignedNodeId",
-        is_deleted AS "isDeleted",
-        deleted_at AS "deletedAt",
-        created_at AS "createdAt",
-        updated_at AS "updatedAt"
+      ${cameraReturningSQL()}
       `,
       [
         cameraId,
@@ -1495,7 +1572,7 @@ app.post("/cameras", async (req, res) => {
 
 app.patch("/cameras/:cameraId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
       return;
     }
 
@@ -1537,7 +1614,7 @@ app.patch("/cameras/:cameraId", async (req, res) => {
     const requestIncludesIsActive =
       Object.prototype.hasOwnProperty.call(req.body || {}, "isActive");
 
-    let nextResidentId = existingCamera.residentID;
+    let nextResidentId = existingCamera.residentId;
     let nextResidentName = existingCamera.residentName;
 
     if (requestIncludesResident) {
@@ -1582,19 +1659,7 @@ app.patch("/cameras/:cameraId", async (req, res) => {
         assigned_node_id = $8,
         updated_at = NOW()
       WHERE id = $1
-      RETURNING
-        id,
-        source_key AS "sourceKey",
-        source_name AS "sourceName",
-        resident_id AS "residentID",
-        resident_name AS "residentName",
-        rtsp_url AS "rtspUrl",
-        is_active AS "isActive",
-        assigned_node_id AS "assignedNodeId",
-        is_deleted AS "isDeleted",
-        deleted_at AS "deletedAt",
-        created_at AS "createdAt",
-        updated_at AS "updatedAt"
+      ${cameraReturningSQL()}
       `,
       [
         cameraId,
@@ -1624,7 +1689,7 @@ app.patch("/cameras/:cameraId", async (req, res) => {
 
 app.delete("/cameras/:cameraId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
       return;
     }
 
@@ -1648,19 +1713,7 @@ app.delete("/cameras/:cameraId", async (req, res) => {
         updated_at = NOW()
       WHERE id = $1
         AND is_deleted = FALSE
-      RETURNING
-        id,
-        source_key AS "sourceKey",
-        source_name AS "sourceName",
-        resident_id AS "residentID",
-        resident_name AS "residentName",
-        rtsp_url AS "rtspUrl",
-        is_active AS "isActive",
-        assigned_node_id AS "assignedNodeId",
-        is_deleted AS "isDeleted",
-        deleted_at AS "deletedAt",
-        created_at AS "createdAt",
-        updated_at AS "updatedAt"
+      ${cameraReturningSQL()}
       `,
       [cameraId]
     );
@@ -1864,6 +1917,7 @@ initializeDatabase()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Good Shepherd webhook server running on port ${PORT}`);
+      console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
     });
   })
   .catch((error) => {
