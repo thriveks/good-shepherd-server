@@ -131,6 +131,32 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS node_commands (
+      command_id UUID PRIMARY KEY,
+      node_id TEXT NOT NULL,
+      command_type TEXT NOT NULL,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'pending',
+      requested_by TEXT,
+      requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      picked_up_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      result JSONB,
+      error TEXT
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS node_commands_node_id_status_idx
+    ON node_commands (node_id, status)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS node_commands_requested_at_idx
+    ON node_commands (requested_at)
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS device_mappings (
       source_key TEXT PRIMARY KEY,
       source_name TEXT NOT NULL,
@@ -413,6 +439,44 @@ function normalizeJsonObject(value) {
   }
 
   return {};
+}
+
+function normalizeNodeCommandType(value) {
+  const commandType = cleanText(value).toLowerCase();
+
+  const allowedCommands = new Set([
+    "ping",
+    "reload_cameras",
+    "restart_monitors",
+    "ffmpeg_check",
+    "diagnostic_report",
+    "clear_last_error",
+    "rtsp_test"
+  ]);
+
+  if (!allowedCommands.has(commandType)) {
+    return null;
+  }
+
+  return commandType;
+}
+
+function normalizeCommandStatus(value) {
+  const status = cleanText(value).toLowerCase();
+
+  if (status === "success") {
+    return "success";
+  }
+
+  if (status === "failed") {
+    return "failed";
+  }
+
+  if (status === "running") {
+    return "running";
+  }
+
+  return "pending";
 }
 
 async function getDeviceMapping(sourceKey) {
@@ -817,6 +881,24 @@ function nodeHealthSelectSQL() {
   `;
 }
 
+function nodeCommandSelectSQL() {
+  return `
+    SELECT
+      command_id AS "commandId",
+      node_id AS "nodeId",
+      command_type AS "commandType",
+      payload,
+      status,
+      requested_by AS "requestedBy",
+      requested_at AS "requestedAt",
+      picked_up_at AS "pickedUpAt",
+      completed_at AS "completedAt",
+      result,
+      error
+    FROM node_commands
+  `;
+}
+
 function residentSelectSQL() {
   return `
     SELECT
@@ -885,7 +967,11 @@ app.get("/", async (req, res) => {
         "POST /nodes/register",
         "GET /node-health",
         "GET /node-health/:nodeId",
-        "POST /node-health"
+        "POST /node-health",
+        "POST /node-commands",
+        "GET /node-commands/:nodeId/pending",
+        "POST /node-commands/:commandId/result",
+        "GET /node-commands/:nodeId"
       ]
     }
   });
@@ -1178,6 +1264,325 @@ app.post("/node-health", async (req, res) => {
   } catch (error) {
     console.error("Node health update failed:", error);
     return res.status(400).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/node-commands", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.body?.nodeId);
+    const commandType = normalizeNodeCommandType(req.body?.commandType);
+    const payload = normalizeJsonObject(req.body?.payload);
+    const requestedBy = cleanText(req.body?.requestedBy) || "Good Shepherd App";
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required field: nodeId"
+      });
+    }
+
+    if (!commandType) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid or missing commandType",
+        allowedCommandTypes: [
+          "ping",
+          "reload_cameras",
+          "restart_monitors",
+          "ffmpeg_check",
+          "diagnostic_report",
+          "clear_last_error",
+          "rtsp_test"
+        ]
+      });
+    }
+
+    const existingNode = await getNodeById(nodeId);
+
+    if (!existingNode) {
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO node_commands (
+        command_id,
+        node_id,
+        command_type,
+        payload,
+        status,
+        requested_by,
+        requested_at,
+        picked_up_at,
+        completed_at,
+        result,
+        error
+      )
+      VALUES ($1, $2, $3, $4::jsonb, 'pending', $5, NOW(), NULL, NULL, NULL, NULL)
+      RETURNING
+        command_id AS "commandId",
+        node_id AS "nodeId",
+        command_type AS "commandType",
+        payload,
+        status,
+        requested_by AS "requestedBy",
+        requested_at AS "requestedAt",
+        picked_up_at AS "pickedUpAt",
+        completed_at AS "completedAt",
+        result,
+        error
+      `,
+      [
+        randomUUID(),
+        nodeId,
+        commandType,
+        JSON.stringify(payload),
+        requestedBy
+      ]
+    );
+
+    console.log("Node command created:");
+    console.log(JSON.stringify(result.rows[0], null, 2));
+
+    return res.status(201).json({
+      success: true,
+      message: "Node command created",
+      command: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Create node command failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/node-commands/:nodeId/pending", async (req, res) => {
+  const client = await pool.connect();
+  let didBegin = false;
+
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    await client.query("BEGIN");
+    didBegin = true;
+
+    await client.query(
+      `
+      UPDATE node_commands
+      SET
+        status = 'pending',
+        picked_up_at = NULL
+      WHERE node_id = $1
+        AND status = 'running'
+        AND picked_up_at < NOW() - INTERVAL '5 minutes'
+      `,
+      [nodeId]
+    );
+
+    const pendingResult = await client.query(
+      `
+      SELECT command_id
+      FROM node_commands
+      WHERE node_id = $1
+        AND status = 'pending'
+      ORDER BY requested_at ASC
+      LIMIT 5
+      FOR UPDATE SKIP LOCKED
+      `,
+      [nodeId]
+    );
+
+    const commandIds = pendingResult.rows.map((row) => row.command_id);
+
+    let commands = [];
+
+    if (commandIds.length > 0) {
+      const updateResult = await client.query(
+        `
+        UPDATE node_commands
+        SET
+          status = 'running',
+          picked_up_at = NOW()
+        WHERE command_id = ANY($1::uuid[])
+        RETURNING
+          command_id AS "commandId",
+          node_id AS "nodeId",
+          command_type AS "commandType",
+          payload,
+          status,
+          requested_by AS "requestedBy",
+          requested_at AS "requestedAt",
+          picked_up_at AS "pickedUpAt",
+          completed_at AS "completedAt",
+          result,
+          error
+        `,
+        [commandIds]
+      );
+
+      commands = updateResult.rows;
+    }
+
+    await client.query("COMMIT");
+    didBegin = false;
+
+    return res.status(200).json({
+      success: true,
+      nodeId,
+      count: commands.length,
+      commands
+    });
+  } catch (error) {
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
+    console.error("Fetch pending node commands failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/node-commands/:commandId/result", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const commandId = cleanText(req.params.commandId);
+    const status = normalizeCommandStatus(req.body?.status);
+    const resultPayload = normalizeJsonObject(req.body?.result);
+    const error = cleanOptionalText(req.body?.error);
+
+    if (!commandId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing commandId"
+      });
+    }
+
+    if (status !== "success" && status !== "failed") {
+      return res.status(400).json({
+        success: false,
+        error: "Command result status must be success or failed"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE node_commands
+      SET
+        status = $2,
+        completed_at = NOW(),
+        result = $3::jsonb,
+        error = $4
+      WHERE command_id = $1
+      RETURNING
+        command_id AS "commandId",
+        node_id AS "nodeId",
+        command_type AS "commandType",
+        payload,
+        status,
+        requested_by AS "requestedBy",
+        requested_at AS "requestedAt",
+        picked_up_at AS "pickedUpAt",
+        completed_at AS "completedAt",
+        result,
+        error
+      `,
+      [
+        commandId,
+        status,
+        JSON.stringify(resultPayload),
+        error
+      ]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        success: false,
+        error: `Command not found: ${commandId}`
+      });
+    }
+
+    console.log("Node command result received:");
+    console.log(JSON.stringify(result.rows[0], null, 2));
+
+    return res.status(200).json({
+      success: true,
+      message: "Node command result saved",
+      command: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Save node command result failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/node-commands/:nodeId", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      ${nodeCommandSelectSQL()}
+      WHERE node_id = $1
+      ORDER BY requested_at DESC
+      LIMIT 25
+      `,
+      [nodeId]
+    );
+
+    return res.status(200).json({
+      success: true,
+      nodeId,
+      count: result.rows.length,
+      commands: result.rows
+    });
+  } catch (error) {
+    console.error("Fetch node command history failed:", error);
+    return res.status(500).json({
       success: false,
       error: error.message
     });
@@ -2285,6 +2690,7 @@ initializeDatabase()
       console.log(`Good Shepherd webhook server running on port ${PORT}`);
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
+      console.log("Remote node command queue enabled.");
     });
   })
   .catch((error) => {
