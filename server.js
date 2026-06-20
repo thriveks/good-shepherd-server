@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 3000;
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
+const NODE_OFFLINE_AFTER_SECONDS = 180;
 
 app.use(express.json());
 
@@ -91,6 +92,42 @@ async function initializeDatabase() {
   await pool.query(`
     ALTER TABLE nodes
     ADD COLUMN IF NOT EXISTS archived_reason TEXT
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS node_health (
+      node_id TEXT PRIMARY KEY,
+      node_name TEXT,
+      location_name TEXT,
+      local_ip TEXT,
+      local_config_port INTEGER,
+      camera_count INTEGER NOT NULL DEFAULT 0,
+      camera_summary JSONB,
+      software_version TEXT,
+      monitor_status TEXT NOT NULL DEFAULT 'Unknown',
+      ffmpeg_status TEXT NOT NULL DEFAULT 'Unknown',
+      ffmpeg_path TEXT,
+      platform TEXT,
+      hostname TEXT,
+      uptime_seconds INTEGER,
+      active_monitor_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      last_error_at TIMESTAMPTZ,
+      diagnostics JSONB,
+      checked_in_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS node_health_checked_in_at_idx
+    ON node_health (checked_in_at)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS node_health_monitor_status_idx
+    ON node_health (monitor_status)
   `);
 
   await pool.query(`
@@ -356,6 +393,28 @@ function validUuidOrGenerated(value) {
   return cleanValue;
 }
 
+function normalizeHealthText(value, fallback) {
+  const cleaned = cleanText(value);
+  return cleaned || fallback;
+}
+
+function normalizeInteger(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : fallback;
+}
+
+function normalizeJsonArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeJsonObject(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+
+  return {};
+}
+
 async function getDeviceMapping(sourceKey) {
   const result = await pool.query(
     `
@@ -562,6 +621,149 @@ async function touchNodeFromWebhook(nodeId) {
   return result.rows[0];
 }
 
+async function upsertNodeHealth(payload) {
+  const nodeId = cleanText(payload?.nodeId);
+
+  if (!nodeId) {
+    throw new Error("Missing required field: nodeId");
+  }
+
+  const nodeName = normalizeHealthText(payload?.nodeName, "Good Shepherd Local Node");
+  const locationName = normalizeHealthText(payload?.locationName, "Unassigned Location");
+  const localIp = cleanOptionalText(payload?.localIp);
+  const localConfigPort = payload?.localConfigPort ? Number(payload.localConfigPort) : null;
+  const cameraCount = normalizeInteger(payload?.cameraCount, 0);
+  const cameraSummary = normalizeJsonArray(payload?.cameraSummary);
+  const softwareVersion = cleanOptionalText(payload?.softwareVersion);
+  const monitorStatus = normalizeHealthText(payload?.monitorStatus, "Online");
+  const ffmpegStatus = normalizeHealthText(payload?.ffmpegStatus, "Unknown");
+  const ffmpegPath = cleanOptionalText(payload?.ffmpegPath);
+  const platform = cleanOptionalText(payload?.platform);
+  const hostname = cleanOptionalText(payload?.hostname);
+  const uptimeSeconds = payload?.uptimeSeconds ? normalizeInteger(payload.uptimeSeconds, 0) : null;
+  const activeMonitorCount = normalizeInteger(payload?.activeMonitorCount, 0);
+  const lastError = cleanOptionalText(payload?.lastError);
+  const diagnostics = normalizeJsonObject(payload?.diagnostics);
+  const lastErrorAt = lastError ? new Date().toISOString() : null;
+
+  await upsertNodeFromRegistration({
+    nodeId,
+    nodeName,
+    locationName,
+    localIp,
+    localConfigPort,
+    cameraCount,
+    cameraSummary,
+    softwareVersion
+  });
+
+  const result = await pool.query(
+    `
+    INSERT INTO node_health (
+      node_id,
+      node_name,
+      location_name,
+      local_ip,
+      local_config_port,
+      camera_count,
+      camera_summary,
+      software_version,
+      monitor_status,
+      ffmpeg_status,
+      ffmpeg_path,
+      platform,
+      hostname,
+      uptime_seconds,
+      active_monitor_count,
+      last_error,
+      last_error_at,
+      diagnostics,
+      checked_in_at,
+      created_at,
+      updated_at
+    )
+    VALUES (
+      $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10,
+      $11, $12, $13, $14, $15, $16, $17, $18::jsonb, NOW(), NOW(), NOW()
+    )
+    ON CONFLICT (node_id)
+    DO UPDATE SET
+      node_name = EXCLUDED.node_name,
+      location_name = EXCLUDED.location_name,
+      local_ip = EXCLUDED.local_ip,
+      local_config_port = EXCLUDED.local_config_port,
+      camera_count = EXCLUDED.camera_count,
+      camera_summary = EXCLUDED.camera_summary,
+      software_version = EXCLUDED.software_version,
+      monitor_status = EXCLUDED.monitor_status,
+      ffmpeg_status = EXCLUDED.ffmpeg_status,
+      ffmpeg_path = EXCLUDED.ffmpeg_path,
+      platform = EXCLUDED.platform,
+      hostname = EXCLUDED.hostname,
+      uptime_seconds = EXCLUDED.uptime_seconds,
+      active_monitor_count = EXCLUDED.active_monitor_count,
+      last_error = EXCLUDED.last_error,
+      last_error_at = CASE
+        WHEN EXCLUDED.last_error IS NULL THEN node_health.last_error_at
+        ELSE NOW()
+      END,
+      diagnostics = EXCLUDED.diagnostics,
+      checked_in_at = NOW(),
+      updated_at = NOW()
+    RETURNING
+      node_id AS "nodeId",
+      node_name AS "nodeName",
+      location_name AS "locationName",
+      local_ip AS "localIp",
+      local_config_port AS "localConfigPort",
+      camera_count AS "cameraCount",
+      camera_summary AS "cameraSummary",
+      software_version AS "softwareVersion",
+      monitor_status AS "monitorStatus",
+      ffmpeg_status AS "ffmpegStatus",
+      ffmpeg_path AS "ffmpegPath",
+      platform,
+      hostname,
+      uptime_seconds AS "uptimeSeconds",
+      active_monitor_count AS "activeMonitorCount",
+      last_error AS "lastError",
+      last_error_at AS "lastErrorAt",
+      diagnostics,
+      checked_in_at AS "checkedInAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt",
+      EXTRACT(EPOCH FROM (NOW() - checked_in_at))::int AS "secondsSinceCheckIn",
+      CASE
+        WHEN checked_in_at >= NOW() - ($19::int * INTERVAL '1 second') THEN TRUE
+        ELSE FALSE
+      END AS "isOnline"
+    `,
+    [
+      nodeId,
+      nodeName,
+      locationName,
+      localIp,
+      localConfigPort,
+      cameraCount,
+      JSON.stringify(cameraSummary),
+      softwareVersion,
+      monitorStatus,
+      ffmpegStatus,
+      ffmpegPath,
+      platform,
+      hostname,
+      uptimeSeconds,
+      activeMonitorCount,
+      lastError,
+      lastErrorAt,
+      JSON.stringify(diagnostics),
+      NODE_OFFLINE_AFTER_SECONDS
+    ]
+  );
+
+  return result.rows[0];
+}
+
 function eventSelectSQL() {
   return `
     SELECT
@@ -579,6 +781,39 @@ function eventSelectSQL() {
       acknowledged_at AS "acknowledgedAt",
       resolution_note AS "resolutionNote"
     FROM webhook_events
+  `;
+}
+
+function nodeHealthSelectSQL() {
+  return `
+    SELECT
+      node_id AS "nodeId",
+      node_name AS "nodeName",
+      location_name AS "locationName",
+      local_ip AS "localIp",
+      local_config_port AS "localConfigPort",
+      camera_count AS "cameraCount",
+      camera_summary AS "cameraSummary",
+      software_version AS "softwareVersion",
+      monitor_status AS "monitorStatus",
+      ffmpeg_status AS "ffmpegStatus",
+      ffmpeg_path AS "ffmpegPath",
+      platform,
+      hostname,
+      uptime_seconds AS "uptimeSeconds",
+      active_monitor_count AS "activeMonitorCount",
+      last_error AS "lastError",
+      last_error_at AS "lastErrorAt",
+      diagnostics,
+      checked_in_at AS "checkedInAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt",
+      EXTRACT(EPOCH FROM (NOW() - checked_in_at))::int AS "secondsSinceCheckIn",
+      CASE
+        WHEN checked_in_at >= NOW() - (${NODE_OFFLINE_AFTER_SECONDS} * INTERVAL '1 second') THEN TRUE
+        ELSE FALSE
+      END AS "isOnline"
+    FROM node_health
   `;
 }
 
@@ -641,7 +876,18 @@ app.get("/", async (req, res) => {
   res.json({
     success: true,
     message: "Good Shepherd webhook server is live",
-    minimumIOSAppBuildForSetupWrites: MIN_IOS_APP_BUILD
+    minimumIOSAppBuildForSetupWrites: MIN_IOS_APP_BUILD,
+    remoteSupport: {
+      enabled: true,
+      nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
+      endpoints: [
+        "GET /nodes",
+        "POST /nodes/register",
+        "GET /node-health",
+        "GET /node-health/:nodeId",
+        "POST /node-health"
+      ]
+    }
   });
 });
 
@@ -754,31 +1000,42 @@ app.get("/nodes", async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        node_id AS "nodeId",
-        node_name AS "nodeName",
-        location_name AS "locationName",
-        status,
-        local_ip AS "localIp",
-        local_config_port AS "localConfigPort",
-        camera_count AS "cameraCount",
-        camera_summary AS "cameraSummary",
-        software_version AS "softwareVersion",
-        first_seen_at AS "firstSeenAt",
-        last_seen_at AS "lastSeenAt",
-        is_archived AS "isArchived",
-        archived_at AS "archivedAt",
-        archived_reason AS "archivedReason"
-      FROM nodes
-      WHERE ($1::boolean = TRUE OR is_archived = FALSE)
-      ORDER BY is_archived ASC, last_seen_at DESC
+        n.node_id AS "nodeId",
+        n.node_name AS "nodeName",
+        n.location_name AS "locationName",
+        n.status,
+        n.local_ip AS "localIp",
+        n.local_config_port AS "localConfigPort",
+        n.camera_count AS "cameraCount",
+        n.camera_summary AS "cameraSummary",
+        n.software_version AS "softwareVersion",
+        n.first_seen_at AS "firstSeenAt",
+        n.last_seen_at AS "lastSeenAt",
+        n.is_archived AS "isArchived",
+        n.archived_at AS "archivedAt",
+        n.archived_reason AS "archivedReason",
+        h.monitor_status AS "monitorStatus",
+        h.ffmpeg_status AS "ffmpegStatus",
+        h.last_error AS "lastError",
+        h.checked_in_at AS "healthCheckedInAt",
+        EXTRACT(EPOCH FROM (NOW() - h.checked_in_at))::int AS "secondsSinceHealthCheckIn",
+        CASE
+          WHEN h.checked_in_at >= NOW() - ($2::int * INTERVAL '1 second') THEN TRUE
+          ELSE FALSE
+        END AS "isOnline"
+      FROM nodes n
+      LEFT JOIN node_health h ON h.node_id = n.node_id
+      WHERE ($1::boolean = TRUE OR n.is_archived = FALSE)
+      ORDER BY n.is_archived ASC, COALESCE(h.checked_in_at, n.last_seen_at) DESC
       `,
-      [includeArchived]
+      [includeArchived, NODE_OFFLINE_AFTER_SECONDS]
     );
 
     res.status(200).json({
       success: true,
       includeArchived,
       count: result.rows.length,
+      nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
       nodes: result.rows
     });
   } catch (error) {
@@ -811,6 +1068,115 @@ app.post("/nodes/register", async (req, res) => {
     });
   } catch (error) {
     console.error("Node registration failed:", error);
+    return res.status(400).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/node-health", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const result = await pool.query(
+      `
+      ${nodeHealthSelectSQL()}
+      ORDER BY checked_in_at DESC
+      `
+    );
+
+    return res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
+      health: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch node health:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch node health"
+    });
+  }
+});
+
+app.get("/node-health/:nodeId", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      ${nodeHealthSelectSQL()}
+      WHERE node_id = $1
+      LIMIT 1
+      `,
+      [nodeId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        success: false,
+        error: `Node health not found: ${nodeId}`
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
+      health: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Failed to fetch node health:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch node health"
+    });
+  }
+});
+
+app.post("/node-health", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized node health request"
+      });
+    }
+
+    const health = await upsertNodeHealth(req.body || {});
+
+    console.log("Node health updated:");
+    console.log(JSON.stringify({
+      nodeId: health.nodeId,
+      locationName: health.locationName,
+      monitorStatus: health.monitorStatus,
+      ffmpegStatus: health.ffmpegStatus,
+      cameraCount: health.cameraCount,
+      activeMonitorCount: health.activeMonitorCount,
+      lastError: health.lastError || null
+    }, null, 2));
+
+    return res.status(200).json({
+      success: true,
+      message: "Node health updated",
+      health
+    });
+  } catch (error) {
+    console.error("Node health update failed:", error);
     return res.status(400).json({
       success: false,
       error: error.message
@@ -1918,6 +2284,7 @@ initializeDatabase()
     app.listen(PORT, () => {
       console.log(`Good Shepherd webhook server running on port ${PORT}`);
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
+      console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
     });
   })
   .catch((error) => {
