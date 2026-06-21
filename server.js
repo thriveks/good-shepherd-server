@@ -9,6 +9,29 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = 180;
 
+const MONITOR_COMMAND_TYPES = [
+  "ping",
+  "reload_cameras",
+  "restart_monitors",
+  "ffmpeg_check",
+  "diagnostic_report",
+  "clear_last_error",
+  "rtsp_test"
+];
+
+const WATCHDOG_COMMAND_TYPES = [
+  "watchdog_ping",
+  "watchdog_health",
+  "start_local_monitor",
+  "stop_local_monitor",
+  "restart_local_monitor"
+];
+
+const ALL_NODE_COMMAND_TYPES = [
+  ...MONITOR_COMMAND_TYPES,
+  ...WATCHDOG_COMMAND_TYPES
+];
+
 app.use(express.json());
 
 const pool = new Pool({
@@ -154,6 +177,11 @@ async function initializeDatabase() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS node_commands_requested_at_idx
     ON node_commands (requested_at)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS node_commands_node_id_status_command_type_idx
+    ON node_commands (node_id, status, command_type)
   `);
 
   await pool.query(`
@@ -444,21 +472,29 @@ function normalizeJsonObject(value) {
 function normalizeNodeCommandType(value) {
   const commandType = cleanText(value).toLowerCase();
 
-  const allowedCommands = new Set([
-    "ping",
-    "reload_cameras",
-    "restart_monitors",
-    "ffmpeg_check",
-    "diagnostic_report",
-    "clear_last_error",
-    "rtsp_test"
-  ]);
-
-  if (!allowedCommands.has(commandType)) {
+  if (!ALL_NODE_COMMAND_TYPES.includes(commandType)) {
     return null;
   }
 
   return commandType;
+}
+
+function normalizeCommandRunner(value) {
+  const runner = cleanText(value).toLowerCase();
+
+  if (runner === "watchdog") {
+    return "watchdog";
+  }
+
+  return "monitor";
+}
+
+function commandTypesForRunner(runner) {
+  if (runner === "watchdog") {
+    return WATCHDOG_COMMAND_TYPES;
+  }
+
+  return MONITOR_COMMAND_TYPES;
 }
 
 function normalizeCommandStatus(value) {
@@ -962,6 +998,12 @@ app.get("/", async (req, res) => {
     remoteSupport: {
       enabled: true,
       nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
+      monitorCommandTypes: MONITOR_COMMAND_TYPES,
+      watchdogCommandTypes: WATCHDOG_COMMAND_TYPES,
+      commandPolling: {
+        monitor: "GET /node-commands/:nodeId/pending?runner=monitor",
+        watchdog: "GET /node-commands/:nodeId/pending?runner=watchdog"
+      },
       endpoints: [
         "GET /nodes",
         "POST /nodes/register",
@@ -969,7 +1011,8 @@ app.get("/", async (req, res) => {
         "GET /node-health/:nodeId",
         "POST /node-health",
         "POST /node-commands",
-        "GET /node-commands/:nodeId/pending",
+        "GET /node-commands/:nodeId/pending?runner=monitor",
+        "GET /node-commands/:nodeId/pending?runner=watchdog",
         "POST /node-commands/:commandId/result",
         "GET /node-commands/:nodeId"
       ]
@@ -1292,15 +1335,9 @@ app.post("/node-commands", async (req, res) => {
       return res.status(400).json({
         success: false,
         error: "Invalid or missing commandType",
-        allowedCommandTypes: [
-          "ping",
-          "reload_cameras",
-          "restart_monitors",
-          "ffmpeg_check",
-          "diagnostic_report",
-          "clear_last_error",
-          "rtsp_test"
-        ]
+        monitorCommandTypes: MONITOR_COMMAND_TYPES,
+        watchdogCommandTypes: WATCHDOG_COMMAND_TYPES,
+        allowedCommandTypes: ALL_NODE_COMMAND_TYPES
       });
     }
 
@@ -1378,6 +1415,8 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
     }
 
     const nodeId = cleanText(req.params.nodeId);
+    const runner = normalizeCommandRunner(req.query.runner);
+    const commandTypes = commandTypesForRunner(runner);
 
     if (!nodeId) {
       return res.status(400).json({
@@ -1396,10 +1435,11 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
         status = 'pending',
         picked_up_at = NULL
       WHERE node_id = $1
+        AND command_type = ANY($2::text[])
         AND status = 'running'
         AND picked_up_at < NOW() - INTERVAL '5 minutes'
       `,
-      [nodeId]
+      [nodeId, commandTypes]
     );
 
     const pendingResult = await client.query(
@@ -1407,12 +1447,13 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
       SELECT command_id
       FROM node_commands
       WHERE node_id = $1
+        AND command_type = ANY($2::text[])
         AND status = 'pending'
       ORDER BY requested_at ASC
       LIMIT 5
       FOR UPDATE SKIP LOCKED
       `,
-      [nodeId]
+      [nodeId, commandTypes]
     );
 
     const commandIds = pendingResult.rows.map((row) => row.command_id);
@@ -1452,6 +1493,8 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
     return res.status(200).json({
       success: true,
       nodeId,
+      runner,
+      commandTypes,
       count: commands.length,
       commands
     });
@@ -2691,6 +2734,8 @@ initializeDatabase()
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
       console.log("Remote node command queue enabled.");
+      console.log(`Monitor command types: ${MONITOR_COMMAND_TYPES.join(", ")}`);
+      console.log(`Watchdog command types: ${WATCHDOG_COMMAND_TYPES.join(", ")}`);
     });
   })
   .catch((error) => {
