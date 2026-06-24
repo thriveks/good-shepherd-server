@@ -9,30 +9,6 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = 180;
 
-const MONITOR_COMMAND_TYPES = [
-  "ping",
-  "reload_cameras",
-  "restart_monitors",
-  "sync_cameras_from_cloud",
-  "ffmpeg_check",
-  "diagnostic_report",
-  "clear_last_error",
-  "rtsp_test"
-];
-
-const WATCHDOG_COMMAND_TYPES = [
-  "watchdog_ping",
-  "watchdog_health",
-  "start_local_monitor",
-  "stop_local_monitor",
-  "restart_local_monitor"
-];
-
-const ALL_NODE_COMMAND_TYPES = [
-  ...MONITOR_COMMAND_TYPES,
-  ...WATCHDOG_COMMAND_TYPES
-];
-
 app.use(express.json());
 
 const pool = new Pool({
@@ -178,11 +154,6 @@ async function initializeDatabase() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS node_commands_requested_at_idx
     ON node_commands (requested_at)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS node_commands_node_id_status_command_type_idx
-    ON node_commands (node_id, status, command_type)
   `);
 
   await pool.query(`
@@ -473,29 +444,21 @@ function normalizeJsonObject(value) {
 function normalizeNodeCommandType(value) {
   const commandType = cleanText(value).toLowerCase();
 
-  if (!ALL_NODE_COMMAND_TYPES.includes(commandType)) {
+  const allowedCommands = new Set([
+    "ping",
+    "reload_cameras",
+    "restart_monitors",
+    "ffmpeg_check",
+    "diagnostic_report",
+    "clear_last_error",
+    "rtsp_test"
+  ]);
+
+  if (!allowedCommands.has(commandType)) {
     return null;
   }
 
   return commandType;
-}
-
-function normalizeCommandRunner(value) {
-  const runner = cleanText(value).toLowerCase();
-
-  if (runner === "watchdog") {
-    return "watchdog";
-  }
-
-  return "monitor";
-}
-
-function commandTypesForRunner(runner) {
-  if (runner === "watchdog") {
-    return WATCHDOG_COMMAND_TYPES;
-  }
-
-  return MONITOR_COMMAND_TYPES;
 }
 
 function normalizeCommandStatus(value) {
@@ -625,17 +588,32 @@ async function upsertNodeFromRegistration({
     ON CONFLICT (node_id)
     DO UPDATE SET
       node_name = CASE
-        WHEN nodes.node_name IS NULL OR nodes.node_name = '' THEN EXCLUDED.node_name
-        WHEN nodes.node_name = 'Good Shepherd Local Node' THEN EXCLUDED.node_name
-        WHEN EXCLUDED.node_name = 'Good Shepherd Local Node' THEN nodes.node_name
+        WHEN EXCLUDED.node_name IS NOT NULL
+          AND TRIM(EXCLUDED.node_name) <> ''
+          AND EXCLUDED.node_name <> 'Good Shepherd Local Node'
+        THEN EXCLUDED.node_name
+        WHEN nodes.node_name IS NULL OR TRIM(nodes.node_name) = ''
+        THEN EXCLUDED.node_name
         ELSE nodes.node_name
       END,
       location_name = CASE
-        WHEN nodes.location_name = 'Unassigned Location' THEN EXCLUDED.location_name
+        WHEN EXCLUDED.location_name IS NOT NULL
+          AND TRIM(EXCLUDED.location_name) <> ''
+          AND EXCLUDED.location_name <> 'Unassigned Location'
+        THEN EXCLUDED.location_name
+        WHEN nodes.location_name IS NULL OR TRIM(nodes.location_name) = ''
+        THEN EXCLUDED.location_name
         ELSE nodes.location_name
       END,
       status = CASE
-        WHEN nodes.location_name = 'Unassigned Location' THEN EXCLUDED.status
+        WHEN EXCLUDED.location_name IS NOT NULL
+          AND TRIM(EXCLUDED.location_name) <> ''
+          AND EXCLUDED.location_name <> 'Unassigned Location'
+        THEN 'Active'
+        WHEN nodes.location_name IS NULL
+          OR TRIM(nodes.location_name) = ''
+          OR nodes.location_name = 'Unassigned Location'
+        THEN EXCLUDED.status
         ELSE nodes.status
       END,
       local_ip = EXCLUDED.local_ip,
@@ -999,22 +977,14 @@ app.get("/", async (req, res) => {
     remoteSupport: {
       enabled: true,
       nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
-      monitorCommandTypes: MONITOR_COMMAND_TYPES,
-      watchdogCommandTypes: WATCHDOG_COMMAND_TYPES,
-      commandPolling: {
-        monitor: "GET /node-commands/:nodeId/pending?runner=monitor",
-        watchdog: "GET /node-commands/:nodeId/pending?runner=watchdog"
-      },
       endpoints: [
         "GET /nodes",
         "POST /nodes/register",
         "GET /node-health",
         "GET /node-health/:nodeId",
         "POST /node-health",
-        "GET /cameras?nodeId=:nodeId&activeOnly=true",
         "POST /node-commands",
-        "GET /node-commands/:nodeId/pending?runner=monitor",
-        "GET /node-commands/:nodeId/pending?runner=watchdog",
+        "GET /node-commands/:nodeId/pending",
         "POST /node-commands/:commandId/result",
         "GET /node-commands/:nodeId"
       ]
@@ -1337,9 +1307,15 @@ app.post("/node-commands", async (req, res) => {
       return res.status(400).json({
         success: false,
         error: "Invalid or missing commandType",
-        monitorCommandTypes: MONITOR_COMMAND_TYPES,
-        watchdogCommandTypes: WATCHDOG_COMMAND_TYPES,
-        allowedCommandTypes: ALL_NODE_COMMAND_TYPES
+        allowedCommandTypes: [
+          "ping",
+          "reload_cameras",
+          "restart_monitors",
+          "ffmpeg_check",
+          "diagnostic_report",
+          "clear_last_error",
+          "rtsp_test"
+        ]
       });
     }
 
@@ -1417,8 +1393,6 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
     }
 
     const nodeId = cleanText(req.params.nodeId);
-    const runner = normalizeCommandRunner(req.query.runner);
-    const commandTypes = commandTypesForRunner(runner);
 
     if (!nodeId) {
       return res.status(400).json({
@@ -1437,11 +1411,10 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
         status = 'pending',
         picked_up_at = NULL
       WHERE node_id = $1
-        AND command_type = ANY($2::text[])
         AND status = 'running'
         AND picked_up_at < NOW() - INTERVAL '5 minutes'
       `,
-      [nodeId, commandTypes]
+      [nodeId]
     );
 
     const pendingResult = await client.query(
@@ -1449,13 +1422,12 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
       SELECT command_id
       FROM node_commands
       WHERE node_id = $1
-        AND command_type = ANY($2::text[])
         AND status = 'pending'
       ORDER BY requested_at ASC
       LIMIT 5
       FOR UPDATE SKIP LOCKED
       `,
-      [nodeId, commandTypes]
+      [nodeId]
     );
 
     const commandIds = pendingResult.rows.map((row) => row.command_id);
@@ -1495,8 +1467,6 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
     return res.status(200).json({
       success: true,
       nodeId,
-      runner,
-      commandTypes,
       count: commands.length,
       commands
     });
@@ -2736,8 +2706,6 @@ initializeDatabase()
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
       console.log("Remote node command queue enabled.");
-      console.log(`Monitor command types: ${MONITOR_COMMAND_TYPES.join(", ")}`);
-      console.log(`Watchdog command types: ${WATCHDOG_COMMAND_TYPES.join(", ")}`);
     });
   })
   .catch((error) => {
