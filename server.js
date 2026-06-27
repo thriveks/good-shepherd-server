@@ -259,6 +259,111 @@ async function initializeDatabase() {
     ON cameras (assigned_node_id)
   `);
 
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sensors (
+      id UUID PRIMARY KEY,
+      node_id TEXT,
+      source_key TEXT NOT NULL UNIQUE,
+      source_name TEXT NOT NULL,
+      sensor_type TEXT NOT NULL DEFAULT 'Motion Sensor',
+      resident_id UUID REFERENCES residents(id) ON DELETE SET NULL,
+      resident_name TEXT NOT NULL DEFAULT 'Unassigned',
+      location_name TEXT NOT NULL DEFAULT 'Unassigned location',
+      room_name TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS node_id TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS source_key TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS source_name TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS sensor_type TEXT NOT NULL DEFAULT 'Motion Sensor'
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS resident_id UUID REFERENCES residents(id) ON DELETE SET NULL
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS resident_name TEXT NOT NULL DEFAULT 'Unassigned'
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS location_name TEXT NOT NULL DEFAULT 'Unassigned location'
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS room_name TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE sensors
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS sensors_source_key_unique_idx
+    ON sensors (source_key)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS sensors_resident_id_idx
+    ON sensors (resident_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS sensors_node_id_idx
+    ON sensors (node_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS sensors_is_deleted_idx
+    ON sensors (is_deleted)
+  `);
+
   await pool.query(`
     INSERT INTO device_mappings (
       source_key,
@@ -969,6 +1074,48 @@ function cameraReturningSQL() {
   `;
 }
 
+
+function sensorSelectSQL() {
+  return `
+    SELECT
+      id,
+      node_id AS "nodeId",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      sensor_type AS "sensorType",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      location_name AS "locationName",
+      room_name AS "roomName",
+      is_active AS "isActive",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM sensors
+  `;
+}
+
+function sensorReturningSQL() {
+  return `
+    RETURNING
+      id,
+      node_id AS "nodeId",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      sensor_type AS "sensorType",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      location_name AS "locationName",
+      room_name AS "roomName",
+      is_active AS "isActive",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+  `;
+}
+
 app.get("/", async (req, res) => {
   res.json({
     success: true,
@@ -986,7 +1133,8 @@ app.get("/", async (req, res) => {
         "POST /node-commands",
         "GET /node-commands/:nodeId/pending",
         "POST /node-commands/:commandId/result",
-        "GET /node-commands/:nodeId"
+        "GET /node-commands/:nodeId",
+        "GET /sensors"
       ]
     }
   });
@@ -2087,6 +2235,19 @@ app.patch("/residents/:residentId", async (req, res) => {
       [residentId, nextName]
     );
 
+    await pool.query(
+      `
+      UPDATE sensors
+      SET
+        resident_name = $2,
+        location_name = $3,
+        updated_at = NOW()
+      WHERE resident_id = $1
+        AND is_deleted = FALSE
+      `,
+      [residentId, nextName, nextLocation]
+    );
+
     return res.status(200).json({
       success: true,
       message: "Resident updated",
@@ -2178,13 +2339,34 @@ app.delete("/residents/:residentId", async (req, res) => {
         [residentId, deletedResidentName]
       );
 
+      const sensorResult = await client.query(
+        `
+        UPDATE sensors
+        SET
+          is_deleted = TRUE,
+          deleted_at = NOW(),
+          resident_id = NULL,
+          resident_name = 'Unassigned',
+          is_active = FALSE,
+          updated_at = NOW()
+        WHERE is_deleted = FALSE
+          AND (
+            resident_id = $1
+            OR LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
+          )
+        RETURNING id
+        `,
+        [residentId, deletedResidentName]
+      );
+
       await client.query("COMMIT");
 
       return res.status(200).json({
         success: true,
         message: "Resident deleted",
         resident: residentResult.rows[0],
-        affectedCameraCount: cameraResult.rows.length
+        affectedCameraCount: cameraResult.rows.length,
+        affectedSensorCount: sensorResult.rows.length
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -2525,6 +2707,243 @@ app.delete("/cameras/:cameraId", async (req, res) => {
   }
 });
 
+
+
+app.get("/sensors", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const includeDeleted = parseBooleanQuery(req.query.includeDeleted);
+    const activeOnly = parseBooleanQuery(req.query.activeOnly);
+    const residentId = cleanText(req.query.residentId);
+    const nodeId = cleanText(req.query.nodeId);
+
+    const result = await pool.query(
+      `
+      ${sensorSelectSQL()}
+      WHERE ($1::boolean = TRUE OR is_deleted = FALSE)
+        AND ($2::boolean = FALSE OR is_active = TRUE)
+        AND ($3::text IS NULL OR resident_id::text = $3)
+        AND ($4::text IS NULL OR node_id = $4)
+      ORDER BY is_deleted ASC, source_name ASC, created_at ASC
+      `,
+      [
+        includeDeleted,
+        activeOnly,
+        residentId || null,
+        nodeId || null
+      ]
+    );
+
+    return res.status(200).json({
+      success: true,
+      includeDeleted,
+      activeOnly,
+      count: result.rows.length,
+      sensors: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch sensors:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch sensors"
+    });
+  }
+});
+
+async function findOrCreateResidentFromEvent({ residentName, locationName, alertLevel, message }) {
+  const name = cleanText(residentName);
+  const location = cleanText(locationName) || "Unassigned location";
+  const normalizedAlertLevel = normalizeAlertLevel(alertLevel);
+  const activeWarnings = warningCountForAlertLevel(normalizedAlertLevel);
+  const lastActivity = cleanText(message) || "Device event received.";
+
+  if (!name) {
+    return null;
+  }
+
+  const existing = await pool.query(
+    `
+    ${residentSelectSQL()}
+    WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+      AND is_deleted = FALSE
+    ORDER BY created_at ASC
+    LIMIT 1
+    `,
+    [name]
+  );
+
+  if (existing.rows[0]) {
+    const result = await pool.query(
+      `
+      UPDATE residents
+      SET
+        location = CASE
+          WHEN location IS NULL
+            OR TRIM(location) = ''
+            OR location = 'Unassigned location'
+          THEN $2
+          ELSE location
+        END,
+        alert_level = $3,
+        active_warnings = $4,
+        last_activity = $5,
+        status_text = 'Active monitoring',
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING
+        id,
+        name,
+        location,
+        alert_level AS "alertLevel",
+        last_activity AS "lastActivity",
+        active_warnings AS "activeWarnings",
+        status_text AS "statusText",
+        is_deleted AS "isDeleted",
+        deleted_at AS "deletedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [
+        existing.rows[0].id,
+        location,
+        normalizedAlertLevel,
+        activeWarnings,
+        lastActivity
+      ]
+    );
+
+    return result.rows[0];
+  }
+
+  const result = await pool.query(
+    `
+    INSERT INTO residents (
+      id,
+      name,
+      location,
+      alert_level,
+      last_activity,
+      active_warnings,
+      status_text,
+      is_deleted,
+      deleted_at,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, 'Active monitoring', FALSE, NULL, NOW(), NOW())
+    RETURNING
+      id,
+      name,
+      location,
+      alert_level AS "alertLevel",
+      last_activity AS "lastActivity",
+      active_warnings AS "activeWarnings",
+      status_text AS "statusText",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    `,
+    [
+      randomUUID(),
+      name,
+      location,
+      normalizedAlertLevel,
+      lastActivity,
+      activeWarnings
+    ]
+  );
+
+  return result.rows[0];
+}
+
+function inferRoomNameFromSourceName(sourceName) {
+  const cleanSourceName = cleanText(sourceName);
+
+  if (!cleanSourceName) {
+    return null;
+  }
+
+  const parts = cleanSourceName.split(" - ").map((part) => cleanText(part)).filter(Boolean);
+
+  if (parts.length >= 2) {
+    return parts[parts.length - 1];
+  }
+
+  return null;
+}
+
+async function upsertSensorFromEvent({
+  nodeId,
+  sourceKey,
+  sourceName,
+  resident,
+  residentName,
+  locationName
+}) {
+  const resolvedSourceKey = cleanText(sourceKey);
+
+  if (!resolvedSourceKey) {
+    return null;
+  }
+
+  const resolvedSourceName = cleanText(sourceName) || "Motion Sensor";
+  const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
+  const resolvedLocationName = cleanText(locationName) || resident?.location || "Unassigned location";
+  const resolvedRoomName = inferRoomNameFromSourceName(resolvedSourceName);
+
+  const result = await pool.query(
+    `
+    INSERT INTO sensors (
+      id,
+      node_id,
+      source_key,
+      source_name,
+      sensor_type,
+      resident_id,
+      resident_name,
+      location_name,
+      room_name,
+      is_active,
+      is_deleted,
+      deleted_at,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, TRUE, FALSE, NULL, NOW(), NOW())
+    ON CONFLICT (source_key)
+    DO UPDATE SET
+      node_id = EXCLUDED.node_id,
+      source_name = EXCLUDED.source_name,
+      sensor_type = EXCLUDED.sensor_type,
+      resident_id = EXCLUDED.resident_id,
+      resident_name = EXCLUDED.resident_name,
+      location_name = EXCLUDED.location_name,
+      room_name = EXCLUDED.room_name,
+      is_active = TRUE,
+      is_deleted = FALSE,
+      deleted_at = NULL,
+      updated_at = NOW()
+    ${sensorReturningSQL()}
+    `,
+    [
+      randomUUID(),
+      cleanText(nodeId) || null,
+      resolvedSourceKey,
+      resolvedSourceName,
+      resident?.id || null,
+      resolvedResidentName,
+      resolvedLocationName,
+      resolvedRoomName
+    ]
+  );
+
+  return result.rows[0];
+}
+
 app.get("/device-mappings", async (req, res) => {
   try {
     const result = await pool.query(
@@ -2623,6 +3042,22 @@ app.post("/webhook", async (req, res) => {
       await touchNodeFromWebhook(resolvedNodeId);
     }
 
+    const resident = await findOrCreateResidentFromEvent({
+      residentName: resolvedResidentName,
+      locationName: resolvedLocationName,
+      alertLevel: resolvedAlertLevel,
+      message
+    });
+
+    const sensor = await upsertSensorFromEvent({
+      nodeId: resolvedNodeId,
+      sourceKey: resolvedSourceKey,
+      sourceName: resolvedSourceName,
+      resident,
+      residentName: resolvedResidentName,
+      locationName: resolvedLocationName
+    });
+
     const event = {
       id: randomUUID(),
       nodeId: resolvedNodeId || null,
@@ -2688,7 +3123,9 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Webhook event received",
-      event
+      event,
+      resident,
+      sensor
     });
   } catch (error) {
     console.error("Webhook processing failed:", error);
