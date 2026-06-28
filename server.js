@@ -2915,6 +2915,9 @@ app.get("/sensor-config/:nodeId", async (req, res) => {
 });
 
 app.post("/sensor-commands", async (req, res) => {
+  const client = await pool.connect();
+  let didBegin = false;
+
   try {
     if (!requireAuthorizedRequest(req, res)) {
       return;
@@ -2937,11 +2940,19 @@ app.post("/sensor-commands", async (req, res) => {
         success: false,
         error: "Invalid or missing commandType",
         allowedCommandTypes: [
-          "ping",
-          "factory_reset",
-          "reconfigure",
-          "reboot",
-          "update_firmware"
+          "reconfigure"
+        ]
+      });
+    }
+
+    // Phase 3 sensor firmware currently supports reconfigure only.
+    // Do not allow ping/reboot/factory_reset/update_firmware to enter the sensor queue yet.
+    if (commandType !== "reconfigure") {
+      return res.status(400).json({
+        success: false,
+        error: "ESP32 sensor firmware currently supports only reconfigure.",
+        allowedCommandTypes: [
+          "reconfigure"
         ]
       });
     }
@@ -2955,7 +2966,26 @@ app.post("/sensor-commands", async (req, res) => {
       });
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+    didBegin = true;
+
+    // Source fix: reconfigure is one-shot. Before creating a new one,
+    // cancel any older pending/running sensor commands for this node.
+    await client.query(
+      `
+      UPDATE node_commands
+      SET
+        status = 'failed',
+        completed_at = NOW(),
+        error = 'Superseded by newer sensor reconfigure command'
+      WHERE node_id = $1
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+        AND status IN ('pending', 'running')
+      `,
+      [nodeId]
+    );
+
+    const result = await client.query(
       `
       INSERT INTO node_commands (
         command_id,
@@ -2993,17 +3023,26 @@ app.post("/sensor-commands", async (req, res) => {
       ]
     );
 
+    await client.query("COMMIT");
+    didBegin = false;
+
     return res.status(201).json({
       success: true,
-      message: "Sensor command created",
+      message: "Sensor reconfigure command created",
       command: result.rows[0]
     });
   } catch (error) {
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
     console.error("Create sensor command failed:", error);
     return res.status(500).json({
       success: false,
       error: error.message
     });
+  } finally {
+    client.release();
   }
 });
 
@@ -3028,28 +3067,35 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
     await client.query("BEGIN");
     didBegin = true;
 
+    // Source fix: never re-deliver old/stale sensor commands.
+    // A reconfigure command is valid only briefly and only while pending.
     await client.query(
       `
       UPDATE node_commands
       SET
-        status = 'pending',
-        picked_up_at = NULL
+        status = 'failed',
+        completed_at = NOW(),
+        error = 'Expired stale sensor command'
       WHERE node_id = $1
-        AND status = 'running'
-        AND picked_up_at < NOW() - INTERVAL '5 minutes'
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+        AND status IN ('pending', 'running')
+        AND requested_at < NOW() - INTERVAL '2 minutes'
       `,
       [nodeId]
     );
 
+    // Sensor firmware currently supports reconfigure only.
+    // Return one fresh pending command, not a batch.
     const pendingResult = await client.query(
       `
       SELECT command_id
       FROM node_commands
       WHERE node_id = $1
         AND status = 'pending'
-        AND command_type IN ('ping', 'factory_reset', 'reconfigure', 'reboot', 'update_firmware')
-      ORDER BY requested_at ASC
-      LIMIT 3
+        AND command_type = 'reconfigure'
+        AND requested_at >= NOW() - INTERVAL '2 minutes'
+      ORDER BY requested_at DESC
+      LIMIT 1
       FOR UPDATE SKIP LOCKED
       `,
       [nodeId]
@@ -3110,6 +3156,9 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
 });
 
 app.post("/sensor-commands/:commandId/result", async (req, res) => {
+  const client = await pool.connect();
+  let didBegin = false;
+
   try {
     if (!requireAuthorizedRequest(req, res)) {
       return;
@@ -3134,7 +3183,10 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
       });
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+    didBegin = true;
+
+    const result = await client.query(
       `
       UPDATE node_commands
       SET
@@ -3165,23 +3217,54 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
     );
 
     if (!result.rows[0]) {
+      await client.query("ROLLBACK");
+      didBegin = false;
+
       return res.status(404).json({
         success: false,
         error: `Command not found: ${commandId}`
       });
     }
 
+    const completedCommand = result.rows[0];
+
+    // Source fix: after a sensor command reports a result, clear any other
+    // pending/running sensor commands for the same node so they cannot fire later.
+    await client.query(
+      `
+      UPDATE node_commands
+      SET
+        status = 'failed',
+        completed_at = NOW(),
+        error = 'Cleared after sensor command result'
+      WHERE node_id = $1
+        AND command_id <> $2
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+        AND status IN ('pending', 'running')
+      `,
+      [completedCommand.nodeId, commandId]
+    );
+
+    await client.query("COMMIT");
+    didBegin = false;
+
     return res.status(200).json({
       success: true,
       message: "Sensor command result saved",
-      command: result.rows[0]
+      command: completedCommand
     });
   } catch (error) {
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
     console.error("Save sensor command result failed:", error);
     return res.status(500).json({
       success: false,
       error: error.message
     });
+  } finally {
+    client.release();
   }
 });
 
