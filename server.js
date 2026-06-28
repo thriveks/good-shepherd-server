@@ -845,6 +845,36 @@ async function upsertNodeHealth(payload) {
     softwareVersion
   });
 
+  // ESP32 sensors report their identity in node-health diagnostics.
+  // Create/update the sensor record during heartbeat so the app can see
+  // new sensors before the first motion event fires.
+  if (diagnostics && diagnostics.sourceKey) {
+    const heartbeatDeviceName = cleanText(diagnostics.deviceName) || "Motion Sensor";
+    const heartbeatRoomName = cleanText(diagnostics.roomName);
+    const heartbeatResidentName = cleanText(diagnostics.residentName);
+    const heartbeatLocationName = cleanText(locationName) || "Unassigned location";
+
+    const heartbeatSourceName = heartbeatRoomName
+      ? `${heartbeatDeviceName} - ${heartbeatRoomName}`
+      : heartbeatDeviceName;
+
+    const resident = await findOrCreateResidentFromEvent({
+      residentName: heartbeatResidentName,
+      locationName: heartbeatLocationName,
+      alertLevel: "Normal",
+      message: "ESP32 sensor heartbeat"
+    });
+
+    await upsertSensorFromEvent({
+      nodeId,
+      sourceKey: diagnostics.sourceKey,
+      sourceName: heartbeatSourceName,
+      resident,
+      residentName: heartbeatResidentName,
+      locationName: heartbeatLocationName
+    });
+  }
+
   const result = await pool.query(
     `
     INSERT INTO node_health (
