@@ -8,8 +8,9 @@ const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = 180;
+const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 
-app.use(express.json());
+app.use(express.json({ limit: "25mb" }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -33,35 +34,12 @@ async function initializeDatabase() {
     )
   `);
 
-  await pool.query(`
-    ALTER TABLE webhook_events
-    ADD COLUMN IF NOT EXISTS node_id TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE webhook_events
-    ADD COLUMN IF NOT EXISTS location_name TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE webhook_events
-    ADD COLUMN IF NOT EXISTS source_key TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE webhook_events
-    ADD COLUMN IF NOT EXISTS acknowledged BOOLEAN NOT NULL DEFAULT FALSE
-  `);
-
-  await pool.query(`
-    ALTER TABLE webhook_events
-    ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ
-  `);
-
-  await pool.query(`
-    ALTER TABLE webhook_events
-    ADD COLUMN IF NOT EXISTS resolution_note TEXT
-  `);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS node_id TEXT`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS location_name TEXT`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS source_key TEXT`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS acknowledged BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS resolution_note TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
@@ -79,20 +57,9 @@ async function initializeDatabase() {
     )
   `);
 
-  await pool.query(`
-    ALTER TABLE nodes
-    ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT FALSE
-  `);
-
-  await pool.query(`
-    ALTER TABLE nodes
-    ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ
-  `);
-
-  await pool.query(`
-    ALTER TABLE nodes
-    ADD COLUMN IF NOT EXISTS archived_reason TEXT
-  `);
+  await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS archived_reason TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS node_health (
@@ -120,15 +87,8 @@ async function initializeDatabase() {
     )
   `);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS node_health_checked_in_at_idx
-    ON node_health (checked_in_at)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS node_health_monitor_status_idx
-    ON node_health (monitor_status)
-  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS node_health_checked_in_at_idx ON node_health (checked_in_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS node_health_monitor_status_idx ON node_health (monitor_status)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS node_commands (
@@ -146,15 +106,25 @@ async function initializeDatabase() {
     )
   `);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS node_commands_node_id_status_idx
-    ON node_commands (node_id, status)
-  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS node_commands_node_id_status_idx ON node_commands (node_id, status)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS node_commands_requested_at_idx ON node_commands (requested_at)`);
 
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS node_commands_requested_at_idx
-    ON node_commands (requested_at)
+    CREATE TABLE IF NOT EXISTS firmware_releases (
+      id UUID PRIMARY KEY,
+      firmware_version TEXT NOT NULL UNIQUE,
+      firmware_url TEXT NOT NULL,
+      sha256 TEXT,
+      release_notes TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS firmware_releases_is_active_idx ON firmware_releases (is_active)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS firmware_releases_created_at_idx ON firmware_releases (created_at)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS device_mappings (
@@ -199,66 +169,18 @@ async function initializeDatabase() {
     )
   `);
 
-  await pool.query(`
-    ALTER TABLE cameras
-    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE
-  `);
-
-  await pool.query(`
-    ALTER TABLE cameras
-    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
-  `);
-
-  await pool.query(`
-    ALTER TABLE cameras
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-
-  await pool.query(`
-    ALTER TABLE cameras
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-
-  await pool.query(`
-    ALTER TABLE residents
-    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE
-  `);
-
-  await pool.query(`
-    ALTER TABLE residents
-    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
-  `);
-
-  await pool.query(`
-    ALTER TABLE residents
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-
-  await pool.query(`
-    ALTER TABLE residents
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS residents_is_deleted_idx
-    ON residents (is_deleted)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS cameras_is_deleted_idx
-    ON cameras (is_deleted)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS cameras_resident_id_idx
-    ON cameras (resident_id)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS cameras_assigned_node_id_idx
-    ON cameras (assigned_node_id)
-  `);
-
+  await pool.query(`ALTER TABLE cameras ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE cameras ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE cameras ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE cameras ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE residents ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE residents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE residents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE residents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS residents_is_deleted_idx ON residents (is_deleted)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS cameras_is_deleted_idx ON cameras (is_deleted)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS cameras_resident_id_idx ON cameras (resident_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS cameras_assigned_node_id_idx ON cameras (assigned_node_id)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sensors (
@@ -279,90 +201,23 @@ async function initializeDatabase() {
     )
   `);
 
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS node_id TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS source_key TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS source_name TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS sensor_type TEXT NOT NULL DEFAULT 'Motion Sensor'
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS resident_id UUID REFERENCES residents(id) ON DELETE SET NULL
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS resident_name TEXT NOT NULL DEFAULT 'Unassigned'
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS location_name TEXT NOT NULL DEFAULT 'Unassigned location'
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS room_name TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-
-  await pool.query(`
-    ALTER TABLE sensors
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS sensors_source_key_unique_idx
-    ON sensors (source_key)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS sensors_resident_id_idx
-    ON sensors (resident_id)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS sensors_node_id_idx
-    ON sensors (node_id)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS sensors_is_deleted_idx
-    ON sensors (is_deleted)
-  `);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS node_id TEXT`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS source_key TEXT`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS source_name TEXT`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS sensor_type TEXT NOT NULL DEFAULT 'Motion Sensor'`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS resident_id UUID REFERENCES residents(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS resident_name TEXT NOT NULL DEFAULT 'Unassigned'`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS location_name TEXT NOT NULL DEFAULT 'Unassigned location'`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS room_name TEXT`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS sensors_source_key_unique_idx ON sensors (source_key)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS sensors_resident_id_idx ON sensors (resident_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS sensors_node_id_idx ON sensors (node_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS sensors_is_deleted_idx ON sensors (is_deleted)`);
 
   await pool.query(`
     INSERT INTO device_mappings (
@@ -372,100 +227,15 @@ async function initializeDatabase() {
       default_alert_level,
       default_time_text
     )
-    VALUES
-      (
-        'thrive-office-wyze',
-        'Office Wyze Camera',
-        'Mary Thompson',
-        'Caution',
-        'Office Motion Event'
-      )
+    VALUES (
+      'thrive-office-wyze',
+      'Office Wyze Camera',
+      'Mary Thompson',
+      'Caution',
+      'Office Motion Event'
+    )
     ON CONFLICT (source_key) DO NOTHING
   `);
-}
-
-function isAuthorizedWebhook(req) {
-  if (!WEBHOOK_SECRET) {
-    return true;
-  }
-
-  const incomingSecret = req.header("x-webhook-secret");
-  return incomingSecret && incomingSecret === WEBHOOK_SECRET;
-}
-
-function requireAuthorizedRequest(req, res) {
-  if (!isAuthorizedWebhook(req)) {
-    res.status(401).json({
-      success: false,
-      error: "Unauthorized request"
-    });
-
-    return false;
-  }
-
-  return true;
-}
-
-function requestAppBuild(req) {
-  const rawBuild = cleanText(req.header("x-app-build"));
-
-  if (!rawBuild) {
-    return null;
-  }
-
-  const parsedBuild = Number(rawBuild);
-
-  if (!Number.isFinite(parsedBuild)) {
-    return null;
-  }
-
-  return parsedBuild;
-}
-
-function requestAppVersion(req) {
-  return cleanText(req.header("x-app-version")) || "Unknown";
-}
-
-function requestAppClient(req) {
-  return cleanText(req.header("x-app-client")) || "Unknown";
-}
-
-function requireMinimumIOSAppBuildForSetupWrites(req, res) {
-  const build = requestAppBuild(req);
-  const version = requestAppVersion(req);
-  const client = requestAppClient(req);
-
-  if (build === null || build < MIN_IOS_APP_BUILD) {
-    console.warn("Blocked old app setup write:", {
-      path: req.path,
-      method: req.method,
-      client,
-      version,
-      build,
-      minimumRequiredBuild: MIN_IOS_APP_BUILD
-    });
-
-    res.status(426).json({
-      success: false,
-      error: "This app build is too old to change resident or camera setup. Please update the app.",
-      appBuild: build,
-      minimumRequiredBuild: MIN_IOS_APP_BUILD,
-      appVersion: version,
-      appClient: client
-    });
-
-    return false;
-  }
-
-  return true;
-}
-
-function requireAuthorizedCurrentAppWrite(req, res) {
-  if (!requireAuthorizedRequest(req, res)) {
-    return false;
-  }
-
-  return requireMinimumIOSAppBuildForSetupWrites(req, res);
 }
 
 function cleanText(value) {
@@ -516,12 +286,7 @@ function warningCountForAlertLevel(alertLevel) {
 
 function validUuidOrGenerated(value) {
   const cleanValue = cleanText(value);
-
-  if (!cleanValue) {
-    return randomUUID();
-  }
-
-  return cleanValue;
+  return cleanValue || randomUUID();
 }
 
 function normalizeHealthText(value, fallback) {
@@ -546,6 +311,85 @@ function normalizeJsonObject(value) {
   return {};
 }
 
+function isAuthorizedWebhook(req) {
+  if (!WEBHOOK_SECRET) {
+    return true;
+  }
+
+  const incomingSecret = req.header("x-webhook-secret");
+  return incomingSecret && incomingSecret === WEBHOOK_SECRET;
+}
+
+function requireAuthorizedRequest(req, res) {
+  if (!isAuthorizedWebhook(req)) {
+    res.status(401).json({
+      success: false,
+      error: "Unauthorized request"
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
+function requestAppBuild(req) {
+  const rawBuild = cleanText(req.header("x-app-build"));
+
+  if (!rawBuild) {
+    return null;
+  }
+
+  const parsedBuild = Number(rawBuild);
+  return Number.isFinite(parsedBuild) ? parsedBuild : null;
+}
+
+function requestAppVersion(req) {
+  return cleanText(req.header("x-app-version")) || "Unknown";
+}
+
+function requestAppClient(req) {
+  return cleanText(req.header("x-app-client")) || "Unknown";
+}
+
+function requireMinimumIOSAppBuildForSetupWrites(req, res) {
+  const build = requestAppBuild(req);
+  const version = requestAppVersion(req);
+  const client = requestAppClient(req);
+
+  if (build === null || build < MIN_IOS_APP_BUILD) {
+    console.warn("Blocked old app setup write:", {
+      path: req.path,
+      method: req.method,
+      client,
+      version,
+      build,
+      minimumRequiredBuild: MIN_IOS_APP_BUILD
+    });
+
+    res.status(426).json({
+      success: false,
+      error: "This app build is too old to change resident or camera setup. Please update the app.",
+      appBuild: build,
+      minimumRequiredBuild: MIN_IOS_APP_BUILD,
+      appVersion: version,
+      appClient: client
+    });
+
+    return false;
+  }
+
+  return true;
+}
+
+function requireAuthorizedCurrentAppWrite(req, res) {
+  if (!requireAuthorizedRequest(req, res)) {
+    return false;
+  }
+
+  return requireMinimumIOSAppBuildForSetupWrites(req, res);
+}
+
 function normalizeNodeCommandType(value) {
   const commandType = cleanText(value).toLowerCase();
 
@@ -563,11 +407,7 @@ function normalizeNodeCommandType(value) {
     "update_firmware"
   ]);
 
-  if (!allowedCommands.has(commandType)) {
-    return null;
-  }
-
-  return commandType;
+  return allowedCommands.has(commandType) ? commandType : null;
 }
 
 function normalizeCommandStatus(value) {
@@ -586,6 +426,204 @@ function normalizeCommandStatus(value) {
   }
 
   return "pending";
+}
+
+function isValidFirmwareUrl(value) {
+  const url = cleanText(value);
+
+  if (!url) {
+    return false;
+  }
+
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function eventSelectSQL() {
+  return `
+    SELECT
+      id,
+      node_id AS "nodeId",
+      location_name AS "locationName",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      resident_name AS "residentName",
+      message,
+      alert_level AS "alertLevel",
+      time_text AS "timeText",
+      timestamp,
+      acknowledged AS "isAcknowledged",
+      acknowledged_at AS "acknowledgedAt",
+      resolution_note AS "resolutionNote"
+    FROM webhook_events
+  `;
+}
+
+function nodeHealthSelectSQL() {
+  return `
+    SELECT
+      node_id AS "nodeId",
+      node_name AS "nodeName",
+      location_name AS "locationName",
+      local_ip AS "localIp",
+      local_config_port AS "localConfigPort",
+      camera_count AS "cameraCount",
+      camera_summary AS "cameraSummary",
+      software_version AS "softwareVersion",
+      monitor_status AS "monitorStatus",
+      ffmpeg_status AS "ffmpegStatus",
+      ffmpeg_path AS "ffmpegPath",
+      platform,
+      hostname,
+      uptime_seconds AS "uptimeSeconds",
+      active_monitor_count AS "activeMonitorCount",
+      last_error AS "lastError",
+      last_error_at AS "lastErrorAt",
+      diagnostics,
+      checked_in_at AS "checkedInAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt",
+      EXTRACT(EPOCH FROM (NOW() - checked_in_at))::int AS "secondsSinceCheckIn",
+      CASE
+        WHEN checked_in_at >= NOW() - (${NODE_OFFLINE_AFTER_SECONDS} * INTERVAL '1 second') THEN TRUE
+        ELSE FALSE
+      END AS "isOnline"
+    FROM node_health
+  `;
+}
+
+function nodeCommandSelectSQL() {
+  return `
+    SELECT
+      command_id AS "commandId",
+      node_id AS "nodeId",
+      command_type AS "commandType",
+      payload,
+      status,
+      requested_by AS "requestedBy",
+      requested_at AS "requestedAt",
+      picked_up_at AS "pickedUpAt",
+      completed_at AS "completedAt",
+      result,
+      error
+    FROM node_commands
+  `;
+}
+
+function residentSelectSQL() {
+  return `
+    SELECT
+      id,
+      name,
+      location,
+      alert_level AS "alertLevel",
+      last_activity AS "lastActivity",
+      active_warnings AS "activeWarnings",
+      status_text AS "statusText",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM residents
+  `;
+}
+
+function cameraSelectSQL() {
+  return `
+    SELECT
+      id,
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      rtsp_url AS "rtspUrl",
+      is_active AS "isActive",
+      assigned_node_id AS "assignedNodeId",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM cameras
+  `;
+}
+
+function cameraReturningSQL() {
+  return `
+    RETURNING
+      id,
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      rtsp_url AS "rtspUrl",
+      is_active AS "isActive",
+      assigned_node_id AS "assignedNodeId",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+  `;
+}
+
+function sensorSelectSQL() {
+  return `
+    SELECT
+      id,
+      node_id AS "nodeId",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      sensor_type AS "sensorType",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      location_name AS "locationName",
+      room_name AS "roomName",
+      is_active AS "isActive",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM sensors
+  `;
+}
+
+function sensorReturningSQL() {
+  return `
+    RETURNING
+      id,
+      node_id AS "nodeId",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      sensor_type AS "sensorType",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      location_name AS "locationName",
+      room_name AS "roomName",
+      is_active AS "isActive",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+  `;
+}
+
+function firmwareReleaseSelectSQL() {
+  return `
+    SELECT
+      id,
+      firmware_version AS "firmwareVersion",
+      firmware_url AS "firmwareUrl",
+      sha256,
+      release_notes AS "releaseNotes",
+      is_active AS "isActive",
+      created_by AS "createdBy",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM firmware_releases
+  `;
 }
 
 async function getDeviceMapping(sourceKey) {
@@ -643,6 +681,19 @@ async function getResidentById(residentId) {
     LIMIT 1
     `,
     [residentId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function getLatestFirmwareRelease() {
+  const result = await pool.query(
+    `
+    ${firmwareReleaseSelectSQL()}
+    WHERE is_active = TRUE
+    ORDER BY created_at DESC
+    LIMIT 1
+    `
   );
 
   return result.rows[0] || null;
@@ -845,9 +896,6 @@ async function upsertNodeHealth(payload) {
     softwareVersion
   });
 
-  // ESP32 sensors report their identity in node-health diagnostics.
-  // Create/update the sensor record during heartbeat so the app can see
-  // new sensors before the first motion event fires.
   if (diagnostics && diagnostics.sourceKey) {
     const heartbeatDeviceName = cleanText(diagnostics.deviceName) || "Motion Sensor";
     const heartbeatRoomName = cleanText(diagnostics.roomName);
@@ -982,62 +1030,24 @@ async function upsertNodeHealth(payload) {
   return result.rows[0];
 }
 
-function eventSelectSQL() {
-  return `
-    SELECT
-      id,
-      node_id AS "nodeId",
-      location_name AS "locationName",
-      source_key AS "sourceKey",
-      source_name AS "sourceName",
-      resident_name AS "residentName",
-      message,
-      alert_level AS "alertLevel",
-      time_text AS "timeText",
-      timestamp,
-      acknowledged AS "isAcknowledged",
-      acknowledged_at AS "acknowledgedAt",
-      resolution_note AS "resolutionNote"
-    FROM webhook_events
-  `;
-}
-
-function nodeHealthSelectSQL() {
-  return `
-    SELECT
-      node_id AS "nodeId",
-      node_name AS "nodeName",
-      location_name AS "locationName",
-      local_ip AS "localIp",
-      local_config_port AS "localConfigPort",
-      camera_count AS "cameraCount",
-      camera_summary AS "cameraSummary",
-      software_version AS "softwareVersion",
-      monitor_status AS "monitorStatus",
-      ffmpeg_status AS "ffmpegStatus",
-      ffmpeg_path AS "ffmpegPath",
-      platform,
-      hostname,
-      uptime_seconds AS "uptimeSeconds",
-      active_monitor_count AS "activeMonitorCount",
-      last_error AS "lastError",
-      last_error_at AS "lastErrorAt",
-      diagnostics,
-      checked_in_at AS "checkedInAt",
-      created_at AS "createdAt",
-      updated_at AS "updatedAt",
-      EXTRACT(EPOCH FROM (NOW() - checked_in_at))::int AS "secondsSinceCheckIn",
-      CASE
-        WHEN checked_in_at >= NOW() - (${NODE_OFFLINE_AFTER_SECONDS} * INTERVAL '1 second') THEN TRUE
-        ELSE FALSE
-      END AS "isOnline"
-    FROM node_health
-  `;
-}
-
-function nodeCommandSelectSQL() {
-  return `
-    SELECT
+async function createCommand({ nodeId, commandType, payload, requestedBy }) {
+  const result = await pool.query(
+    `
+    INSERT INTO node_commands (
+      command_id,
+      node_id,
+      command_type,
+      payload,
+      status,
+      requested_by,
+      requested_at,
+      picked_up_at,
+      completed_at,
+      result,
+      error
+    )
+    VALUES ($1, $2, $3, $4::jsonb, 'pending', $5, NOW(), NULL, NULL, NULL, NULL)
+    RETURNING
       command_id AS "commandId",
       node_id AS "nodeId",
       command_type AS "commandType",
@@ -1049,13 +1059,101 @@ function nodeCommandSelectSQL() {
       completed_at AS "completedAt",
       result,
       error
-    FROM node_commands
-  `;
+    `,
+    [
+      randomUUID(),
+      nodeId,
+      commandType,
+      JSON.stringify(payload),
+      requestedBy
+    ]
+  );
+
+  return result.rows[0];
 }
 
-function residentSelectSQL() {
-  return `
-    SELECT
+async function findOrCreateResidentFromEvent({ residentName, locationName, alertLevel, message }) {
+  const name = cleanText(residentName);
+  const location = cleanText(locationName) || "Unassigned location";
+  const normalizedAlertLevel = normalizeAlertLevel(alertLevel);
+  const activeWarnings = warningCountForAlertLevel(normalizedAlertLevel);
+  const lastActivity = cleanText(message) || "Device event received.";
+
+  if (!name) {
+    return null;
+  }
+
+  const existing = await pool.query(
+    `
+    ${residentSelectSQL()}
+    WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+      AND is_deleted = FALSE
+    ORDER BY created_at ASC
+    LIMIT 1
+    `,
+    [name]
+  );
+
+  if (existing.rows[0]) {
+    const result = await pool.query(
+      `
+      UPDATE residents
+      SET
+        location = CASE
+          WHEN location IS NULL
+            OR TRIM(location) = ''
+            OR location = 'Unassigned location'
+          THEN $2
+          ELSE location
+        END,
+        alert_level = $3,
+        active_warnings = $4,
+        last_activity = $5,
+        status_text = 'Active monitoring',
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING
+        id,
+        name,
+        location,
+        alert_level AS "alertLevel",
+        last_activity AS "lastActivity",
+        active_warnings AS "activeWarnings",
+        status_text AS "statusText",
+        is_deleted AS "isDeleted",
+        deleted_at AS "deletedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [
+        existing.rows[0].id,
+        location,
+        normalizedAlertLevel,
+        activeWarnings,
+        lastActivity
+      ]
+    );
+
+    return result.rows[0];
+  }
+
+  const result = await pool.query(
+    `
+    INSERT INTO residents (
+      id,
+      name,
+      location,
+      alert_level,
+      last_activity,
+      active_warnings,
+      status_text,
+      is_deleted,
+      deleted_at,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, 'Active monitoring', FALSE, NULL, NOW(), NOW())
+    RETURNING
       id,
       name,
       location,
@@ -1067,87 +1165,119 @@ function residentSelectSQL() {
       deleted_at AS "deletedAt",
       created_at AS "createdAt",
       updated_at AS "updatedAt"
-    FROM residents
-  `;
+    `,
+    [
+      randomUUID(),
+      name,
+      location,
+      normalizedAlertLevel,
+      lastActivity,
+      activeWarnings
+    ]
+  );
+
+  return result.rows[0];
 }
 
-function cameraSelectSQL() {
-  return `
-    SELECT
-      id,
-      source_key AS "sourceKey",
-      source_name AS "sourceName",
-      resident_id AS "residentId",
-      resident_name AS "residentName",
-      rtsp_url AS "rtspUrl",
-      is_active AS "isActive",
-      assigned_node_id AS "assignedNodeId",
-      is_deleted AS "isDeleted",
-      deleted_at AS "deletedAt",
-      created_at AS "createdAt",
-      updated_at AS "updatedAt"
-    FROM cameras
-  `;
+function inferRoomNameFromSourceName(sourceName) {
+  const cleanSourceName = cleanText(sourceName);
+
+  if (!cleanSourceName) {
+    return null;
+  }
+
+  const parts = cleanSourceName.split(" - ").map((part) => cleanText(part)).filter(Boolean);
+
+  if (parts.length >= 2) {
+    return parts[parts.length - 1];
+  }
+
+  return null;
 }
 
-function cameraReturningSQL() {
-  return `
-    RETURNING
+async function upsertSensorFromEvent({
+  nodeId,
+  sourceKey,
+  sourceName,
+  resident,
+  residentName,
+  locationName
+}) {
+  const resolvedSourceKey = cleanText(sourceKey);
+
+  if (!resolvedSourceKey) {
+    return null;
+  }
+
+  const resolvedSourceName = cleanText(sourceName) || "Motion Sensor";
+  const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
+  const resolvedLocationName = cleanText(locationName) || resident?.location || "Unassigned location";
+  const resolvedRoomName = inferRoomNameFromSourceName(resolvedSourceName);
+
+  const result = await pool.query(
+    `
+    INSERT INTO sensors (
       id,
-      source_key AS "sourceKey",
-      source_name AS "sourceName",
-      resident_id AS "residentId",
-      resident_name AS "residentName",
-      rtsp_url AS "rtspUrl",
-      is_active AS "isActive",
-      assigned_node_id AS "assignedNodeId",
-      is_deleted AS "isDeleted",
-      deleted_at AS "deletedAt",
-      created_at AS "createdAt",
-      updated_at AS "updatedAt"
-  `;
+      node_id,
+      source_key,
+      source_name,
+      sensor_type,
+      resident_id,
+      resident_name,
+      location_name,
+      room_name,
+      is_active,
+      is_deleted,
+      deleted_at,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, TRUE, FALSE, NULL, NOW(), NOW())
+    ON CONFLICT (source_key)
+    DO UPDATE SET
+      node_id = EXCLUDED.node_id,
+      source_name = EXCLUDED.source_name,
+      sensor_type = EXCLUDED.sensor_type,
+      resident_id = EXCLUDED.resident_id,
+      resident_name = EXCLUDED.resident_name,
+      location_name = EXCLUDED.location_name,
+      room_name = EXCLUDED.room_name,
+      is_active = TRUE,
+      is_deleted = FALSE,
+      deleted_at = NULL,
+      updated_at = NOW()
+    ${sensorReturningSQL()}
+    `,
+    [
+      randomUUID(),
+      cleanText(nodeId) || null,
+      resolvedSourceKey,
+      resolvedSourceName,
+      resident?.id || null,
+      resolvedResidentName,
+      resolvedLocationName,
+      resolvedRoomName
+    ]
+  );
+
+  return result.rows[0];
 }
 
-
-function sensorSelectSQL() {
-  return `
-    SELECT
-      id,
-      node_id AS "nodeId",
-      source_key AS "sourceKey",
-      source_name AS "sourceName",
-      sensor_type AS "sensorType",
-      resident_id AS "residentId",
-      resident_name AS "residentName",
-      location_name AS "locationName",
-      room_name AS "roomName",
-      is_active AS "isActive",
-      is_deleted AS "isDeleted",
-      deleted_at AS "deletedAt",
-      created_at AS "createdAt",
-      updated_at AS "updatedAt"
-    FROM sensors
-  `;
-}
-
-function sensorReturningSQL() {
-  return `
-    RETURNING
-      id,
-      node_id AS "nodeId",
-      source_key AS "sourceKey",
-      source_name AS "sourceName",
-      sensor_type AS "sensorType",
-      resident_id AS "residentId",
-      resident_name AS "residentName",
-      location_name AS "locationName",
-      room_name AS "roomName",
-      is_active AS "isActive",
-      is_deleted AS "isDeleted",
-      deleted_at AS "deletedAt",
-      created_at AS "createdAt",
-      updated_at AS "updatedAt"
-  `;
+async function failStaleSensorCommands(client, nodeId) {
+  await client.query(
+    `
+    UPDATE node_commands
+    SET
+      status = 'failed',
+      completed_at = NOW(),
+      error = 'Expired stale sensor command'
+    WHERE node_id = $1
+      AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+      AND status IN ('pending', 'running')
+      AND requested_at < NOW() - ($2::int * INTERVAL '1 minute')
+    `,
+    [nodeId, SENSOR_COMMAND_EXPIRATION_MINUTES]
+  );
 }
 
 app.get("/", async (req, res) => {
@@ -1158,6 +1288,7 @@ app.get("/", async (req, res) => {
     remoteSupport: {
       enabled: true,
       nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
+      sensorCommandExpirationMinutes: SENSOR_COMMAND_EXPIRATION_MINUTES,
       endpoints: [
         "GET /nodes",
         "POST /nodes/register",
@@ -1173,6 +1304,11 @@ app.get("/", async (req, res) => {
         "POST /sensor-commands",
         "GET /sensor-commands/:nodeId/pending",
         "POST /sensor-commands/:commandId/result",
+        "GET /sensor-commands/:nodeId",
+        "GET /firmware/releases",
+        "POST /firmware/releases",
+        "GET /firmware/latest",
+        "POST /firmware/update-node",
         "GET /resident-candidates"
       ]
     }
@@ -1455,6 +1591,7 @@ app.post("/node-health", async (req, res) => {
       ffmpegStatus: health.ffmpegStatus,
       cameraCount: health.cameraCount,
       activeMonitorCount: health.activeMonitorCount,
+      softwareVersion: health.softwareVersion,
       lastError: health.lastError || null
     }, null, 2));
 
@@ -1493,20 +1630,7 @@ app.post("/node-commands", async (req, res) => {
     if (!commandType) {
       return res.status(400).json({
         success: false,
-        error: "Invalid or missing commandType",
-        allowedCommandTypes: [
-          "ping",
-          "reload_cameras",
-          "restart_monitors",
-          "ffmpeg_check",
-          "diagnostic_report",
-          "clear_last_error",
-          "rtsp_test",
-          "factory_reset",
-          "reconfigure",
-          "reboot",
-          "update_firmware"
-        ]
+        error: "Invalid or missing commandType"
       });
     }
 
@@ -1519,51 +1643,20 @@ app.post("/node-commands", async (req, res) => {
       });
     }
 
-    const result = await pool.query(
-      `
-      INSERT INTO node_commands (
-        command_id,
-        node_id,
-        command_type,
-        payload,
-        status,
-        requested_by,
-        requested_at,
-        picked_up_at,
-        completed_at,
-        result,
-        error
-      )
-      VALUES ($1, $2, $3, $4::jsonb, 'pending', $5, NOW(), NULL, NULL, NULL, NULL)
-      RETURNING
-        command_id AS "commandId",
-        node_id AS "nodeId",
-        command_type AS "commandType",
-        payload,
-        status,
-        requested_by AS "requestedBy",
-        requested_at AS "requestedAt",
-        picked_up_at AS "pickedUpAt",
-        completed_at AS "completedAt",
-        result,
-        error
-      `,
-      [
-        randomUUID(),
-        nodeId,
-        commandType,
-        JSON.stringify(payload),
-        requestedBy
-      ]
-    );
+    const command = await createCommand({
+      nodeId,
+      commandType,
+      payload,
+      requestedBy
+    });
 
     console.log("Node command created:");
-    console.log(JSON.stringify(result.rows[0], null, 2));
+    console.log(JSON.stringify(command, null, 2));
 
     return res.status(201).json({
       success: true,
       message: "Node command created",
-      command: result.rows[0]
+      command
     });
   } catch (error) {
     console.error("Create node command failed:", error);
@@ -1622,7 +1715,6 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
     );
 
     const commandIds = pendingResult.rows.map((row) => row.command_id);
-
     let commands = [];
 
     if (commandIds.length > 0) {
@@ -2437,8 +2529,6 @@ app.get("/cameras", async (req, res) => {
     const residentId = cleanText(req.query.residentId);
     const nodeId = cleanText(req.query.nodeId);
 
-    const params = [includeDeleted, activeOnly, residentId || null, nodeId || null];
-
     const result = await pool.query(
       `
       ${cameraSelectSQL()}
@@ -2448,7 +2538,7 @@ app.get("/cameras", async (req, res) => {
         AND ($4::text IS NULL OR assigned_node_id = $4)
       ORDER BY is_deleted ASC, source_name ASC, created_at ASC
       `,
-      params
+      [includeDeleted, activeOnly, residentId || null, nodeId || null]
     );
 
     return res.status(200).json({
@@ -2750,8 +2840,6 @@ app.delete("/cameras/:cameraId", async (req, res) => {
   }
 });
 
-
-
 app.get("/sensors", async (req, res) => {
   try {
     if (!requireAuthorizedRequest(req, res)) {
@@ -2795,7 +2883,6 @@ app.get("/sensors", async (req, res) => {
     });
   }
 });
-
 
 app.get("/resident-candidates", async (req, res) => {
   try {
@@ -2914,6 +3001,50 @@ app.get("/sensor-config/:nodeId", async (req, res) => {
   }
 });
 
+app.get("/sensor-commands/:nodeId", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+    const activeOnly = parseBooleanQuery(req.query.activeOnly);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      ${nodeCommandSelectSQL()}
+      WHERE node_id = $1
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+        AND ($2::boolean = FALSE OR status IN ('pending', 'running'))
+      ORDER BY requested_at DESC
+      LIMIT 50
+      `,
+      [nodeId, activeOnly]
+    );
+
+    return res.status(200).json({
+      success: true,
+      nodeId,
+      activeOnly,
+      count: result.rows.length,
+      commands: result.rows
+    });
+  } catch (error) {
+    console.error("Fetch sensor command history failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.post("/sensor-commands", async (req, res) => {
   const client = await pool.connect();
   let didBegin = false;
@@ -2940,21 +3071,37 @@ app.post("/sensor-commands", async (req, res) => {
         success: false,
         error: "Invalid or missing commandType",
         allowedCommandTypes: [
-          "reconfigure"
+          "reconfigure",
+          "update_firmware"
         ]
       });
     }
 
-    // Phase 3 sensor firmware currently supports reconfigure only.
-    // Do not allow ping/reboot/factory_reset/update_firmware to enter the sensor queue yet.
-    if (commandType !== "reconfigure") {
+    if (!["reconfigure", "update_firmware"].includes(commandType)) {
       return res.status(400).json({
         success: false,
-        error: "ESP32 sensor firmware currently supports only reconfigure.",
+        error: "ESP32 sensor firmware currently supports only reconfigure and update_firmware.",
         allowedCommandTypes: [
-          "reconfigure"
+          "reconfigure",
+          "update_firmware"
         ]
       });
+    }
+
+    if (commandType === "update_firmware") {
+      if (!isValidFirmwareUrl(payload.firmwareUrl)) {
+        return res.status(400).json({
+          success: false,
+          error: "update_firmware requires payload.firmwareUrl as an HTTPS URL"
+        });
+      }
+
+      if (!cleanText(payload.firmwareVersion)) {
+        return res.status(400).json({
+          success: false,
+          error: "update_firmware requires payload.firmwareVersion"
+        });
+      }
     }
 
     const existingNode = await getNodeById(nodeId);
@@ -2969,15 +3116,13 @@ app.post("/sensor-commands", async (req, res) => {
     await client.query("BEGIN");
     didBegin = true;
 
-    // Source fix: reconfigure is one-shot. Before creating a new one,
-    // cancel any older pending/running sensor commands for this node.
     await client.query(
       `
       UPDATE node_commands
       SET
         status = 'failed',
         completed_at = NOW(),
-        error = 'Superseded by newer sensor reconfigure command'
+        error = 'Superseded by newer sensor command'
       WHERE node_id = $1
         AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
         AND status IN ('pending', 'running')
@@ -3028,7 +3173,7 @@ app.post("/sensor-commands", async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      message: "Sensor reconfigure command created",
+      message: `Sensor ${commandType} command created`,
       command: result.rows[0]
     });
   } catch (error) {
@@ -3067,38 +3212,21 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
     await client.query("BEGIN");
     didBegin = true;
 
-    // Source fix: never re-deliver old/stale sensor commands.
-    // A reconfigure command is valid only briefly and only while pending.
-    await client.query(
-      `
-      UPDATE node_commands
-      SET
-        status = 'failed',
-        completed_at = NOW(),
-        error = 'Expired stale sensor command'
-      WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
-        AND status IN ('pending', 'running')
-        AND requested_at < NOW() - INTERVAL '2 minutes'
-      `,
-      [nodeId]
-    );
+    await failStaleSensorCommands(client, nodeId);
 
-    // Sensor firmware currently supports reconfigure only.
-    // Return one fresh pending command, not a batch.
     const pendingResult = await client.query(
       `
       SELECT command_id
       FROM node_commands
       WHERE node_id = $1
         AND status = 'pending'
-        AND command_type = 'reconfigure'
-        AND requested_at >= NOW() - INTERVAL '2 minutes'
+        AND command_type IN ('reconfigure', 'update_firmware')
+        AND requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
       ORDER BY requested_at DESC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
       `,
-      [nodeId]
+      [nodeId, SENSOR_COMMAND_EXPIRATION_MINUTES]
     );
 
     const commandIds = pendingResult.rows.map((row) => row.command_id);
@@ -3228,8 +3356,6 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
 
     const completedCommand = result.rows[0];
 
-    // Source fix: after a sensor command reports a result, clear any other
-    // pending/running sensor commands for the same node so they cannot fire later.
     await client.query(
       `
       UPDATE node_commands
@@ -3268,196 +3394,237 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
   }
 });
 
-async function findOrCreateResidentFromEvent({ residentName, locationName, alertLevel, message }) {
-  const name = cleanText(residentName);
-  const location = cleanText(locationName) || "Unassigned location";
-  const normalizedAlertLevel = normalizeAlertLevel(alertLevel);
-  const activeWarnings = warningCountForAlertLevel(normalizedAlertLevel);
-  const lastActivity = cleanText(message) || "Device event received.";
+app.get("/firmware/releases", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
 
-  if (!name) {
-    return null;
-  }
+    const includeInactive = parseBooleanQuery(req.query.includeInactive);
 
-  const existing = await pool.query(
-    `
-    ${residentSelectSQL()}
-    WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
-      AND is_deleted = FALSE
-    ORDER BY created_at ASC
-    LIMIT 1
-    `,
-    [name]
-  );
-
-  if (existing.rows[0]) {
     const result = await pool.query(
       `
-      UPDATE residents
-      SET
-        location = CASE
-          WHEN location IS NULL
-            OR TRIM(location) = ''
-            OR location = 'Unassigned location'
-          THEN $2
-          ELSE location
-        END,
-        alert_level = $3,
-        active_warnings = $4,
-        last_activity = $5,
-        status_text = 'Active monitoring',
+      ${firmwareReleaseSelectSQL()}
+      WHERE ($1::boolean = TRUE OR is_active = TRUE)
+      ORDER BY created_at DESC
+      `,
+      [includeInactive]
+    );
+
+    return res.status(200).json({
+      success: true,
+      includeInactive,
+      count: result.rows.length,
+      releases: result.rows
+    });
+  } catch (error) {
+    console.error("Fetch firmware releases failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/firmware/releases", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const firmwareVersion = cleanText(req.body?.firmwareVersion);
+    const firmwareUrl = cleanText(req.body?.firmwareUrl);
+    const sha256 = cleanOptionalText(req.body?.sha256);
+    const releaseNotes = cleanOptionalText(req.body?.releaseNotes);
+    const createdBy = cleanText(req.body?.createdBy) || "Good Shepherd Admin";
+    const isActive = typeof req.body?.isActive === "boolean" ? req.body.isActive : true;
+
+    if (!firmwareVersion) {
+      return res.status(400).json({
+        success: false,
+        error: "firmwareVersion is required"
+      });
+    }
+
+    if (!isValidFirmwareUrl(firmwareUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: "firmwareUrl must be a valid HTTPS URL"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO firmware_releases (
+        id,
+        firmware_version,
+        firmware_url,
+        sha256,
+        release_notes,
+        is_active,
+        created_by,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      ON CONFLICT (firmware_version)
+      DO UPDATE SET
+        firmware_url = EXCLUDED.firmware_url,
+        sha256 = EXCLUDED.sha256,
+        release_notes = EXCLUDED.release_notes,
+        is_active = EXCLUDED.is_active,
+        created_by = EXCLUDED.created_by,
         updated_at = NOW()
-      WHERE id = $1
       RETURNING
         id,
-        name,
-        location,
-        alert_level AS "alertLevel",
-        last_activity AS "lastActivity",
-        active_warnings AS "activeWarnings",
-        status_text AS "statusText",
-        is_deleted AS "isDeleted",
-        deleted_at AS "deletedAt",
+        firmware_version AS "firmwareVersion",
+        firmware_url AS "firmwareUrl",
+        sha256,
+        release_notes AS "releaseNotes",
+        is_active AS "isActive",
+        created_by AS "createdBy",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       `,
       [
-        existing.rows[0].id,
-        location,
-        normalizedAlertLevel,
-        activeWarnings,
-        lastActivity
+        randomUUID(),
+        firmwareVersion,
+        firmwareUrl,
+        sha256,
+        releaseNotes,
+        isActive,
+        createdBy
       ]
     );
 
-    return result.rows[0];
+    return res.status(200).json({
+      success: true,
+      message: "Firmware release saved",
+      release: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Save firmware release failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
+});
 
-  const result = await pool.query(
-    `
-    INSERT INTO residents (
-      id,
-      name,
-      location,
-      alert_level,
-      last_activity,
-      active_warnings,
-      status_text,
-      is_deleted,
-      deleted_at,
-      created_at,
-      updated_at
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, 'Active monitoring', FALSE, NULL, NOW(), NOW())
-    RETURNING
-      id,
-      name,
-      location,
-      alert_level AS "alertLevel",
-      last_activity AS "lastActivity",
-      active_warnings AS "activeWarnings",
-      status_text AS "statusText",
-      is_deleted AS "isDeleted",
-      deleted_at AS "deletedAt",
-      created_at AS "createdAt",
-      updated_at AS "updatedAt"
-    `,
-    [
-      randomUUID(),
-      name,
-      location,
-      normalizedAlertLevel,
-      lastActivity,
-      activeWarnings
-    ]
-  );
+app.get("/firmware/latest", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
 
-  return result.rows[0];
-}
+    const latest = await getLatestFirmwareRelease();
 
-function inferRoomNameFromSourceName(sourceName) {
-  const cleanSourceName = cleanText(sourceName);
+    if (!latest) {
+      return res.status(404).json({
+        success: false,
+        error: "No active firmware release found"
+      });
+    }
 
-  if (!cleanSourceName) {
-    return null;
+    return res.status(200).json({
+      success: true,
+      release: latest
+    });
+  } catch (error) {
+    console.error("Fetch latest firmware release failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
+});
 
-  const parts = cleanSourceName.split(" - ").map((part) => cleanText(part)).filter(Boolean);
+app.post("/firmware/update-node", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
 
-  if (parts.length >= 2) {
-    return parts[parts.length - 1];
+    const nodeId = cleanText(req.body?.nodeId);
+    const requestedBy = cleanText(req.body?.requestedBy) || "Good Shepherd Firmware Manager";
+    const explicitFirmwareVersion = cleanText(req.body?.firmwareVersion);
+    const explicitFirmwareUrl = cleanText(req.body?.firmwareUrl);
+    const explicitSha256 = cleanOptionalText(req.body?.sha256);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "nodeId is required"
+      });
+    }
+
+    const node = await getNodeById(nodeId);
+
+    if (!node) {
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    let firmwareVersion = explicitFirmwareVersion;
+    let firmwareUrl = explicitFirmwareUrl;
+    let sha256 = explicitSha256;
+
+    if (!firmwareVersion || !firmwareUrl) {
+      const latest = await getLatestFirmwareRelease();
+
+      if (!latest) {
+        return res.status(404).json({
+          success: false,
+          error: "No active firmware release found. Create one first with POST /firmware/releases."
+        });
+      }
+
+      firmwareVersion = latest.firmwareVersion;
+      firmwareUrl = latest.firmwareUrl;
+      sha256 = latest.sha256 || null;
+    }
+
+    if (!firmwareVersion) {
+      return res.status(400).json({
+        success: false,
+        error: "firmwareVersion is required"
+      });
+    }
+
+    if (!isValidFirmwareUrl(firmwareUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: "firmwareUrl must be a valid HTTPS URL"
+      });
+    }
+
+    const command = await createCommand({
+      nodeId,
+      commandType: "update_firmware",
+      payload: {
+        firmwareVersion,
+        firmwareUrl,
+        sha256
+      },
+      requestedBy
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Firmware update command queued",
+      node,
+      command
+    });
+  } catch (error) {
+    console.error("Queue firmware update failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
-
-  return null;
-}
-
-async function upsertSensorFromEvent({
-  nodeId,
-  sourceKey,
-  sourceName,
-  resident,
-  residentName,
-  locationName
-}) {
-  const resolvedSourceKey = cleanText(sourceKey);
-
-  if (!resolvedSourceKey) {
-    return null;
-  }
-
-  const resolvedSourceName = cleanText(sourceName) || "Motion Sensor";
-  const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
-  const resolvedLocationName = cleanText(locationName) || resident?.location || "Unassigned location";
-  const resolvedRoomName = inferRoomNameFromSourceName(resolvedSourceName);
-
-  const result = await pool.query(
-    `
-    INSERT INTO sensors (
-      id,
-      node_id,
-      source_key,
-      source_name,
-      sensor_type,
-      resident_id,
-      resident_name,
-      location_name,
-      room_name,
-      is_active,
-      is_deleted,
-      deleted_at,
-      created_at,
-      updated_at
-    )
-    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, TRUE, FALSE, NULL, NOW(), NOW())
-    ON CONFLICT (source_key)
-    DO UPDATE SET
-      node_id = EXCLUDED.node_id,
-      source_name = EXCLUDED.source_name,
-      sensor_type = EXCLUDED.sensor_type,
-      resident_id = EXCLUDED.resident_id,
-      resident_name = EXCLUDED.resident_name,
-      location_name = EXCLUDED.location_name,
-      room_name = EXCLUDED.room_name,
-      is_active = TRUE,
-      is_deleted = FALSE,
-      deleted_at = NULL,
-      updated_at = NOW()
-    ${sensorReturningSQL()}
-    `,
-    [
-      randomUUID(),
-      cleanText(nodeId) || null,
-      resolvedSourceKey,
-      resolvedSourceName,
-      resident?.id || null,
-      resolvedResidentName,
-      resolvedLocationName,
-      resolvedRoomName
-    ]
-  );
-
-  return result.rows[0];
-}
+});
 
 app.get("/device-mappings", async (req, res) => {
   try {
@@ -3658,6 +3825,7 @@ initializeDatabase()
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
       console.log("Remote node command queue enabled.");
+      console.log("ESP32 OTA firmware update command support enabled.");
     });
   })
   .catch((error) => {
