@@ -9,6 +9,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = 180;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
+const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -60,6 +61,9 @@ async function initializeDatabase() {
   await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS archived_reason TEXT`);
+  await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS wifi_ssid TEXT`);
+  await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS wifi_rssi INTEGER`);
+  await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS setup_state TEXT NOT NULL DEFAULT 'unassigned'`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS node_health (
@@ -88,6 +92,9 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS node_health_checked_in_at_idx ON node_health (checked_in_at)`);
+  await pool.query(`ALTER TABLE node_health ADD COLUMN IF NOT EXISTS wifi_ssid TEXT`);
+  await pool.query(`ALTER TABLE node_health ADD COLUMN IF NOT EXISTS wifi_rssi INTEGER`);
+  await pool.query(`ALTER TABLE node_health ADD COLUMN IF NOT EXISTS setup_state TEXT NOT NULL DEFAULT 'unassigned'`);
   await pool.query(`CREATE INDEX IF NOT EXISTS node_health_monitor_status_idx ON node_health (monitor_status)`);
 
   await pool.query(`
@@ -217,6 +224,7 @@ async function initializeDatabase() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS sensors_source_key_unique_idx ON sensors (source_key)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS sensors_resident_id_idx ON sensors (resident_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS sensors_node_id_idx ON sensors (node_id)`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS setup_state TEXT NOT NULL DEFAULT 'unassigned'`);
   await pool.query(`CREATE INDEX IF NOT EXISTS sensors_is_deleted_idx ON sensors (is_deleted)`);
 
   await pool.query(`
@@ -310,6 +318,41 @@ function normalizeJsonObject(value) {
 
   return {};
 }
+
+function normalizeSetupState(value) {
+  const setupState = cleanText(value).toLowerCase();
+
+  if (setupState === "assigned" || setupState === "active") {
+    return "assigned";
+  }
+
+  return "unassigned";
+}
+
+function isAssignedSensorRow(row) {
+  if (!row) {
+    return false;
+  }
+
+  return Boolean(row.residentId) ||
+    cleanText(row.residentName).toLowerCase() !== "unassigned" ||
+    cleanText(row.roomName) ||
+    normalizeSetupState(row.setupState) === "assigned";
+}
+
+function sanitizeBulkNodeIds(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return [...new Set(value.map((nodeId) => cleanText(nodeId)).filter(Boolean))];
+}
+
+function normalizeEsp32SensorCommandType(value) {
+  const commandType = normalizeNodeCommandType(value);
+  return ESP32_SENSOR_COMMAND_TYPES.includes(commandType) ? commandType : null;
+}
+
 
 function isAuthorizedWebhook(req) {
   if (!WEBHOOK_SECRET) {
@@ -476,6 +519,9 @@ function nodeHealthSelectSQL() {
       camera_count AS "cameraCount",
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
+      wifi_ssid AS "wifiSsid",
+      wifi_rssi AS "wifiRssi",
+      setup_state AS "setupState",
       monitor_status AS "monitorStatus",
       ffmpeg_status AS "ffmpegStatus",
       ffmpeg_path AS "ffmpegPath",
@@ -583,6 +629,7 @@ function sensorSelectSQL() {
       resident_name AS "residentName",
       location_name AS "locationName",
       room_name AS "roomName",
+      setup_state AS "setupState",
       is_active AS "isActive",
       is_deleted AS "isDeleted",
       deleted_at AS "deletedAt",
@@ -604,6 +651,7 @@ function sensorReturningSQL() {
       resident_name AS "residentName",
       location_name AS "locationName",
       room_name AS "roomName",
+      setup_state AS "setupState",
       is_active AS "isActive",
       is_deleted AS "isDeleted",
       deleted_at AS "deletedAt",
@@ -660,6 +708,9 @@ async function getNodeById(nodeId) {
       camera_count AS "cameraCount",
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
+      wifi_ssid AS "wifiSsid",
+      wifi_rssi AS "wifiRssi",
+      setup_state AS "setupState",
       first_seen_at AS "firstSeenAt",
       last_seen_at AS "lastSeenAt",
       is_archived AS "isArchived",
@@ -709,7 +760,10 @@ async function upsertNodeFromRegistration({
   localConfigPort,
   cameraCount,
   cameraSummary,
-  softwareVersion
+  softwareVersion,
+  wifiSsid,
+  wifiRssi,
+  setupState
 }) {
   const resolvedNodeId = cleanText(nodeId);
 
@@ -727,6 +781,9 @@ async function upsertNodeFromRegistration({
   const resolvedCameraCount = Number.isFinite(Number(cameraCount)) ? Number(cameraCount) : 0;
   const resolvedCameraSummary = Array.isArray(cameraSummary) ? cameraSummary : [];
   const resolvedSoftwareVersion = cleanText(softwareVersion) || null;
+  const resolvedWifiSsid = cleanOptionalText(wifiSsid);
+  const resolvedWifiRssi = Number.isFinite(Number(wifiRssi)) ? Number(wifiRssi) : null;
+  const resolvedSetupState = normalizeSetupState(setupState || resolvedStatus);
 
   const result = await pool.query(
     `
@@ -740,13 +797,16 @@ async function upsertNodeFromRegistration({
       camera_count,
       camera_summary,
       software_version,
+      wifi_ssid,
+      wifi_rssi,
+      setup_state,
       first_seen_at,
       last_seen_at,
       is_archived,
       archived_at,
       archived_reason
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW(), NOW(), FALSE, NULL, NULL)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, NOW(), NOW(), FALSE, NULL, NULL)
     ON CONFLICT (node_id)
     DO UPDATE SET
       node_name = CASE
@@ -783,6 +843,13 @@ async function upsertNodeFromRegistration({
       camera_count = EXCLUDED.camera_count,
       camera_summary = EXCLUDED.camera_summary,
       software_version = EXCLUDED.software_version,
+      wifi_ssid = COALESCE(EXCLUDED.wifi_ssid, nodes.wifi_ssid),
+      wifi_rssi = COALESCE(EXCLUDED.wifi_rssi, nodes.wifi_rssi),
+      setup_state = CASE
+        WHEN EXCLUDED.setup_state = 'assigned' THEN 'assigned'
+        WHEN nodes.setup_state = 'assigned' THEN nodes.setup_state
+        ELSE EXCLUDED.setup_state
+      END,
       last_seen_at = NOW()
     RETURNING
       node_id AS "nodeId",
@@ -794,6 +861,9 @@ async function upsertNodeFromRegistration({
       camera_count AS "cameraCount",
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
+      wifi_ssid AS "wifiSsid",
+      wifi_rssi AS "wifiRssi",
+      setup_state AS "setupState",
       first_seen_at AS "firstSeenAt",
       last_seen_at AS "lastSeenAt",
       is_archived AS "isArchived",
@@ -809,7 +879,10 @@ async function upsertNodeFromRegistration({
       resolvedLocalConfigPort,
       resolvedCameraCount,
       JSON.stringify(resolvedCameraSummary),
-      resolvedSoftwareVersion
+      resolvedSoftwareVersion,
+      resolvedWifiSsid,
+      resolvedWifiRssi,
+      resolvedSetupState
     ]
   );
 
@@ -850,6 +923,9 @@ async function touchNodeFromWebhook(nodeId) {
       camera_count AS "cameraCount",
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
+      wifi_ssid AS "wifiSsid",
+      wifi_rssi AS "wifiRssi",
+      setup_state AS "setupState",
       first_seen_at AS "firstSeenAt",
       last_seen_at AS "lastSeenAt",
       is_archived AS "isArchived",
@@ -885,6 +961,11 @@ async function upsertNodeHealth(payload) {
   const activeMonitorCount = normalizeInteger(payload?.activeMonitorCount, 0);
   const lastError = cleanOptionalText(payload?.lastError);
   const diagnostics = normalizeJsonObject(payload?.diagnostics);
+  const wifiSsid = cleanOptionalText(payload?.wifiSsid ?? payload?.ssid ?? diagnostics?.wifiSsid ?? diagnostics?.ssid);
+  const wifiRssi = Number.isFinite(Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi))
+    ? Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi)
+    : null;
+  const setupState = normalizeSetupState(payload?.setupState ?? diagnostics?.setupState);
   const lastErrorAt = lastError ? new Date().toISOString() : null;
 
   await upsertNodeFromRegistration({
@@ -895,7 +976,10 @@ async function upsertNodeHealth(payload) {
     localConfigPort,
     cameraCount,
     cameraSummary,
-    softwareVersion
+    softwareVersion,
+    wifiSsid,
+    wifiRssi,
+    setupState
   });
 
   if (diagnostics && diagnostics.sourceKey) {
@@ -936,6 +1020,9 @@ async function upsertNodeHealth(payload) {
       camera_count,
       camera_summary,
       software_version,
+      wifi_ssid,
+      wifi_rssi,
+      setup_state,
       monitor_status,
       ffmpeg_status,
       ffmpeg_path,
@@ -951,8 +1038,8 @@ async function upsertNodeHealth(payload) {
       updated_at
     )
     VALUES (
-      $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10,
-      $11, $12, $13, $14, $15, $16, $17, $18::jsonb, NOW(), NOW(), NOW()
+      $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13,
+      $14, $15, $16, $17, $18, $19, $20, $21::jsonb, NOW(), NOW(), NOW()
     )
     ON CONFLICT (node_id)
     DO UPDATE SET
@@ -963,6 +1050,9 @@ async function upsertNodeHealth(payload) {
       camera_count = EXCLUDED.camera_count,
       camera_summary = EXCLUDED.camera_summary,
       software_version = EXCLUDED.software_version,
+      wifi_ssid = EXCLUDED.wifi_ssid,
+      wifi_rssi = EXCLUDED.wifi_rssi,
+      setup_state = EXCLUDED.setup_state,
       monitor_status = EXCLUDED.monitor_status,
       ffmpeg_status = EXCLUDED.ffmpeg_status,
       ffmpeg_path = EXCLUDED.ffmpeg_path,
@@ -987,6 +1077,9 @@ async function upsertNodeHealth(payload) {
       camera_count AS "cameraCount",
       camera_summary AS "cameraSummary",
       software_version AS "softwareVersion",
+      wifi_ssid AS "wifiSsid",
+      wifi_rssi AS "wifiRssi",
+      setup_state AS "setupState",
       monitor_status AS "monitorStatus",
       ffmpeg_status AS "ffmpegStatus",
       ffmpeg_path AS "ffmpegPath",
@@ -1002,7 +1095,7 @@ async function upsertNodeHealth(payload) {
       updated_at AS "updatedAt",
       EXTRACT(EPOCH FROM (NOW() - checked_in_at))::int AS "secondsSinceCheckIn",
       CASE
-        WHEN checked_in_at >= NOW() - ($19::int * INTERVAL '1 second') THEN TRUE
+        WHEN checked_in_at >= NOW() - ($22::int * INTERVAL '1 second') THEN TRUE
         ELSE FALSE
       END AS "isOnline"
     `,
@@ -1015,6 +1108,9 @@ async function upsertNodeHealth(payload) {
       cameraCount,
       JSON.stringify(cameraSummary),
       softwareVersion,
+      wifiSsid,
+      wifiRssi,
+      setupState,
       monitorStatus,
       ffmpegStatus,
       ffmpegPath,
@@ -1228,13 +1324,14 @@ async function upsertSensorFromEvent({
       resident_name,
       location_name,
       room_name,
+      setup_state,
       is_active,
       is_deleted,
       deleted_at,
       created_at,
       updated_at
     )
-    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, TRUE, FALSE, NULL, NOW(), NOW())
+    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, $9, TRUE, FALSE, NULL, NOW(), NOW())
     ON CONFLICT (source_key)
     DO UPDATE SET
       node_id = EXCLUDED.node_id,
@@ -1244,6 +1341,7 @@ async function upsertSensorFromEvent({
       resident_name = EXCLUDED.resident_name,
       location_name = EXCLUDED.location_name,
       room_name = EXCLUDED.room_name,
+      setup_state = EXCLUDED.setup_state,
       is_active = TRUE,
       is_deleted = FALSE,
       deleted_at = NULL,
@@ -1258,11 +1356,227 @@ async function upsertSensorFromEvent({
       resident?.id || null,
       resolvedResidentName,
       resolvedLocationName,
-      resolvedRoomName
+      resolvedRoomName,
+      resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned"
     ]
   );
 
   return result.rows[0];
+}
+
+async function updateSensorAssignment({ nodeId, residentId, residentName, locationName, roomName, sourceName, sourceKey }) {
+  const resolvedNodeId = cleanText(nodeId);
+
+  if (!resolvedNodeId) {
+    throw new Error("Missing required field: nodeId");
+  }
+
+  const existingNode = await getNodeById(resolvedNodeId);
+
+  if (!existingNode) {
+    throw new Error(`Node not found: ${resolvedNodeId}`);
+  }
+
+  let resolvedResidentId = cleanOptionalText(residentId);
+  let resolvedResidentName = cleanText(residentName);
+  let resolvedLocationName = cleanText(locationName) || existingNode.locationName || "Unassigned Location";
+
+  if (resolvedResidentId) {
+    const resident = await getResidentById(resolvedResidentId);
+
+    if (!resident || resident.isDeleted) {
+      throw new Error(`Resident not found: ${resolvedResidentId}`);
+    }
+
+    resolvedResidentName = resident.name;
+    resolvedLocationName = cleanText(locationName) || resident.location || resolvedLocationName;
+  } else {
+    resolvedResidentId = null;
+    resolvedResidentName = resolvedResidentName || "Unassigned";
+  }
+
+  const resolvedRoomName = cleanOptionalText(roomName);
+  const resolvedSourceKey = cleanText(sourceKey) || resolvedNodeId;
+  const resolvedSourceName =
+    cleanText(sourceName) ||
+    (resolvedRoomName ? `Motion Sensor - ${resolvedRoomName}` : (existingNode.nodeName || "Motion Sensor"));
+  const setupState = resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned";
+
+  const sensorResult = await pool.query(
+    `
+    INSERT INTO sensors (
+      id,
+      node_id,
+      source_key,
+      source_name,
+      sensor_type,
+      resident_id,
+      resident_name,
+      location_name,
+      room_name,
+      setup_state,
+      is_active,
+      is_deleted,
+      deleted_at,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, $9, TRUE, FALSE, NULL, NOW(), NOW())
+    ON CONFLICT (source_key)
+    DO UPDATE SET
+      node_id = EXCLUDED.node_id,
+      source_name = EXCLUDED.source_name,
+      sensor_type = EXCLUDED.sensor_type,
+      resident_id = EXCLUDED.resident_id,
+      resident_name = EXCLUDED.resident_name,
+      location_name = EXCLUDED.location_name,
+      room_name = EXCLUDED.room_name,
+      setup_state = EXCLUDED.setup_state,
+      is_active = TRUE,
+      is_deleted = FALSE,
+      deleted_at = NULL,
+      updated_at = NOW()
+    ${sensorReturningSQL()}
+    `,
+    [
+      randomUUID(),
+      resolvedNodeId,
+      resolvedSourceKey,
+      resolvedSourceName,
+      resolvedResidentId,
+      resolvedResidentName,
+      resolvedLocationName,
+      resolvedRoomName,
+      setupState
+    ]
+  );
+
+  const nodeResult = await pool.query(
+    `
+    UPDATE nodes
+    SET
+      node_name = $2,
+      location_name = $3,
+      status = CASE WHEN $4 = 'assigned' THEN 'Active' ELSE 'Pending Setup' END,
+      setup_state = $4,
+      last_seen_at = NOW()
+    WHERE node_id = $1
+    RETURNING
+      node_id AS "nodeId",
+      node_name AS "nodeName",
+      location_name AS "locationName",
+      status,
+      local_ip AS "localIp",
+      local_config_port AS "localConfigPort",
+      camera_count AS "cameraCount",
+      camera_summary AS "cameraSummary",
+      software_version AS "softwareVersion",
+      wifi_ssid AS "wifiSsid",
+      wifi_rssi AS "wifiRssi",
+      setup_state AS "setupState",
+      first_seen_at AS "firstSeenAt",
+      last_seen_at AS "lastSeenAt",
+      is_archived AS "isArchived",
+      archived_at AS "archivedAt",
+      archived_reason AS "archivedReason"
+    `,
+    [resolvedNodeId, resolvedSourceName, resolvedLocationName, setupState]
+  );
+
+  await pool.query(
+    `
+    UPDATE node_health
+    SET
+      node_name = $2,
+      location_name = $3,
+      setup_state = $4,
+      updated_at = NOW()
+    WHERE node_id = $1
+    `,
+    [resolvedNodeId, resolvedSourceName, resolvedLocationName, setupState]
+  );
+
+  return {
+    node: nodeResult.rows[0],
+    sensor: sensorResult.rows[0]
+  };
+}
+
+async function createSensorCommand({ nodeId, commandType, payload, requestedBy, supersedeExisting = true }) {
+  const client = await pool.connect();
+  let didBegin = false;
+
+  try {
+    await client.query("BEGIN");
+    didBegin = true;
+
+    if (supersedeExisting) {
+      await client.query(
+        `
+        UPDATE node_commands
+        SET
+          status = 'failed',
+          completed_at = NOW(),
+          error = 'Superseded by newer sensor command'
+        WHERE node_id = $1
+          AND command_type = $2
+          AND status IN ('pending', 'running')
+        `,
+        [nodeId, commandType]
+      );
+    }
+
+    const result = await client.query(
+      `
+      INSERT INTO node_commands (
+        command_id,
+        node_id,
+        command_type,
+        payload,
+        status,
+        requested_by,
+        requested_at,
+        picked_up_at,
+        completed_at,
+        result,
+        error
+      )
+      VALUES ($1, $2, $3, $4::jsonb, 'pending', $5, NOW(), NULL, NULL, NULL, NULL)
+      RETURNING
+        command_id AS "commandId",
+        node_id AS "nodeId",
+        command_type AS "commandType",
+        payload,
+        status,
+        requested_by AS "requestedBy",
+        requested_at AS "requestedAt",
+        picked_up_at AS "pickedUpAt",
+        completed_at AS "completedAt",
+        result,
+        error
+      `,
+      [
+        randomUUID(),
+        nodeId,
+        commandType,
+        JSON.stringify(payload || {}),
+        requestedBy
+      ]
+    );
+
+    await client.query("COMMIT");
+    didBegin = false;
+
+    return result.rows[0];
+  } catch (error) {
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function failStaleSensorCommands(client, nodeId) {
@@ -1302,6 +1616,9 @@ app.get("/", async (req, res) => {
         "POST /node-commands/:commandId/result",
         "GET /node-commands/:nodeId",
         "GET /sensors",
+        "GET /sensor-inventory",
+        "PATCH /sensors/:nodeId/assignment",
+        "POST /sensor-bulk-actions",
         "GET /sensor-config/:nodeId",
         "POST /sensor-commands",
         "GET /sensor-commands/:nodeId/pending",
@@ -1434,7 +1751,10 @@ app.get("/nodes", async (req, res) => {
         n.local_config_port AS "localConfigPort",
         n.camera_count AS "cameraCount",
         n.camera_summary AS "cameraSummary",
-        n.software_version AS "softwareVersion",
+        COALESCE(h.software_version, n.software_version) AS "softwareVersion",
+        COALESCE(h.wifi_ssid, n.wifi_ssid) AS "wifiSsid",
+        COALESCE(h.wifi_rssi, n.wifi_rssi) AS "wifiRssi",
+        COALESCE(h.setup_state, n.setup_state) AS "setupState",
         n.first_seen_at AS "firstSeenAt",
         n.last_seen_at AS "lastSeenAt",
         n.is_archived AS "isArchived",
@@ -1550,7 +1870,7 @@ app.get("/node-health/:nodeId", async (req, res) => {
       WHERE node_id = $1
       LIMIT 1
       `,
-      [nodeId]
+      [nodeId, commandType]
     );
 
     if (!result.rows[0]) {
@@ -2842,6 +3162,320 @@ app.delete("/cameras/:cameraId", async (req, res) => {
   }
 });
 
+app.get("/sensor-inventory", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const includeArchived = parseBooleanQuery(req.query.includeArchived);
+    const includeDeleted = parseBooleanQuery(req.query.includeDeleted);
+
+    const result = await pool.query(
+      `
+      SELECT
+        n.node_id AS "nodeId",
+        n.node_name AS "nodeName",
+        COALESCE(s.source_name, n.node_name, h.node_name, 'Motion Sensor') AS "displayName",
+        n.location_name AS "nodeLocationName",
+        COALESCE(s.location_name, n.location_name, h.location_name, 'Unassigned location') AS "locationName",
+        n.status AS "nodeStatus",
+        n.local_ip AS "localIp",
+        n.local_config_port AS "localConfigPort",
+        COALESCE(h.software_version, n.software_version) AS "softwareVersion",
+        COALESCE(h.wifi_ssid, n.wifi_ssid) AS "wifiSsid",
+        COALESCE(h.wifi_rssi, n.wifi_rssi) AS "wifiRssi",
+        h.checked_in_at AS "healthCheckedInAt",
+        EXTRACT(EPOCH FROM (NOW() - h.checked_in_at))::int AS "secondsSinceHealthCheckIn",
+        CASE
+          WHEN h.checked_in_at >= NOW() - ($3::int * INTERVAL '1 second') THEN TRUE
+          ELSE FALSE
+        END AS "isOnline",
+        n.is_archived AS "isArchived",
+        n.archived_at AS "archivedAt",
+        n.archived_reason AS "archivedReason",
+        s.id AS "sensorId",
+        s.source_key AS "sourceKey",
+        s.source_name AS "sourceName",
+        s.sensor_type AS "sensorType",
+        s.resident_id AS "residentId",
+        s.resident_name AS "residentName",
+        s.room_name AS "roomName",
+        s.is_active AS "isActive",
+        s.is_deleted AS "isDeleted",
+        CASE
+          WHEN s.id IS NULL THEN FALSE
+          WHEN s.resident_id IS NOT NULL THEN TRUE
+          WHEN LOWER(TRIM(COALESCE(s.resident_name, ''))) <> '' AND LOWER(TRIM(COALESCE(s.resident_name, ''))) <> 'unassigned' THEN TRUE
+          WHEN TRIM(COALESCE(s.room_name, '')) <> '' THEN TRUE
+          WHEN s.setup_state = 'assigned' THEN TRUE
+          WHEN n.setup_state = 'assigned' THEN TRUE
+          ELSE FALSE
+        END AS "isAssigned",
+        CASE
+          WHEN s.id IS NULL THEN 'unassigned'
+          WHEN s.resident_id IS NOT NULL THEN 'assigned'
+          WHEN LOWER(TRIM(COALESCE(s.resident_name, ''))) <> '' AND LOWER(TRIM(COALESCE(s.resident_name, ''))) <> 'unassigned' THEN 'assigned'
+          WHEN TRIM(COALESCE(s.room_name, '')) <> '' THEN 'assigned'
+          WHEN s.setup_state = 'assigned' THEN 'assigned'
+          WHEN n.setup_state = 'assigned' THEN 'assigned'
+          ELSE 'unassigned'
+        END AS "setupState",
+        h.diagnostics AS "diagnostics",
+        (
+          SELECT jsonb_build_object(
+            'commandId', c.command_id,
+            'commandType', c.command_type,
+            'status', c.status,
+            'requestedAt', c.requested_at,
+            'pickedUpAt', c.picked_up_at,
+            'completedAt', c.completed_at,
+            'result', c.result,
+            'error', c.error
+          )
+          FROM node_commands c
+          WHERE c.node_id = n.node_id
+            AND c.command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
+          ORDER BY c.requested_at DESC
+          LIMIT 1
+        ) AS "latestCommand"
+      FROM nodes n
+      LEFT JOIN node_health h ON h.node_id = n.node_id
+      LEFT JOIN sensors s ON s.node_id = n.node_id
+        AND ($2::boolean = TRUE OR s.is_deleted = FALSE)
+      WHERE n.node_id LIKE 'esp32-%'
+        AND ($1::boolean = TRUE OR n.is_archived = FALSE)
+      ORDER BY
+        CASE WHEN h.checked_in_at >= NOW() - ($3::int * INTERVAL '1 second') THEN 0 ELSE 1 END,
+        CASE
+          WHEN s.id IS NULL THEN 1
+          WHEN s.resident_id IS NULL AND LOWER(TRIM(COALESCE(s.resident_name, ''))) IN ('', 'unassigned') AND TRIM(COALESCE(s.room_name, '')) = '' THEN 1
+          ELSE 0
+        END DESC,
+        COALESCE(h.checked_in_at, n.last_seen_at) DESC
+      `,
+      [includeArchived, includeDeleted, NODE_OFFLINE_AFTER_SECONDS]
+    );
+
+    const sensors = result.rows.map((row) => ({
+      ...row,
+      actionState: row.latestCommand && ["pending", "running"].includes(row.latestCommand.status)
+        ? row.latestCommand.status
+        : "idle"
+    }));
+
+    return res.status(200).json({
+      success: true,
+      includeArchived,
+      includeDeleted,
+      count: sensors.length,
+      nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
+      sensors
+    });
+  } catch (error) {
+    console.error("Fetch sensor inventory failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.patch("/sensors/:nodeId/assignment", async (req, res) => {
+  try {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    const assignment = await updateSensorAssignment({
+      nodeId,
+      residentId: req.body?.residentId ?? req.body?.residentID,
+      residentName: req.body?.residentName,
+      locationName: req.body?.locationName,
+      roomName: req.body?.roomName,
+      sourceName: req.body?.sourceName,
+      sourceKey: req.body?.sourceKey
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Sensor assignment updated without setup reset",
+      ...assignment
+    });
+  } catch (error) {
+    console.error("Sensor assignment update failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/sensor-bulk-actions", async (req, res) => {
+  try {
+    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+      return;
+    }
+
+    const action = cleanText(req.body?.action).toLowerCase();
+    const nodeIds = sanitizeBulkNodeIds(req.body?.nodeIds);
+    const payload = normalizeJsonObject(req.body?.payload);
+    const requestedBy = cleanText(req.body?.requestedBy) || "Good Shepherd Bulk Sensor Commissioning";
+    const allowedBulkActions = ["identify", "locate", "update_firmware", "reconfigure", "factory_reset", "reboot", "ping", "assign"];
+
+    if (!allowedBulkActions.includes(action)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid or missing bulk action",
+        allowedBulkActions
+      });
+    }
+
+    if (nodeIds.length === 0 && action !== "assign") {
+      return res.status(400).json({
+        success: false,
+        error: "nodeIds must contain at least one nodeId"
+      });
+    }
+
+    if (action === "assign") {
+      const assignments = Array.isArray(req.body?.assignments) ? req.body.assignments : [];
+
+      if (assignments.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "assign bulk action requires assignments[]"
+        });
+      }
+
+      const results = [];
+      const errors = [];
+
+      for (const assignmentRequest of assignments) {
+        const assignmentNodeId = cleanText(assignmentRequest?.nodeId);
+
+        try {
+          const assignment = await updateSensorAssignment({
+            nodeId: assignmentNodeId,
+            residentId: assignmentRequest?.residentId ?? assignmentRequest?.residentID,
+            residentName: assignmentRequest?.residentName,
+            locationName: assignmentRequest?.locationName,
+            roomName: assignmentRequest?.roomName,
+            sourceName: assignmentRequest?.sourceName,
+            sourceKey: assignmentRequest?.sourceKey
+          });
+
+          results.push({
+            nodeId: assignmentNodeId,
+            success: true,
+            ...assignment
+          });
+        } catch (error) {
+          errors.push({
+            nodeId: assignmentNodeId || null,
+            success: false,
+            error: error.message
+          });
+        }
+      }
+
+      return res.status(errors.length > 0 ? 207 : 200).json({
+        success: errors.length === 0,
+        action,
+        requestedCount: assignments.length,
+        successCount: results.length,
+        errorCount: errors.length,
+        results,
+        errors
+      });
+    }
+
+    const commandType = normalizeEsp32SensorCommandType(action);
+
+    if (!commandType) {
+      return res.status(400).json({
+        success: false,
+        error: "Action is not a valid ESP32 sensor command"
+      });
+    }
+
+    if (commandType === "update_firmware") {
+      if (!isValidFirmwareUrl(payload.firmwareUrl)) {
+        return res.status(400).json({
+          success: false,
+          error: "update_firmware requires payload.firmwareUrl as an HTTPS URL"
+        });
+      }
+
+      if (!cleanText(payload.firmwareVersion)) {
+        return res.status(400).json({
+          success: false,
+          error: "update_firmware requires payload.firmwareVersion"
+        });
+      }
+    }
+
+    const results = [];
+    const errors = [];
+
+    for (const nodeId of nodeIds) {
+      try {
+        const existingNode = await getNodeById(nodeId);
+
+        if (!existingNode) {
+          throw new Error(`Node not found: ${nodeId}`);
+        }
+
+        const command = await createSensorCommand({
+          nodeId,
+          commandType,
+          payload,
+          requestedBy,
+          supersedeExisting: true
+        });
+
+        results.push({
+          nodeId,
+          success: true,
+          command
+        });
+      } catch (error) {
+        errors.push({
+          nodeId,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+
+    return res.status(errors.length > 0 ? 207 : 201).json({
+      success: errors.length === 0,
+      action,
+      commandType,
+      requestedCount: nodeIds.length,
+      successCount: results.length,
+      errorCount: errors.length,
+      results,
+      errors
+    });
+  } catch (error) {
+    console.error("Sensor bulk action failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.get("/sensors", async (req, res) => {
   try {
     if (!requireAuthorizedRequest(req, res)) {
@@ -3057,7 +3691,7 @@ app.post("/sensor-commands", async (req, res) => {
     }
 
     const nodeId = cleanText(req.body?.nodeId);
-    const commandType = normalizeNodeCommandType(req.body?.commandType);
+    const commandType = normalizeEsp32SensorCommandType(req.body?.commandType);
     const payload = normalizeJsonObject(req.body?.payload);
     const requestedBy = cleanText(req.body?.requestedBy) || "Good Shepherd App";
 
@@ -3134,9 +3768,9 @@ app.post("/sensor-commands", async (req, res) => {
       SET
         status = 'failed',
         completed_at = NOW(),
-        error = 'Superseded by newer sensor command'
+        error = 'Superseded by newer sensor command of same type'
       WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
+        AND command_type = $2
         AND status IN ('pending', 'running')
       `,
       [nodeId]
@@ -3234,8 +3868,8 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
         AND status = 'pending'
         AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset')
         AND requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
-      ORDER BY requested_at DESC
-      LIMIT 1
+      ORDER BY requested_at ASC
+      LIMIT 5
       FOR UPDATE SKIP LOCKED
       `,
       [nodeId, SENSOR_COMMAND_EXPIRATION_MINUTES]
