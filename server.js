@@ -404,6 +404,8 @@ function normalizeNodeCommandType(value) {
     "factory_reset",
     "reconfigure",
     "reboot",
+    "identify",
+    "locate",
     "update_firmware"
   ]);
 
@@ -1272,7 +1274,7 @@ async function failStaleSensorCommands(client, nodeId) {
       completed_at = NOW(),
       error = 'Expired stale sensor command'
     WHERE node_id = $1
-      AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+      AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
       AND status IN ('pending', 'running')
       AND requested_at < NOW() - ($2::int * INTERVAL '1 minute')
     `,
@@ -3021,7 +3023,7 @@ app.get("/sensor-commands/:nodeId", async (req, res) => {
       `
       ${nodeCommandSelectSQL()}
       WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
         AND ($2::boolean = FALSE OR status IN ('pending', 'running'))
       ORDER BY requested_at DESC
       LIMIT 50
@@ -3072,18 +3074,28 @@ app.post("/sensor-commands", async (req, res) => {
         error: "Invalid or missing commandType",
         allowedCommandTypes: [
           "reconfigure",
-          "update_firmware"
+          "update_firmware",
+          "identify",
+          "locate",
+          "ping",
+          "reboot",
+          "factory_reset"
         ]
       });
     }
 
-    if (!["reconfigure", "update_firmware"].includes(commandType)) {
+    if (!["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"].includes(commandType)) {
       return res.status(400).json({
         success: false,
-        error: "ESP32 sensor firmware currently supports only reconfigure and update_firmware.",
+        error: "ESP32 sensor firmware supports reconfigure, update_firmware, identify, locate, ping, reboot, and factory_reset.",
         allowedCommandTypes: [
           "reconfigure",
-          "update_firmware"
+          "update_firmware",
+          "identify",
+          "locate",
+          "ping",
+          "reboot",
+          "factory_reset"
         ]
       });
     }
@@ -3124,7 +3136,7 @@ app.post("/sensor-commands", async (req, res) => {
         completed_at = NOW(),
         error = 'Superseded by newer sensor command'
       WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
         AND status IN ('pending', 'running')
       `,
       [nodeId]
@@ -3220,7 +3232,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
       FROM node_commands
       WHERE node_id = $1
         AND status = 'pending'
-        AND command_type IN ('reconfigure', 'update_firmware')
+        AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset')
         AND requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
       ORDER BY requested_at DESC
       LIMIT 1
@@ -3365,7 +3377,7 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
         error = 'Cleared after sensor command result'
       WHERE node_id = $1
         AND command_id <> $2
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'update_firmware')
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
         AND status IN ('pending', 'running')
       `,
       [completedCommand.nodeId, commandId]
