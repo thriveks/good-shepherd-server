@@ -1364,6 +1364,132 @@ async function upsertSensorFromEvent({
   return result.rows[0];
 }
 
+
+async function findResidentForSensorAssignment({ residentId, residentName, locationName }) {
+  const resolvedResidentId = cleanOptionalText(residentId);
+  const resolvedResidentName = cleanText(residentName);
+  const resolvedLocationName = cleanText(locationName) || "Unassigned location";
+
+  if (resolvedResidentId) {
+    const resident = await getResidentById(resolvedResidentId);
+
+    if (!resident || resident.isDeleted) {
+      throw new Error(`Resident not found: ${resolvedResidentId}`);
+    }
+
+    return {
+      id: resident.id,
+      name: resident.name,
+      location: resident.location || resolvedLocationName
+    };
+  }
+
+  if (!resolvedResidentName || resolvedResidentName.toLowerCase() === "unassigned") {
+    return null;
+  }
+
+  const existing = await pool.query(
+    `
+    ${residentSelectSQL()}
+    WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+      AND LOWER(TRIM(location)) = LOWER(TRIM($2))
+      AND is_deleted = FALSE
+    ORDER BY created_at ASC
+    LIMIT 1
+    `,
+    [resolvedResidentName, resolvedLocationName]
+  );
+
+  if (existing.rows[0]) {
+    return {
+      id: existing.rows[0].id,
+      name: existing.rows[0].name,
+      location: existing.rows[0].location || resolvedLocationName
+    };
+  }
+
+  const created = await pool.query(
+    `
+    INSERT INTO residents (
+      id,
+      name,
+      location,
+      alert_level,
+      last_activity,
+      active_warnings,
+      status_text,
+      is_deleted,
+      deleted_at,
+      created_at,
+      updated_at
+    )
+    VALUES (
+      $1,
+      $2,
+      $3,
+      'Normal',
+      'Resident created during BLE sensor assignment.',
+      0,
+      'Active monitoring',
+      FALSE,
+      NULL,
+      NOW(),
+      NOW()
+    )
+    RETURNING
+      id,
+      name,
+      location,
+      alert_level AS "alertLevel",
+      last_activity AS "lastActivity",
+      active_warnings AS "activeWarnings",
+      status_text AS "statusText",
+      is_deleted AS "isDeleted",
+      deleted_at AS "deletedAt",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    `,
+    [randomUUID(), resolvedResidentName, resolvedLocationName]
+  );
+
+  return {
+    id: created.rows[0].id,
+    name: created.rows[0].name,
+    location: created.rows[0].location || resolvedLocationName
+  };
+}
+
+async function clearStaleSensorAssignmentsForNode(client, { nodeId, sourceKey, keepSensorId }) {
+  const resolvedNodeId = cleanText(nodeId);
+  const resolvedSourceKey = cleanText(sourceKey);
+
+  if (!resolvedNodeId && !resolvedSourceKey) {
+    return 0;
+  }
+
+  const result = await client.query(
+    `
+    UPDATE sensors
+    SET
+      is_active = FALSE,
+      is_deleted = TRUE,
+      deleted_at = NOW(),
+      setup_state = 'unassigned',
+      updated_at = NOW()
+    WHERE id <> $3
+      AND is_deleted = FALSE
+      AND (
+        ($1::text <> '' AND node_id = $1)
+        OR ($2::text <> '' AND source_key = $2)
+      )
+    RETURNING id
+    `,
+    [resolvedNodeId, resolvedSourceKey, keepSensorId]
+  );
+
+  return result.rows.length;
+}
+
 async function updateSensorAssignment({ nodeId, residentId, residentName, locationName, roomName, sourceName, sourceKey }) {
   const resolvedNodeId = cleanText(nodeId);
 
@@ -1377,131 +1503,172 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
     throw new Error(`Node not found: ${resolvedNodeId}`);
   }
 
-  let resolvedResidentId = cleanOptionalText(residentId);
-  let resolvedResidentName = cleanText(residentName);
-  let resolvedLocationName = cleanText(locationName) || existingNode.locationName || "Unassigned Location";
+  const resident = await findResidentForSensorAssignment({
+    residentId,
+    residentName,
+    locationName
+  });
 
-  if (resolvedResidentId) {
-    const resident = await getResidentById(resolvedResidentId);
-
-    if (!resident || resident.isDeleted) {
-      throw new Error(`Resident not found: ${resolvedResidentId}`);
-    }
-
-    resolvedResidentName = resident.name;
-    resolvedLocationName = cleanText(locationName) || resident.location || resolvedLocationName;
-  } else {
-    resolvedResidentId = null;
-    resolvedResidentName = resolvedResidentName || "Unassigned";
-  }
-
+  const resolvedResidentId = resident?.id || null;
+  const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
+  const resolvedLocationName =
+    cleanText(locationName) ||
+    resident?.location ||
+    existingNode.locationName ||
+    "Unassigned Location";
   const resolvedRoomName = cleanOptionalText(roomName);
-  const resolvedSourceKey = cleanText(sourceKey) || resolvedNodeId;
+  const resolvedSourceKey =
+    cleanText(sourceKey) ||
+    `motion-${resolvedNodeId.replace(/^esp32-/, "")}`;
   const resolvedSourceName =
     cleanText(sourceName) ||
     (resolvedRoomName ? `Motion Sensor - ${resolvedRoomName}` : (existingNode.nodeName || "Motion Sensor"));
   const setupState = resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned";
 
-  const sensorResult = await pool.query(
-    `
-    INSERT INTO sensors (
-      id,
-      node_id,
-      source_key,
-      source_name,
-      sensor_type,
-      resident_id,
-      resident_name,
-      location_name,
-      room_name,
-      setup_state,
-      is_active,
-      is_deleted,
-      deleted_at,
-      created_at,
-      updated_at
-    )
-    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, $9, TRUE, FALSE, NULL, NOW(), NOW())
-    ON CONFLICT (source_key)
-    DO UPDATE SET
-      node_id = EXCLUDED.node_id,
-      source_name = EXCLUDED.source_name,
-      sensor_type = EXCLUDED.sensor_type,
-      resident_id = EXCLUDED.resident_id,
-      resident_name = EXCLUDED.resident_name,
-      location_name = EXCLUDED.location_name,
-      room_name = EXCLUDED.room_name,
-      setup_state = EXCLUDED.setup_state,
-      is_active = TRUE,
-      is_deleted = FALSE,
-      deleted_at = NULL,
-      updated_at = NOW()
-    ${sensorReturningSQL()}
-    `,
-    [
-      randomUUID(),
-      resolvedNodeId,
-      resolvedSourceKey,
-      resolvedSourceName,
-      resolvedResidentId,
-      resolvedResidentName,
-      resolvedLocationName,
-      resolvedRoomName,
-      setupState
-    ]
-  );
+  const client = await pool.connect();
+  let didBegin = false;
 
-  const nodeResult = await pool.query(
-    `
-    UPDATE nodes
-    SET
-      node_name = $2,
-      location_name = $3,
-      status = CASE WHEN $4 = 'assigned' THEN 'Active' ELSE 'Pending Setup' END,
-      setup_state = $4,
-      last_seen_at = NOW()
-    WHERE node_id = $1
-    RETURNING
-      node_id AS "nodeId",
-      node_name AS "nodeName",
-      location_name AS "locationName",
-      status,
-      local_ip AS "localIp",
-      local_config_port AS "localConfigPort",
-      camera_count AS "cameraCount",
-      camera_summary AS "cameraSummary",
-      software_version AS "softwareVersion",
-      wifi_ssid AS "wifiSsid",
-      wifi_rssi AS "wifiRssi",
-      setup_state AS "setupState",
-      first_seen_at AS "firstSeenAt",
-      last_seen_at AS "lastSeenAt",
-      is_archived AS "isArchived",
-      archived_at AS "archivedAt",
-      archived_reason AS "archivedReason"
-    `,
-    [resolvedNodeId, resolvedSourceName, resolvedLocationName, setupState]
-  );
+  try {
+    await client.query("BEGIN");
+    didBegin = true;
 
-  await pool.query(
-    `
-    UPDATE node_health
-    SET
-      node_name = $2,
-      location_name = $3,
-      setup_state = $4,
-      updated_at = NOW()
-    WHERE node_id = $1
-    `,
-    [resolvedNodeId, resolvedSourceName, resolvedLocationName, setupState]
-  );
+    const sensorResult = await client.query(
+      `
+      INSERT INTO sensors (
+        id,
+        node_id,
+        source_key,
+        source_name,
+        sensor_type,
+        resident_id,
+        resident_name,
+        location_name,
+        room_name,
+        setup_state,
+        is_active,
+        is_deleted,
+        deleted_at,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, $9, TRUE, FALSE, NULL, NOW(), NOW())
+      ON CONFLICT (source_key)
+      DO UPDATE SET
+        node_id = EXCLUDED.node_id,
+        source_name = EXCLUDED.source_name,
+        sensor_type = EXCLUDED.sensor_type,
+        resident_id = EXCLUDED.resident_id,
+        resident_name = EXCLUDED.resident_name,
+        location_name = EXCLUDED.location_name,
+        room_name = EXCLUDED.room_name,
+        setup_state = EXCLUDED.setup_state,
+        is_active = TRUE,
+        is_deleted = FALSE,
+        deleted_at = NULL,
+        updated_at = NOW()
+      ${sensorReturningSQL()}
+      `,
+      [
+        randomUUID(),
+        resolvedNodeId,
+        resolvedSourceKey,
+        resolvedSourceName,
+        resolvedResidentId,
+        resolvedResidentName,
+        resolvedLocationName,
+        resolvedRoomName,
+        setupState
+      ]
+    );
 
-  return {
-    node: nodeResult.rows[0],
-    sensor: sensorResult.rows[0]
-  };
+    const sensor = sensorResult.rows[0];
+
+    const staleSensorCount = await clearStaleSensorAssignmentsForNode(client, {
+      nodeId: resolvedNodeId,
+      sourceKey: resolvedSourceKey,
+      keepSensorId: sensor.id
+    });
+
+    const nodeResult = await client.query(
+      `
+      UPDATE nodes
+      SET
+        node_name = $2,
+        location_name = $3,
+        status = CASE WHEN $4 = 'assigned' THEN 'Active' ELSE 'Pending Setup' END,
+        setup_state = $4,
+        last_seen_at = NOW()
+      WHERE node_id = $1
+      RETURNING
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName",
+        status,
+        local_ip AS "localIp",
+        local_config_port AS "localConfigPort",
+        camera_count AS "cameraCount",
+        camera_summary AS "cameraSummary",
+        software_version AS "softwareVersion",
+        wifi_ssid AS "wifiSsid",
+        wifi_rssi AS "wifiRssi",
+        setup_state AS "setupState",
+        first_seen_at AS "firstSeenAt",
+        last_seen_at AS "lastSeenAt",
+        is_archived AS "isArchived",
+        archived_at AS "archivedAt",
+        archived_reason AS "archivedReason"
+      `,
+      [resolvedNodeId, resolvedSourceName, resolvedLocationName, setupState]
+    );
+
+    await client.query(
+      `
+      UPDATE node_health
+      SET
+        node_name = $2,
+        location_name = $3,
+        setup_state = $4,
+        diagnostics = COALESCE(diagnostics, '{}'::jsonb) ||
+          jsonb_build_object(
+            'sourceKey', $5::text,
+            'deviceName', 'Motion Sensor',
+            'roomName', COALESCE($6::text, ''),
+            'residentName', $7::text,
+            'locationName', $3::text,
+            'assignmentState', CASE WHEN $4 = 'assigned' THEN 'Assigned' ELSE 'Unassigned' END
+          ),
+        updated_at = NOW()
+      WHERE node_id = $1
+      `,
+      [
+        resolvedNodeId,
+        resolvedSourceName,
+        resolvedLocationName,
+        setupState,
+        resolvedSourceKey,
+        resolvedRoomName,
+        resolvedResidentName
+      ]
+    );
+
+    await client.query("COMMIT");
+    didBegin = false;
+
+    return {
+      node: nodeResult.rows[0],
+      sensor,
+      staleSensorCount
+    };
+  } catch (error) {
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
 }
-
 async function createSensorCommand({ nodeId, commandType, payload, requestedBy, supersedeExisting = true }) {
   const client = await pool.connect();
   let didBegin = false;
@@ -1870,7 +2037,7 @@ app.get("/node-health/:nodeId", async (req, res) => {
       WHERE node_id = $1
       LIMIT 1
       `,
-      [nodeId, commandType]
+      [nodeId]
     );
 
     if (!result.rows[0]) {
@@ -2800,11 +2967,9 @@ app.delete("/residents/:residentId", async (req, res) => {
         `
         UPDATE sensors
         SET
-          is_deleted = TRUE,
-          deleted_at = NOW(),
           resident_id = NULL,
           resident_name = 'Unassigned',
-          is_active = FALSE,
+          setup_state = 'unassigned',
           updated_at = NOW()
         WHERE is_deleted = FALSE
           AND (
