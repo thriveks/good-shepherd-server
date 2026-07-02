@@ -1,6 +1,8 @@
 const express = require("express");
 const { Pool } = require("pg");
 const { randomUUID } = require("crypto");
+const https = require("https");
+const http = require("http");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,6 +12,11 @@ const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = 180;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
+const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
+const FIRMWARE_GITHUB_REPO = process.env.FIRMWARE_GITHUB_REPO || "good-shepherd-esp32-firmware";
+const FIRMWARE_DOWNLOAD_ASSET_NAME = process.env.FIRMWARE_DOWNLOAD_ASSET_NAME || "good_shepherd_esp32_motion.ino.bin";
+const MAX_FIRMWARE_DOWNLOAD_REDIRECTS = 8;
+const FIRMWARE_DOWNLOAD_TIMEOUT_MS = 120000;
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -486,6 +493,165 @@ function isValidFirmwareUrl(value) {
   } catch {
     return false;
   }
+}
+
+function isSafeFirmwareReleaseTag(value) {
+  const releaseTag = cleanText(value);
+  return /^v[0-9][A-Za-z0-9._-]*$/.test(releaseTag);
+}
+
+function isSafeFirmwareAssetName(value) {
+  const assetName = cleanText(value);
+  return assetName === FIRMWARE_DOWNLOAD_ASSET_NAME;
+}
+
+function githubFirmwareAssetUrl(releaseTag, assetName) {
+  return `https://github.com/${encodeURIComponent(FIRMWARE_GITHUB_OWNER)}/${encodeURIComponent(FIRMWARE_GITHUB_REPO)}/releases/download/${encodeURIComponent(releaseTag)}/${encodeURIComponent(assetName)}`;
+}
+
+function copyFirmwareDownloadHeaders(upstreamResponse, res) {
+  const contentLength = upstreamResponse.headers["content-length"];
+  const contentType = upstreamResponse.headers["content-type"] || "application/octet-stream";
+  const etag = upstreamResponse.headers.etag;
+  const lastModified = upstreamResponse.headers["last-modified"];
+
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.setHeader("Content-Disposition", `attachment; filename="${FIRMWARE_DOWNLOAD_ASSET_NAME}"`);
+  res.setHeader("X-Good-Shepherd-Firmware-Proxy", "true");
+
+  if (contentLength) {
+    res.setHeader("Content-Length", contentLength);
+  }
+
+  if (etag) {
+    res.setHeader("ETag", etag);
+  }
+
+  if (lastModified) {
+    res.setHeader("Last-Modified", lastModified);
+  }
+}
+
+function firmwareDownloadClientForUrl(parsedUrl) {
+  if (parsedUrl.protocol === "https:") {
+    return https;
+  }
+
+  if (parsedUrl.protocol === "http:") {
+    return http;
+  }
+
+  return null;
+}
+
+function proxyFirmwareDownload(upstreamUrl, res, redirectsRemaining = MAX_FIRMWARE_DOWNLOAD_REDIRECTS) {
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(upstreamUrl);
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: "Invalid upstream firmware URL"
+      });
+    }
+    return;
+  }
+
+  const client = firmwareDownloadClientForUrl(parsedUrl);
+
+  if (!client) {
+    if (!res.headersSent) {
+      res.status(502).json({
+        success: false,
+        error: "Unsupported upstream firmware URL protocol"
+      });
+    }
+    return;
+  }
+
+  const request = client.get(
+    parsedUrl,
+    {
+      headers: {
+        "User-Agent": "Good-Shepherd-Firmware-Proxy/1.0",
+        "Accept": "application/octet-stream,*/*"
+      }
+    },
+    (upstreamResponse) => {
+      const statusCode = upstreamResponse.statusCode || 0;
+      const redirectLocation = upstreamResponse.headers.location;
+
+      if ([301, 302, 303, 307, 308].includes(statusCode) && redirectLocation) {
+        upstreamResponse.resume();
+
+        if (redirectsRemaining <= 0) {
+          if (!res.headersSent) {
+            res.status(502).json({
+              success: false,
+              error: "Firmware download failed: too many redirects"
+            });
+          }
+          return;
+        }
+
+        const nextUrl = new URL(redirectLocation, parsedUrl).toString();
+        proxyFirmwareDownload(nextUrl, res, redirectsRemaining - 1);
+        return;
+      }
+
+      if (statusCode < 200 || statusCode >= 300) {
+        const chunks = [];
+        let totalBytes = 0;
+
+        upstreamResponse.on("data", (chunk) => {
+          if (totalBytes < 4096) {
+            chunks.push(chunk);
+            totalBytes += chunk.length;
+          }
+        });
+
+        upstreamResponse.on("end", () => {
+          const bodyPreview = Buffer.concat(chunks).toString("utf8").slice(0, 1000);
+
+          if (!res.headersSent) {
+            res.status(502).json({
+              success: false,
+              error: `Firmware upstream download failed with HTTP ${statusCode}`,
+              upstreamStatusCode: statusCode,
+              upstreamBodyPreview: bodyPreview
+            });
+          }
+        });
+
+        upstreamResponse.resume();
+        return;
+      }
+
+      copyFirmwareDownloadHeaders(upstreamResponse, res);
+      res.status(200);
+      upstreamResponse.pipe(res);
+    }
+  );
+
+  request.setTimeout(FIRMWARE_DOWNLOAD_TIMEOUT_MS, () => {
+    request.destroy(new Error("Firmware upstream download timed out"));
+  });
+
+  request.on("error", (error) => {
+    console.error("Firmware proxy download failed:", error);
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        success: false,
+        error: error.message || "Firmware proxy download failed"
+      });
+    } else {
+      res.destroy(error);
+    }
+  });
 }
 
 function eventSelectSQL() {
@@ -1794,6 +1960,7 @@ app.get("/", async (req, res) => {
         "GET /firmware/releases",
         "POST /firmware/releases",
         "GET /firmware/latest",
+        "GET /firmware/download/:releaseTag/:assetName",
         "POST /firmware/update-node",
         "GET /resident-candidates"
       ]
@@ -3938,7 +4105,7 @@ app.post("/sensor-commands", async (req, res) => {
         AND command_type = $2
         AND status IN ('pending', 'running')
       `,
-      [nodeId]
+      [nodeId, commandType]
     );
 
     const result = await client.query(
@@ -4202,6 +4369,46 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
     });
   } finally {
     client.release();
+  }
+});
+
+
+app.get("/firmware/download/:releaseTag/:assetName", async (req, res) => {
+  try {
+    const releaseTag = cleanText(req.params.releaseTag);
+    const assetName = cleanText(req.params.assetName);
+
+    if (!isSafeFirmwareReleaseTag(releaseTag)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid firmware release tag"
+      });
+    }
+
+    if (!isSafeFirmwareAssetName(assetName)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid firmware asset name"
+      });
+    }
+
+    const upstreamUrl = githubFirmwareAssetUrl(releaseTag, assetName);
+
+    console.log("Firmware download proxy requested:");
+    console.log(JSON.stringify({ releaseTag, assetName, upstreamUrl }, null, 2));
+
+    return proxyFirmwareDownload(upstreamUrl, res);
+  } catch (error) {
+    console.error("Firmware download proxy failed:", error);
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+
+    return res.end();
   }
 });
 
