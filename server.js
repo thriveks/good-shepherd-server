@@ -13,6 +13,8 @@ const NODE_OFFLINE_AFTER_SECONDS = 180;
 const AI_INACTIVE_WATCH_MINUTES = 120;
 const AI_INACTIVE_WARNING_MINUTES = 240;
 const AI_INACTIVE_CRITICAL_MINUTES = 480;
+const AI_MOTION_HISTORY_DAYS = 30;
+const AI_MOTION_HISTORY_EVENT_LIMIT = 5000;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
@@ -238,6 +240,32 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS sensors_is_deleted_idx ON sensors (is_deleted)`);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS motion_events (
+      id UUID PRIMARY KEY,
+      webhook_event_id UUID,
+      resident_id UUID REFERENCES residents(id) ON DELETE SET NULL,
+      resident_name TEXT NOT NULL,
+      location_name TEXT,
+      sensor_id UUID REFERENCES sensors(id) ON DELETE SET NULL,
+      node_id TEXT,
+      source_key TEXT,
+      source_name TEXT NOT NULL,
+      room_name TEXT,
+      message TEXT NOT NULL,
+      alert_level TEXT NOT NULL DEFAULT 'Normal',
+      time_text TEXT NOT NULL DEFAULT 'Motion Event',
+      event_timestamp TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS motion_events_resident_id_timestamp_idx ON motion_events (resident_id, event_timestamp DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS motion_events_resident_name_timestamp_idx ON motion_events (LOWER(TRIM(resident_name)), event_timestamp DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS motion_events_source_key_timestamp_idx ON motion_events (source_key, event_timestamp DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS motion_events_event_timestamp_idx ON motion_events (event_timestamp DESC)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS motion_events_webhook_event_id_unique_idx ON motion_events (webhook_event_id) WHERE webhook_event_id IS NOT NULL`);
+
+  await pool.query(`
     INSERT INTO device_mappings (
       source_key,
       source_name,
@@ -417,6 +445,44 @@ function isRoutineMotionEventRow(event) {
   return !concernTerms.some((term) => searchableText.includes(term));
 }
 
+function isPhysicalMotionEventRow(event) {
+  if (!isRoutineMotionEventRow(event)) {
+    return false;
+  }
+
+  const signalText = [
+    event?.message,
+    event?.timeText
+  ]
+    .map((value) => cleanText(value))
+    .join(" ")
+    .toLowerCase();
+
+  const detectedMotion =
+    signalText.includes("motion detected") ||
+    signalText.includes("activity detected") ||
+    signalText.includes("motion/activity detected") ||
+    (signalText.includes("motion") && signalText.includes("detected")) ||
+    (signalText.includes("activity") && signalText.includes("detected"));
+
+  if (!detectedMotion) {
+    return false;
+  }
+
+  const noiseTerms = [
+    "heartbeat",
+    "check-in",
+    "check in",
+    "online",
+    "offline",
+    "setup",
+    "assigned",
+    "unassigned"
+  ];
+
+  return !noiseTerms.some((term) => signalText.includes(term));
+}
+
 function minutesSince(dateValue) {
   const date = dateValue ? new Date(dateValue) : null;
 
@@ -545,7 +611,7 @@ function buildAIStatusForResident({
 }
 
 async function buildAIMotionSummary() {
-  const [residentResult, sensorResult, eventResult, nodeHealthResult] = await Promise.all([
+  const [residentResult, sensorResult, eventResult, motionEventResult, nodeHealthResult] = await Promise.all([
     pool.query(`
       ${residentSelectSQL()}
       WHERE is_deleted = FALSE
@@ -561,6 +627,15 @@ async function buildAIMotionSummary() {
       ORDER BY timestamp DESC
       LIMIT 200
     `),
+    pool.query(
+      `
+      ${motionEventSelectSQL()}
+      WHERE event_timestamp >= NOW() - ($1::int * INTERVAL '1 day')
+      ORDER BY event_timestamp DESC
+      LIMIT $2
+      `,
+      [AI_MOTION_HISTORY_DAYS, AI_MOTION_HISTORY_EVENT_LIMIT]
+    ),
     pool.query(`
       ${nodeHealthSelectSQL()}
       ORDER BY checked_in_at DESC
@@ -569,6 +644,7 @@ async function buildAIMotionSummary() {
 
   const sensors = sensorResult.rows;
   const events = eventResult.rows;
+  const motionHistoryEvents = motionEventResult.rows;
   const nodeHealthByNodeId = new Map(
     nodeHealthResult.rows.map((health) => [cleanText(health.nodeId), health])
   );
@@ -587,8 +663,15 @@ async function buildAIMotionSummary() {
     });
 
     const motionEvents = residentEvents.filter(isMotionEventRow);
-    const routineMotionEvents = motionEvents.filter(isRoutineMotionEventRow);
-    const latestMotionEvent = routineMotionEvents[0] || motionEvents[0] || null;
+    const physicalWebhookMotionEvents = motionEvents.filter(isPhysicalMotionEventRow);
+    const residentMotionHistoryEvents = motionHistoryEvents.filter((event) => {
+      const eventResidentNameKey = normalizeForMatch(event.residentName);
+      return event.residentId === resident.id || eventResidentNameKey === residentNameKey;
+    });
+    const residentMotionEvents = residentMotionHistoryEvents.length > 0
+      ? residentMotionHistoryEvents
+      : physicalWebhookMotionEvents;
+    const latestMotionEvent = residentMotionEvents[0] || null;
     const latestMotionSensor = latestMotionEvent
       ? residentSensors.find((sensor) => {
           return normalizeForMatch(sensor.sourceKey) === normalizeForMatch(latestMotionEvent.sourceKey) ||
@@ -596,7 +679,7 @@ async function buildAIMotionSummary() {
         })
       : null;
 
-    const motionCountToday = motionEvents.filter((event) => {
+    const motionCountToday = residentMotionEvents.filter((event) => {
       const eventDate = new Date(event.timestamp);
       const now = new Date();
       return !Number.isNaN(eventDate.getTime()) &&
@@ -605,7 +688,7 @@ async function buildAIMotionSummary() {
         eventDate.getDate() === now.getDate();
     }).length;
 
-    const motionCountLastHour = motionEvents.filter((event) => {
+    const motionCountLastHour = residentMotionEvents.filter((event) => {
       const eventDate = new Date(event.timestamp);
       return !Number.isNaN(eventDate.getTime()) &&
         eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
@@ -667,7 +750,9 @@ async function buildAIMotionSummary() {
       activeSensorCount: activeSensors.length,
       offlineSensorCount: offlineSensors.length,
       onlineSensorCount: Math.max(0, activeSensors.length - offlineSensors.length),
-      motionEventCount: motionEvents.length,
+      motionEventCount: residentMotionEvents.length,
+      persistentMotionEventCount: residentMotionHistoryEvents.length,
+      retainedMotionEventFallbackCount: physicalWebhookMotionEvents.length,
       motionCountToday,
       motionCountLastHour,
       openAlertCount: openAlerts.length,
@@ -710,6 +795,7 @@ async function buildAIMotionSummary() {
     inactiveWatchMinutes: AI_INACTIVE_WATCH_MINUTES,
     inactiveWarningMinutes: AI_INACTIVE_WARNING_MINUTES,
     inactiveCriticalMinutes: AI_INACTIVE_CRITICAL_MINUTES,
+    motionHistoryDays: AI_MOTION_HISTORY_DAYS,
     nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
     residentCount: residents.length,
     residents
@@ -1027,6 +1113,28 @@ function eventSelectSQL() {
       acknowledged_at AS "acknowledgedAt",
       resolution_note AS "resolutionNote"
     FROM webhook_events
+  `;
+}
+
+function motionEventSelectSQL() {
+  return `
+    SELECT
+      id,
+      webhook_event_id AS "webhookEventId",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      location_name AS "locationName",
+      sensor_id AS "sensorId",
+      node_id AS "nodeId",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      room_name AS "roomName",
+      message,
+      alert_level AS "alertLevel",
+      time_text AS "timeText",
+      event_timestamp AS "timestamp",
+      created_at AS "createdAt"
+    FROM motion_events
   `;
 }
 
@@ -1886,6 +1994,71 @@ async function upsertSensorFromEvent({
   return result.rows[0];
 }
 
+async function recordMotionHistoryEvent({ event, resident, sensor }) {
+  if (!isPhysicalMotionEventRow(event)) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+    INSERT INTO motion_events (
+      id,
+      webhook_event_id,
+      resident_id,
+      resident_name,
+      location_name,
+      sensor_id,
+      node_id,
+      source_key,
+      source_name,
+      room_name,
+      message,
+      alert_level,
+      time_text,
+      event_timestamp,
+      created_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+    ON CONFLICT (webhook_event_id) WHERE webhook_event_id IS NOT NULL
+    DO NOTHING
+    RETURNING
+      id,
+      webhook_event_id AS "webhookEventId",
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      location_name AS "locationName",
+      sensor_id AS "sensorId",
+      node_id AS "nodeId",
+      source_key AS "sourceKey",
+      source_name AS "sourceName",
+      room_name AS "roomName",
+      message,
+      alert_level AS "alertLevel",
+      time_text AS "timeText",
+      event_timestamp AS "timestamp",
+      created_at AS "createdAt"
+    `,
+    [
+      randomUUID(),
+      event.id,
+      resident?.id || null,
+      resident?.name || event.residentName,
+      event.locationName || resident?.location || null,
+      sensor?.id || null,
+      event.nodeId || sensor?.nodeId || null,
+      event.sourceKey || sensor?.sourceKey || null,
+      event.sourceName,
+      sensor?.roomName || inferRoomNameFromSourceName(event.sourceName) || null,
+      event.message,
+      normalizeAlertLevel(event.alertLevel),
+      event.timeText,
+      event.timestamp
+    ]
+  );
+
+  return result.rows[0] || null;
+}
+
 
 async function findResidentForSensorAssignment({ residentId, residentName, locationName }) {
   const resolvedResidentId = cleanOptionalText(residentId);
@@ -2305,6 +2478,7 @@ app.get("/", async (req, res) => {
         "POST /node-commands/:commandId/result",
         "GET /node-commands/:nodeId",
         "GET /ai/motion-summary",
+        "GET /ai/motion-events",
         "GET /sensors",
         "GET /sensor-inventory",
         "PATCH /sensors/:nodeId/assignment",
@@ -2363,6 +2537,36 @@ app.get("/ai/motion-summary", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to build AI motion summary"
+    });
+  }
+});
+
+app.get("/ai/motion-events", async (req, res) => {
+  try {
+    const requestedLimit = normalizeInteger(req.query.limit, 100);
+    const limit = Math.min(Math.max(requestedLimit, 1), 500);
+    const residentId = cleanOptionalText(req.query.residentId);
+
+    const result = await pool.query(
+      `
+      ${motionEventSelectSQL()}
+      WHERE ($2::text IS NULL OR resident_id::text = $2)
+      ORDER BY timestamp DESC
+      LIMIT $1
+      `,
+      [limit, residentId]
+    );
+
+    res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      events: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch AI motion events:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch AI motion events"
     });
   }
 });
@@ -5174,6 +5378,12 @@ app.post("/webhook", async (req, res) => {
       ]
     );
 
+    const motionHistoryEvent = await recordMotionHistoryEvent({
+      event,
+      resident,
+      sensor
+    });
+
     await pool.query(
       `
       DELETE FROM webhook_events
@@ -5194,6 +5404,7 @@ app.post("/webhook", async (req, res) => {
       success: true,
       message: "Webhook event received",
       event,
+      motionHistoryEvent,
       resident,
       sensor
     });
