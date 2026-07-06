@@ -10,6 +10,9 @@ const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = 180;
+const AI_INACTIVE_WATCH_MINUTES = 120;
+const AI_INACTIVE_WARNING_MINUTES = 240;
+const AI_INACTIVE_CRITICAL_MINUTES = 480;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
@@ -358,6 +361,312 @@ function sanitizeBulkNodeIds(value) {
 function normalizeEsp32SensorCommandType(value) {
   const commandType = normalizeNodeCommandType(value);
   return ESP32_SENSOR_COMMAND_TYPES.includes(commandType) ? commandType : null;
+}
+
+function normalizeForMatch(value) {
+  return cleanText(value).toLowerCase();
+}
+
+function isMotionEventRow(event) {
+  const searchableText = [
+    event?.message,
+    event?.sourceName,
+    event?.sourceKey,
+    event?.locationName,
+    event?.timeText
+  ]
+    .map((value) => cleanText(value))
+    .join(" ")
+    .toLowerCase();
+
+  return searchableText.includes("motion") ||
+    searchableText.includes("activity") ||
+    searchableText.includes("esp32") ||
+    searchableText.includes("pir") ||
+    searchableText.includes("sensor heartbeat");
+}
+
+function isRoutineMotionEventRow(event) {
+  if (!isMotionEventRow(event)) {
+    return false;
+  }
+
+  const searchableText = [
+    event?.message,
+    event?.timeText
+  ]
+    .map((value) => cleanText(value))
+    .join(" ")
+    .toLowerCase();
+
+  const concernTerms = [
+    "no motion",
+    "inactivity",
+    "missed",
+    "offline",
+    "failed",
+    "warning",
+    "critical",
+    "fall",
+    "help",
+    "emergency",
+    "unexpected",
+    "unusual"
+  ];
+
+  return !concernTerms.some((term) => searchableText.includes(term));
+}
+
+function minutesSince(dateValue) {
+  const date = dateValue ? new Date(dateValue) : null;
+
+  if (!date || Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return Math.max(0, Math.floor((Date.now() - date.getTime()) / 60000));
+}
+
+function roomNameFromEvent(event, sensor) {
+  const cleanSensorRoom = cleanText(sensor?.roomName);
+
+  if (cleanSensorRoom) {
+    return cleanSensorRoom;
+  }
+
+  const inferredRoom = inferRoomNameFromSourceName(event?.sourceName);
+
+  if (inferredRoom) {
+    return inferredRoom;
+  }
+
+  return cleanText(event?.locationName) || "Unknown room";
+}
+
+function buildAIStatusForResident({
+  resident,
+  residentEvents,
+  residentSensors,
+  latestMotionEvent,
+  latestMotionSensor,
+  inactiveMinutes,
+  openAlertCount,
+  offlineSensorCount
+}) {
+  const residentAlertLevel = normalizeAlertLevel(resident?.alertLevel);
+  const hasInactiveMinutes = Number.isFinite(inactiveMinutes);
+  const motionCountLastHour = residentEvents.filter((event) => {
+    const eventDate = new Date(event.timestamp);
+    return isMotionEventRow(event) &&
+      !Number.isNaN(eventDate.getTime()) &&
+      eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
+  }).length;
+
+  if (residentAlertLevel === "Critical" ||
+    openAlertCount >= 2 ||
+    (hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_CRITICAL_MINUTES)) {
+    return {
+      aiStatus: "Critical",
+      aiLevel: "Critical",
+      aiExplanation: hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_CRITICAL_MINUTES
+        ? `No routine ESP32 motion has been seen for ${inactiveMinutes} minutes. Immediate follow-up is recommended.`
+        : "The resident has a critical or repeated unresolved behavior signal. Immediate follow-up is recommended."
+    };
+  }
+
+  if (residentAlertLevel === "Caution" ||
+    (hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_WARNING_MINUTES) ||
+    offlineSensorCount > 0) {
+    return {
+      aiStatus: "Warning",
+      aiLevel: "Warning",
+      aiExplanation: offlineSensorCount > 0
+        ? `${offlineSensorCount} assigned ESP32 motion sensor(s) may be offline or stale. Review sensor coverage.`
+        : "The resident has a caution-level behavior signal that should be reviewed against their normal routine."
+    };
+  }
+
+  if (openAlertCount === 1 ||
+    (hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_WATCH_MINUTES)) {
+    return {
+      aiStatus: "Watch",
+      aiLevel: "Watch",
+      aiExplanation: hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_WATCH_MINUTES
+        ? `No routine ESP32 motion has been seen for ${inactiveMinutes} minutes. Continue watching for a missed routine.`
+        : "One unresolved event is open. Keep watching for another missed activity or sensor issue."
+    };
+  }
+
+  if (!latestMotionEvent) {
+    return {
+      aiStatus: "Normal",
+      aiLevel: "Normal",
+      aiExplanation: residentSensors.length > 0
+        ? "ESP32 motion sensors are assigned, but no recent motion event is available in the retained event feed yet."
+        : "No ESP32 motion sensors are assigned to this resident yet."
+    };
+  }
+
+  return {
+    aiStatus: "Normal",
+    aiLevel: "Normal",
+    aiExplanation: motionCountLastHour > 0
+      ? "Recent ESP32 motion activity is being treated as normal routine movement."
+      : `Latest ESP32 motion was in ${roomNameFromEvent(latestMotionEvent, latestMotionSensor)}. Resident remains in normal monitoring.`
+  };
+}
+
+async function buildAIMotionSummary() {
+  const [residentResult, sensorResult, eventResult, nodeHealthResult] = await Promise.all([
+    pool.query(`
+      ${residentSelectSQL()}
+      WHERE is_deleted = FALSE
+      ORDER BY name ASC
+    `),
+    pool.query(`
+      ${sensorSelectSQL()}
+      WHERE is_deleted = FALSE
+      ORDER BY resident_name ASC, room_name ASC NULLS LAST, source_name ASC
+    `),
+    pool.query(`
+      ${eventSelectSQL()}
+      ORDER BY timestamp DESC
+      LIMIT 200
+    `),
+    pool.query(`
+      ${nodeHealthSelectSQL()}
+      ORDER BY checked_in_at DESC
+    `)
+  ]);
+
+  const sensors = sensorResult.rows;
+  const events = eventResult.rows;
+  const nodeHealthByNodeId = new Map(
+    nodeHealthResult.rows.map((health) => [cleanText(health.nodeId), health])
+  );
+
+  const residents = residentResult.rows.map((resident) => {
+    const residentNameKey = normalizeForMatch(resident.name);
+
+    const residentSensors = sensors.filter((sensor) => {
+      const sensorResidentNameKey = normalizeForMatch(sensor.residentName);
+      return sensor.residentId === resident.id || sensorResidentNameKey === residentNameKey;
+    });
+
+    const residentEvents = events.filter((event) => {
+      const eventResidentNameKey = normalizeForMatch(event.residentName);
+      return eventResidentNameKey === residentNameKey;
+    });
+
+    const motionEvents = residentEvents.filter(isMotionEventRow);
+    const routineMotionEvents = motionEvents.filter(isRoutineMotionEventRow);
+    const latestMotionEvent = routineMotionEvents[0] || motionEvents[0] || null;
+    const latestMotionSensor = latestMotionEvent
+      ? residentSensors.find((sensor) => {
+          return normalizeForMatch(sensor.sourceKey) === normalizeForMatch(latestMotionEvent.sourceKey) ||
+            normalizeForMatch(sensor.sourceName) === normalizeForMatch(latestMotionEvent.sourceName);
+        })
+      : null;
+
+    const motionCountToday = motionEvents.filter((event) => {
+      const eventDate = new Date(event.timestamp);
+      const now = new Date();
+      return !Number.isNaN(eventDate.getTime()) &&
+        eventDate.getFullYear() === now.getFullYear() &&
+        eventDate.getMonth() === now.getMonth() &&
+        eventDate.getDate() === now.getDate();
+    }).length;
+
+    const motionCountLastHour = motionEvents.filter((event) => {
+      const eventDate = new Date(event.timestamp);
+      return !Number.isNaN(eventDate.getTime()) &&
+        eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
+    }).length;
+
+    const openAlerts = residentEvents.filter((event) => {
+      return event.isAcknowledged !== true && normalizeAlertLevel(event.alertLevel) !== "Normal";
+    });
+
+    const activeSensors = residentSensors.filter((sensor) => sensor.isActive !== false);
+    const offlineSensors = activeSensors.filter((sensor) => {
+      const nodeId = cleanText(sensor.nodeId);
+
+      if (!nodeId) {
+        return false;
+      }
+
+      const health = nodeHealthByNodeId.get(nodeId);
+      return !health || health.isOnline !== true;
+    });
+
+    const inactiveMinutes = latestMotionEvent ? minutesSince(latestMotionEvent.timestamp) : null;
+    const aiStatus = buildAIStatusForResident({
+      resident,
+      residentEvents,
+      residentSensors,
+      latestMotionEvent,
+      latestMotionSensor,
+      inactiveMinutes,
+      openAlertCount: openAlerts.length,
+      offlineSensorCount: offlineSensors.length
+    });
+
+    return {
+      residentId: resident.id,
+      residentName: resident.name,
+      location: resident.location,
+      residentAlertLevel: resident.alertLevel,
+      residentLastActivity: resident.lastActivity,
+      residentStatusText: resident.statusText,
+      activeWarnings: resident.activeWarnings,
+      sensorCount: residentSensors.length,
+      activeSensorCount: activeSensors.length,
+      offlineSensorCount: offlineSensors.length,
+      onlineSensorCount: Math.max(0, activeSensors.length - offlineSensors.length),
+      motionEventCount: motionEvents.length,
+      motionCountToday,
+      motionCountLastHour,
+      openAlertCount: openAlerts.length,
+      inactiveMinutes,
+      lastMotionAt: latestMotionEvent?.timestamp || null,
+      lastMotionRoom: latestMotionEvent ? roomNameFromEvent(latestMotionEvent, latestMotionSensor) : null,
+      lastMotionSourceName: latestMotionEvent?.sourceName || null,
+      lastMotionSourceKey: latestMotionEvent?.sourceKey || null,
+      lastMotionMessage: latestMotionEvent?.message || null,
+      aiStatus: aiStatus.aiStatus,
+      aiLevel: aiStatus.aiLevel,
+      aiExplanation: aiStatus.aiExplanation,
+      sensors: residentSensors.map((sensor) => {
+        const health = nodeHealthByNodeId.get(cleanText(sensor.nodeId));
+
+        return {
+          id: sensor.id,
+          nodeId: sensor.nodeId,
+          sourceKey: sensor.sourceKey,
+          sourceName: sensor.sourceName,
+          sensorType: sensor.sensorType,
+          roomName: sensor.roomName,
+          locationName: sensor.locationName,
+          setupState: sensor.setupState,
+          isActive: sensor.isActive,
+          isOnline: health ? health.isOnline === true : null,
+          wifiRssi: health?.wifiRssi ?? null,
+          lastSeenAt: health?.checkedInAt || null
+        };
+      })
+    };
+  });
+
+  return {
+    success: true,
+    generatedAt: new Date().toISOString(),
+    inactiveWatchMinutes: AI_INACTIVE_WATCH_MINUTES,
+    inactiveWarningMinutes: AI_INACTIVE_WARNING_MINUTES,
+    inactiveCriticalMinutes: AI_INACTIVE_CRITICAL_MINUTES,
+    nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
+    residentCount: residents.length,
+    residents
+  };
 }
 
 
@@ -1948,6 +2257,7 @@ app.get("/", async (req, res) => {
         "GET /node-commands/:nodeId/pending",
         "POST /node-commands/:commandId/result",
         "GET /node-commands/:nodeId",
+        "GET /ai/motion-summary",
         "GET /sensors",
         "GET /sensor-inventory",
         "PATCH /sensors/:nodeId/assignment",
@@ -1993,6 +2303,19 @@ app.get("/events", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to fetch events"
+    });
+  }
+});
+
+app.get("/ai/motion-summary", async (req, res) => {
+  try {
+    const summary = await buildAIMotionSummary();
+    res.status(200).json(summary);
+  } catch (error) {
+    console.error("Failed to build AI motion summary:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to build AI motion summary"
     });
   }
 });
