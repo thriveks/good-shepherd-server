@@ -677,6 +677,70 @@ function buildResidentMotionBaseline(residentMotionEvents) {
   };
 }
 
+function buildResidentRoomIntelligence(residentSensors, residentMotionEvents) {
+  const todayKey = localDateKey(new Date());
+  const activeSensors = residentSensors.filter((sensor) => sensor.isActive !== false);
+  const assignedRooms = [...new Set(
+    activeSensors
+      .map((sensor) => cleanText(sensor.roomName) || inferRoomNameFromSourceName(sensor.sourceName))
+      .filter(Boolean)
+  )].sort((first, second) => first.localeCompare(second));
+  const roomCounts = new Map();
+
+  for (const event of residentMotionEvents) {
+    const eventDate = new Date(event.timestamp);
+
+    if (Number.isNaN(eventDate.getTime()) || localDateKey(eventDate) !== todayKey) {
+      continue;
+    }
+
+    const roomName = motionEventRoomName(event);
+    roomCounts.set(roomName, (roomCounts.get(roomName) || 0) + 1);
+  }
+
+  const roomMotionCountsToday = [...roomCounts.entries()]
+    .map(([roomName, count]) => ({ roomName, count }))
+    .sort((first, second) => {
+      if (first.count !== second.count) {
+        return second.count - first.count;
+      }
+
+      return first.roomName.localeCompare(second.roomName);
+    });
+  const activeRoomsToday = roomMotionCountsToday
+    .filter((room) => room.count > 0)
+    .map((room) => room.roomName);
+  const quietAssignedRoomsToday = assignedRooms.filter((roomName) => {
+    return !activeRoomsToday.some((activeRoomName) => normalizeForMatch(activeRoomName) === normalizeForMatch(roomName));
+  });
+
+  let coverageStatus = "No Coverage";
+  let coverageExplanation = "No active ESP32 motion sensors are assigned to this resident.";
+
+  if (activeSensors.length > 0 && assignedRooms.length === 0) {
+    coverageStatus = "Coverage Pending";
+    coverageExplanation = "Active sensors exist, but assigned room names are missing.";
+  } else if (activeSensors.length > 0 && activeRoomsToday.length === 0) {
+    coverageStatus = "No Motion Today";
+    coverageExplanation = "Assigned rooms have not reported physical motion today.";
+  } else if (activeSensors.length > 0 && quietAssignedRoomsToday.length === 0) {
+    coverageStatus = "All Assigned Rooms Active";
+    coverageExplanation = "All assigned rooms with ESP32 motion sensors have reported motion today.";
+  } else if (activeSensors.length > 0) {
+    coverageStatus = "Partial Room Activity";
+    coverageExplanation = `${activeRoomsToday.length} room(s) reported motion today; ${quietAssignedRoomsToday.length} assigned room(s) have not.`;
+  }
+
+  return {
+    assignedRooms,
+    activeRoomsToday,
+    quietAssignedRoomsToday,
+    roomMotionCountsToday,
+    coverageStatus,
+    coverageExplanation
+  };
+}
+
 function buildAIStatusForResident({
   resident,
   residentEvents,
@@ -862,6 +926,7 @@ async function buildAIMotionSummary() {
         eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
     }).length;
     const motionBaseline = buildResidentMotionBaseline(residentMotionEvents);
+    const roomIntelligence = buildResidentRoomIntelligence(residentSensors, residentMotionEvents);
 
     const openAlerts = residentEvents.filter((event) => {
       return event.isAcknowledged !== true && normalizeAlertLevel(event.alertLevel) !== "Normal";
@@ -937,6 +1002,12 @@ async function buildAIMotionSummary() {
       mostActiveRoomToday: motionBaseline.mostActiveRoomToday,
       mostActiveRoomTodayCount: motionBaseline.mostActiveRoomTodayCount,
       hourlyMotionCounts: motionBaseline.hourlyMotionCounts,
+      assignedRooms: roomIntelligence.assignedRooms,
+      activeRoomsToday: roomIntelligence.activeRoomsToday,
+      quietAssignedRoomsToday: roomIntelligence.quietAssignedRoomsToday,
+      roomMotionCountsToday: roomIntelligence.roomMotionCountsToday,
+      coverageStatus: roomIntelligence.coverageStatus,
+      coverageExplanation: roomIntelligence.coverageExplanation,
       openAlertCount: openAlerts.length,
       recentOpenAlertCount: recentOpenAlerts.length,
       recentCriticalOpenAlertCount: recentCriticalOpenAlerts.length,
