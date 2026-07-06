@@ -15,6 +15,10 @@ const AI_INACTIVE_WARNING_MINUTES = 240;
 const AI_INACTIVE_CRITICAL_MINUTES = 480;
 const AI_MOTION_HISTORY_DAYS = 30;
 const AI_MOTION_HISTORY_EVENT_LIMIT = 5000;
+const AI_BASELINE_MIN_DAYS = 3;
+const AI_BASELINE_QUIET_RATIO = 0.5;
+const AI_BASELINE_ACTIVE_RATIO = 1.75;
+const AI_TIME_ZONE = process.env.AI_TIME_ZONE || "America/Chicago";
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
@@ -509,6 +513,170 @@ function roomNameFromEvent(event, sensor) {
   return cleanText(event?.locationName) || "Unknown room";
 }
 
+function localDateKey(dateValue) {
+  const date = dateValue ? new Date(dateValue) : null;
+
+  if (!date || Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: AI_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  if (!year || !month || !day) {
+    return null;
+  }
+
+  return `${year}-${month}-${day}`;
+}
+
+function localHourFromDate(dateValue) {
+  const date = dateValue ? new Date(dateValue) : null;
+
+  if (!date || Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: AI_TIME_ZONE,
+    hour: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  const hour = Number(parts.find((part) => part.type === "hour")?.value);
+
+  return Number.isFinite(hour) ? hour : null;
+}
+
+function motionEventRoomName(event) {
+  return cleanText(event?.roomName) ||
+    inferRoomNameFromSourceName(event?.sourceName) ||
+    cleanText(event?.locationName) ||
+    "Unknown room";
+}
+
+function displayAverage(value) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.round(value * 10) / 10;
+}
+
+function buildResidentMotionBaseline(residentMotionEvents) {
+  const todayKey = localDateKey(new Date());
+  const hourlyCounts = Array.from({ length: 24 }, (_, hour) => ({
+    hour,
+    count: 0
+  }));
+  const eventsByDate = new Map();
+  const roomCountsToday = new Map();
+  let firstMotionToday = null;
+  let lastMotionToday = null;
+
+  for (const event of residentMotionEvents) {
+    const eventDate = new Date(event.timestamp);
+
+    if (Number.isNaN(eventDate.getTime())) {
+      continue;
+    }
+
+    const dateKey = localDateKey(eventDate);
+
+    if (!dateKey) {
+      continue;
+    }
+
+    if (!eventsByDate.has(dateKey)) {
+      eventsByDate.set(dateKey, []);
+    }
+
+    eventsByDate.get(dateKey).push(event);
+
+    if (dateKey === todayKey) {
+      const hour = localHourFromDate(eventDate);
+
+      if (hour !== null) {
+        hourlyCounts[hour].count += 1;
+      }
+
+      const roomName = motionEventRoomName(event);
+      roomCountsToday.set(roomName, (roomCountsToday.get(roomName) || 0) + 1);
+
+      if (!firstMotionToday || eventDate.getTime() < new Date(firstMotionToday.timestamp).getTime()) {
+        firstMotionToday = event;
+      }
+
+      if (!lastMotionToday || eventDate.getTime() > new Date(lastMotionToday.timestamp).getTime()) {
+        lastMotionToday = event;
+      }
+    }
+  }
+
+  const todayEvents = eventsByDate.get(todayKey) || [];
+  const baselineDateKeys = [...eventsByDate.keys()].filter((dateKey) => dateKey !== todayKey);
+  const baselineMotionCounts = baselineDateKeys.map((dateKey) => eventsByDate.get(dateKey)?.length || 0);
+  const baselineDayCount = baselineMotionCounts.length;
+  const baselineMotionAverage = baselineDayCount > 0
+    ? baselineMotionCounts.reduce((sum, count) => sum + count, 0) / baselineDayCount
+    : 0;
+  const todayMotionCount = todayEvents.length;
+  const expectedMotionCountLow = baselineDayCount >= AI_BASELINE_MIN_DAYS
+    ? Math.max(1, Math.floor(baselineMotionAverage * AI_BASELINE_QUIET_RATIO))
+    : null;
+  const expectedMotionCountHigh = baselineDayCount >= AI_BASELINE_MIN_DAYS
+    ? Math.ceil(baselineMotionAverage * AI_BASELINE_ACTIVE_RATIO)
+    : null;
+
+  let patternStatus = "Insufficient Baseline";
+  let patternExplanation = `Need at least ${AI_BASELINE_MIN_DAYS} prior motion days before comparing this resident to their own routine.`;
+
+  if (baselineDayCount >= AI_BASELINE_MIN_DAYS) {
+    if (todayMotionCount < expectedMotionCountLow) {
+      patternStatus = "Too Quiet";
+      patternExplanation = `Today has ${todayMotionCount} motion event(s), below the expected low range of ${expectedMotionCountLow}.`;
+    } else if (todayMotionCount > expectedMotionCountHigh) {
+      patternStatus = "More Active Than Usual";
+      patternExplanation = `Today has ${todayMotionCount} motion event(s), above the expected high range of ${expectedMotionCountHigh}.`;
+    } else {
+      patternStatus = "Normal Pattern";
+      patternExplanation = `Today is within this resident's recent motion baseline.`;
+    }
+  }
+
+  const mostActiveRoomToday = [...roomCountsToday.entries()]
+    .sort((first, second) => {
+      if (first[1] !== second[1]) {
+        return second[1] - first[1];
+      }
+
+      return first[0].localeCompare(second[0]);
+    })[0] || null;
+
+  return {
+    baselineDayCount,
+    baselineMotionAverage: displayAverage(baselineMotionAverage),
+    todayMotionCount,
+    expectedMotionCountLow,
+    expectedMotionCountHigh,
+    patternStatus,
+    patternExplanation,
+    firstMotionTodayAt: firstMotionToday?.timestamp || null,
+    firstMotionTodayRoom: firstMotionToday ? motionEventRoomName(firstMotionToday) : null,
+    lastMotionTodayAt: lastMotionToday?.timestamp || null,
+    lastMotionTodayRoom: lastMotionToday ? motionEventRoomName(lastMotionToday) : null,
+    mostActiveRoomToday: mostActiveRoomToday ? mostActiveRoomToday[0] : null,
+    mostActiveRoomTodayCount: mostActiveRoomToday ? mostActiveRoomToday[1] : 0,
+    hourlyMotionCounts: hourlyCounts
+  };
+}
+
 function buildAIStatusForResident({
   resident,
   residentEvents,
@@ -693,6 +861,7 @@ async function buildAIMotionSummary() {
       return !Number.isNaN(eventDate.getTime()) &&
         eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
     }).length;
+    const motionBaseline = buildResidentMotionBaseline(residentMotionEvents);
 
     const openAlerts = residentEvents.filter((event) => {
       return event.isAcknowledged !== true && normalizeAlertLevel(event.alertLevel) !== "Normal";
@@ -755,6 +924,19 @@ async function buildAIMotionSummary() {
       retainedMotionEventFallbackCount: physicalWebhookMotionEvents.length,
       motionCountToday,
       motionCountLastHour,
+      baselineDayCount: motionBaseline.baselineDayCount,
+      baselineMotionAverage: motionBaseline.baselineMotionAverage,
+      expectedMotionCountLow: motionBaseline.expectedMotionCountLow,
+      expectedMotionCountHigh: motionBaseline.expectedMotionCountHigh,
+      patternStatus: motionBaseline.patternStatus,
+      patternExplanation: motionBaseline.patternExplanation,
+      firstMotionTodayAt: motionBaseline.firstMotionTodayAt,
+      firstMotionTodayRoom: motionBaseline.firstMotionTodayRoom,
+      lastMotionTodayAt: motionBaseline.lastMotionTodayAt,
+      lastMotionTodayRoom: motionBaseline.lastMotionTodayRoom,
+      mostActiveRoomToday: motionBaseline.mostActiveRoomToday,
+      mostActiveRoomTodayCount: motionBaseline.mostActiveRoomTodayCount,
+      hourlyMotionCounts: motionBaseline.hourlyMotionCounts,
       openAlertCount: openAlerts.length,
       recentOpenAlertCount: recentOpenAlerts.length,
       recentCriticalOpenAlertCount: recentCriticalOpenAlerts.length,
@@ -796,6 +978,10 @@ async function buildAIMotionSummary() {
     inactiveWarningMinutes: AI_INACTIVE_WARNING_MINUTES,
     inactiveCriticalMinutes: AI_INACTIVE_CRITICAL_MINUTES,
     motionHistoryDays: AI_MOTION_HISTORY_DAYS,
+    baselineMinimumDays: AI_BASELINE_MIN_DAYS,
+    baselineQuietRatio: AI_BASELINE_QUIET_RATIO,
+    baselineActiveRatio: AI_BASELINE_ACTIVE_RATIO,
+    aiTimeZone: AI_TIME_ZONE,
     nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
     residentCount: residents.length,
     residents
