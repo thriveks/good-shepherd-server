@@ -451,9 +451,13 @@ function buildAIStatusForResident({
   latestMotionSensor,
   inactiveMinutes,
   openAlertCount,
+  recentOpenAlertCount,
+  recentCriticalOpenAlertCount,
+  recentCautionOpenAlertCount,
+  activeSensorCount,
+  onlineSensorCount,
   offlineSensorCount
 }) {
-  const residentAlertLevel = normalizeAlertLevel(resident?.alertLevel);
   const hasInactiveMinutes = Number.isFinite(inactiveMinutes);
   const motionCountLastHour = residentEvents.filter((event) => {
     const eventDate = new Date(event.timestamp);
@@ -462,19 +466,43 @@ function buildAIStatusForResident({
       eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
   }).length;
 
-  if (residentAlertLevel === "Critical" ||
-    openAlertCount >= 2 ||
+  if (residentSensors.length === 0) {
+    return {
+      aiStatus: "Setup Needed",
+      aiLevel: "Setup Needed",
+      aiExplanation: "No ESP32 motion sensors are assigned to this resident yet. Add or assign sensors before using AI behavior monitoring."
+    };
+  }
+
+  if (activeSensorCount === 0) {
+    return {
+      aiStatus: "Setup Needed",
+      aiLevel: "Setup Needed",
+      aiExplanation: "This resident has sensor records, but no active ESP32 motion sensors are available for AI behavior monitoring."
+    };
+  }
+
+  if (onlineSensorCount === 0) {
+    return {
+      aiStatus: "Sensor Issue",
+      aiLevel: "Sensor Issue",
+      aiExplanation: "All assigned ESP32 motion sensors appear offline or stale. Restore sensor connectivity before treating this as a resident behavior issue."
+    };
+  }
+
+  if (recentCriticalOpenAlertCount > 0 ||
     (hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_CRITICAL_MINUTES)) {
     return {
       aiStatus: "Critical",
       aiLevel: "Critical",
       aiExplanation: hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_CRITICAL_MINUTES
         ? `No routine ESP32 motion has been seen for ${inactiveMinutes} minutes. Immediate follow-up is recommended.`
-        : "The resident has a critical or repeated unresolved behavior signal. Immediate follow-up is recommended."
+        : "A recent critical behavior event is open. Immediate follow-up is recommended."
     };
   }
 
-  if (residentAlertLevel === "Caution" ||
+  if (recentCautionOpenAlertCount > 0 ||
+    recentOpenAlertCount >= 2 ||
     (hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_WARNING_MINUTES) ||
     offlineSensorCount > 0) {
     return {
@@ -486,7 +514,7 @@ function buildAIStatusForResident({
     };
   }
 
-  if (openAlertCount === 1 ||
+  if (recentOpenAlertCount === 1 ||
     (hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_WATCH_MINUTES)) {
     return {
       aiStatus: "Watch",
@@ -586,6 +614,17 @@ async function buildAIMotionSummary() {
     const openAlerts = residentEvents.filter((event) => {
       return event.isAcknowledged !== true && normalizeAlertLevel(event.alertLevel) !== "Normal";
     });
+    const recentOpenAlerts = openAlerts.filter((event) => {
+      const eventDate = new Date(event.timestamp);
+      return !Number.isNaN(eventDate.getTime()) &&
+        eventDate.getTime() >= Date.now() - (24 * 60 * 60 * 1000);
+    });
+    const recentCriticalOpenAlerts = recentOpenAlerts.filter((event) => {
+      return normalizeAlertLevel(event.alertLevel) === "Critical";
+    });
+    const recentCautionOpenAlerts = recentOpenAlerts.filter((event) => {
+      return normalizeAlertLevel(event.alertLevel) === "Caution";
+    });
 
     const activeSensors = residentSensors.filter((sensor) => sensor.isActive !== false);
     const offlineSensors = activeSensors.filter((sensor) => {
@@ -608,6 +647,11 @@ async function buildAIMotionSummary() {
       latestMotionSensor,
       inactiveMinutes,
       openAlertCount: openAlerts.length,
+      recentOpenAlertCount: recentOpenAlerts.length,
+      recentCriticalOpenAlertCount: recentCriticalOpenAlerts.length,
+      recentCautionOpenAlertCount: recentCautionOpenAlerts.length,
+      activeSensorCount: activeSensors.length,
+      onlineSensorCount: Math.max(0, activeSensors.length - offlineSensors.length),
       offlineSensorCount: offlineSensors.length
     });
 
@@ -627,6 +671,9 @@ async function buildAIMotionSummary() {
       motionCountToday,
       motionCountLastHour,
       openAlertCount: openAlerts.length,
+      recentOpenAlertCount: recentOpenAlerts.length,
+      recentCriticalOpenAlertCount: recentCriticalOpenAlerts.length,
+      recentCautionOpenAlertCount: recentCautionOpenAlerts.length,
       inactiveMinutes,
       lastMotionAt: latestMotionEvent?.timestamp || null,
       lastMotionRoom: latestMotionEvent ? roomNameFromEvent(latestMotionEvent, latestMotionSensor) : null,
