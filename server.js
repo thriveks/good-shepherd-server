@@ -895,6 +895,90 @@ function buildResidentActionGuidance({
   };
 }
 
+function buildResidentFollowUpStatus({
+  actionGuidance,
+  latestActionLog
+}) {
+  const actionLevel = cleanText(actionGuidance?.actionLevel);
+  const actionTitle = cleanText(actionGuidance?.actionTitle);
+  const nextCheckMinutes = Number.isFinite(actionGuidance?.nextCheckMinutes)
+    ? actionGuidance.nextCheckMinutes
+    : null;
+
+  if (actionLevel === "Normal") {
+    return {
+      followUpStatus: "No Action Needed",
+      followUpExplanation: "Current action recommendation is normal monitoring.",
+      followUpDueAt: null,
+      minutesUntilFollowUpDue: null
+    };
+  }
+
+  const logActionLevel = cleanText(latestActionLog?.actionLevel);
+  const logActionTitle = cleanText(latestActionLog?.actionTitle);
+  const logMatchesCurrentAction =
+    latestActionLog &&
+    normalizeForMatch(logActionLevel) === normalizeForMatch(actionLevel) &&
+    normalizeForMatch(logActionTitle) === normalizeForMatch(actionTitle);
+
+  if (!logMatchesCurrentAction) {
+    return {
+      followUpStatus: "Not Logged",
+      followUpExplanation: "No follow-up has been logged for this current action recommendation.",
+      followUpDueAt: null,
+      minutesUntilFollowUpDue: null
+    };
+  }
+
+  if (nextCheckMinutes === null) {
+    return {
+      followUpStatus: "Not Scheduled",
+      followUpExplanation: "A follow-up was logged, and this recommendation does not require a timed recheck.",
+      followUpDueAt: null,
+      minutesUntilFollowUpDue: null
+    };
+  }
+
+  if (nextCheckMinutes <= 0) {
+    return {
+      followUpStatus: "Due Now",
+      followUpExplanation: "This recommendation requires immediate follow-up.",
+      followUpDueAt: new Date().toISOString(),
+      minutesUntilFollowUpDue: 0
+    };
+  }
+
+  const loggedAt = new Date(latestActionLog.createdAt);
+
+  if (Number.isNaN(loggedAt.getTime())) {
+    return {
+      followUpStatus: "Logged",
+      followUpExplanation: "A follow-up was logged, but its timestamp could not be used to calculate the next due time.",
+      followUpDueAt: null,
+      minutesUntilFollowUpDue: null
+    };
+  }
+
+  const dueAt = new Date(loggedAt.getTime() + (nextCheckMinutes * 60 * 1000));
+  const minutesUntilDue = Math.ceil((dueAt.getTime() - Date.now()) / (60 * 1000));
+
+  if (minutesUntilDue <= 0) {
+    return {
+      followUpStatus: "Due Again",
+      followUpExplanation: "The logged follow-up interval has elapsed. Recheck this resident or sensor issue.",
+      followUpDueAt: dueAt.toISOString(),
+      minutesUntilFollowUpDue: 0
+    };
+  }
+
+  return {
+    followUpStatus: "Logged",
+    followUpExplanation: "A follow-up has been logged and the next recheck is not due yet.",
+    followUpDueAt: dueAt.toISOString(),
+    minutesUntilFollowUpDue: minutesUntilDue
+  };
+}
+
 function buildAIStatusForResident({
   resident,
   residentEvents,
@@ -1146,6 +1230,10 @@ async function buildAIMotionSummary() {
       recentCautionOpenAlertCount: recentCautionOpenAlerts.length,
       inactiveMinutes
     });
+    const followUpStatus = buildResidentFollowUpStatus({
+      actionGuidance,
+      latestActionLog
+    });
 
     return {
       residentId: resident.id,
@@ -1208,6 +1296,10 @@ async function buildAIMotionSummary() {
       lastActionStatus: latestActionLog?.actionStatus || null,
       lastActionNote: latestActionLog?.actionNote || null,
       lastActionBy: latestActionLog?.createdBy || null,
+      followUpStatus: followUpStatus.followUpStatus,
+      followUpExplanation: followUpStatus.followUpExplanation,
+      followUpDueAt: followUpStatus.followUpDueAt,
+      minutesUntilFollowUpDue: followUpStatus.minutesUntilFollowUpDue,
       sensors: residentSensors.map((sensor) => {
         const health = nodeHealthByNodeId.get(cleanText(sensor.nodeId));
 
