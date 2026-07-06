@@ -741,6 +741,142 @@ function buildResidentRoomIntelligence(residentSensors, residentMotionEvents) {
   };
 }
 
+function buildResidentActionGuidance({
+  aiStatus,
+  motionBaseline,
+  roomIntelligence,
+  activeSensorCount,
+  offlineSensorCount,
+  recentCriticalOpenAlertCount,
+  recentCautionOpenAlertCount,
+  inactiveMinutes
+}) {
+  const aiLevel = cleanText(aiStatus?.aiLevel || aiStatus?.aiStatus);
+  const patternStatus = cleanText(motionBaseline?.patternStatus);
+  const coverageStatus = cleanText(roomIntelligence?.coverageStatus);
+
+  if (aiLevel === "Critical" || recentCriticalOpenAlertCount > 0) {
+    return {
+      actionLevel: "Immediate",
+      actionTitle: "Immediate follow-up recommended",
+      actionSummary: "A critical resident behavior signal is present.",
+      actionItems: [
+        "Contact or physically check on the resident using the agency's normal escalation process.",
+        "Review the most recent motion room, last motion time, and open alerts before closing the event.",
+        "Document the follow-up result after contact is completed."
+      ],
+      nextCheckMinutes: 0
+    };
+  }
+
+  if (aiLevel === "Sensor Issue") {
+    return {
+      actionLevel: "Technical",
+      actionTitle: "Restore sensor connectivity",
+      actionSummary: "Resident behavior should not be judged until assigned sensors are online.",
+      actionItems: [
+        "Check power and Wi-Fi for the offline ESP32 sensor or local node.",
+        "Confirm the sensor is assigned to the correct resident and room.",
+        "Retest motion after connectivity is restored."
+      ],
+      nextCheckMinutes: 15
+    };
+  }
+
+  if (aiLevel === "Setup Needed") {
+    return {
+      actionLevel: "Setup",
+      actionTitle: "Complete sensor assignment",
+      actionSummary: "AI behavior monitoring is not active for this resident yet.",
+      actionItems: [
+        "Assign at least one ESP32 motion sensor to this resident.",
+        "Set the correct room name for each sensor.",
+        "Trigger a test motion event and confirm it appears in the AI Dashboard."
+      ],
+      nextCheckMinutes: null
+    };
+  }
+
+  if (aiLevel === "Warning" || patternStatus === "Too Quiet") {
+    return {
+      actionLevel: "Review",
+      actionTitle: "Review resident activity",
+      actionSummary: "Motion activity is below the current expected pattern or a warning signal is present.",
+      actionItems: [
+        "Review last motion time and the quiet rooms for this resident.",
+        "Compare activity against the resident's expected routine for this time of day.",
+        "Escalate if the resident cannot be reached or if quiet activity continues."
+      ],
+      nextCheckMinutes: 30
+    };
+  }
+
+  if (aiLevel === "Watch" || recentCautionOpenAlertCount > 0 || coverageStatus === "No Motion Today") {
+    return {
+      actionLevel: "Watch",
+      actionTitle: "Continue watching activity",
+      actionSummary: "No immediate escalation is required, but activity should be checked again soon.",
+      actionItems: [
+        "Check the resident again after the next expected motion window.",
+        "Watch for additional alerts or continued inactivity.",
+        "Confirm sensors remain online."
+      ],
+      nextCheckMinutes: inactiveMinutes !== null && inactiveMinutes >= AI_INACTIVE_WATCH_MINUTES ? 30 : 60
+    };
+  }
+
+  if (coverageStatus === "Partial Room Activity") {
+    return {
+      actionLevel: "Observe",
+      actionTitle: "Room activity is partial",
+      actionSummary: "Motion is present, but not all assigned rooms have reported activity today.",
+      actionItems: [
+        "Review which assigned rooms are quiet today.",
+        "Confirm quiet rooms are expected based on the resident's routine.",
+        "No action is needed if this matches normal activity."
+      ],
+      nextCheckMinutes: 120
+    };
+  }
+
+  if (patternStatus === "More Active Than Usual") {
+    return {
+      actionLevel: "Observe",
+      actionTitle: "Activity is higher than usual",
+      actionSummary: "Motion is above the resident's recent baseline.",
+      actionItems: [
+        "Review room distribution to see where extra motion is happening.",
+        "Check whether the resident has visitors, staff activity, or a changed routine.",
+        "Continue normal monitoring unless other alerts appear."
+      ],
+      nextCheckMinutes: 120
+    };
+  }
+
+  if (activeSensorCount > 0 && offlineSensorCount === 0) {
+    return {
+      actionLevel: "Normal",
+      actionTitle: "No action needed",
+      actionSummary: "Sensors are online and current activity is within normal monitoring rules.",
+      actionItems: [
+        "Continue normal monitoring."
+      ],
+      nextCheckMinutes: 240
+    };
+  }
+
+  return {
+    actionLevel: "Review",
+    actionTitle: "Review resident setup",
+    actionSummary: "The resident does not have enough clean monitoring data for a stronger recommendation.",
+    actionItems: [
+      "Check sensor assignment and recent activity.",
+      "Confirm the resident should be included in AI monitoring."
+    ],
+    nextCheckMinutes: null
+  };
+}
+
 function buildAIStatusForResident({
   resident,
   residentEvents,
@@ -971,6 +1107,16 @@ async function buildAIMotionSummary() {
       onlineSensorCount: Math.max(0, activeSensors.length - offlineSensors.length),
       offlineSensorCount: offlineSensors.length
     });
+    const actionGuidance = buildResidentActionGuidance({
+      aiStatus,
+      motionBaseline,
+      roomIntelligence,
+      activeSensorCount: activeSensors.length,
+      offlineSensorCount: offlineSensors.length,
+      recentCriticalOpenAlertCount: recentCriticalOpenAlerts.length,
+      recentCautionOpenAlertCount: recentCautionOpenAlerts.length,
+      inactiveMinutes
+    });
 
     return {
       residentId: resident.id,
@@ -1021,6 +1167,11 @@ async function buildAIMotionSummary() {
       aiStatus: aiStatus.aiStatus,
       aiLevel: aiStatus.aiLevel,
       aiExplanation: aiStatus.aiExplanation,
+      actionLevel: actionGuidance.actionLevel,
+      actionTitle: actionGuidance.actionTitle,
+      actionSummary: actionGuidance.actionSummary,
+      actionItems: actionGuidance.actionItems,
+      nextCheckMinutes: actionGuidance.nextCheckMinutes,
       sensors: residentSensors.map((sensor) => {
         const health = nodeHealthByNodeId.get(cleanText(sensor.nodeId));
 
