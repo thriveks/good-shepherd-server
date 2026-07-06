@@ -270,6 +270,24 @@ async function initializeDatabase() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS motion_events_webhook_event_id_unique_idx ON motion_events (webhook_event_id) WHERE webhook_event_id IS NOT NULL`);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_action_logs (
+      id UUID PRIMARY KEY,
+      resident_id UUID REFERENCES residents(id) ON DELETE SET NULL,
+      resident_name TEXT NOT NULL,
+      action_level TEXT NOT NULL,
+      action_title TEXT NOT NULL,
+      action_status TEXT NOT NULL DEFAULT 'completed',
+      action_note TEXT,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS ai_action_logs_resident_id_created_at_idx ON ai_action_logs (resident_id, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS ai_action_logs_resident_name_created_at_idx ON ai_action_logs (LOWER(TRIM(resident_name)), created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS ai_action_logs_created_at_idx ON ai_action_logs (created_at DESC)`);
+
+  await pool.query(`
     INSERT INTO device_mappings (
       source_key,
       source_name,
@@ -979,7 +997,7 @@ function buildAIStatusForResident({
 }
 
 async function buildAIMotionSummary() {
-  const [residentResult, sensorResult, eventResult, motionEventResult, nodeHealthResult] = await Promise.all([
+  const [residentResult, sensorResult, eventResult, motionEventResult, nodeHealthResult, actionLogResult] = await Promise.all([
     pool.query(`
       ${residentSelectSQL()}
       WHERE is_deleted = FALSE
@@ -1007,12 +1025,18 @@ async function buildAIMotionSummary() {
     pool.query(`
       ${nodeHealthSelectSQL()}
       ORDER BY checked_in_at DESC
+    `),
+    pool.query(`
+      ${aiActionLogSelectSQL()}
+      ORDER BY created_at DESC
+      LIMIT 500
     `)
   ]);
 
   const sensors = sensorResult.rows;
   const events = eventResult.rows;
   const motionHistoryEvents = motionEventResult.rows;
+  const actionLogs = actionLogResult.rows;
   const nodeHealthByNodeId = new Map(
     nodeHealthResult.rows.map((health) => [cleanText(health.nodeId), health])
   );
@@ -1029,6 +1053,11 @@ async function buildAIMotionSummary() {
       const eventResidentNameKey = normalizeForMatch(event.residentName);
       return eventResidentNameKey === residentNameKey;
     });
+    const residentActionLogs = actionLogs.filter((log) => {
+      const logResidentNameKey = normalizeForMatch(log.residentName);
+      return log.residentId === resident.id || logResidentNameKey === residentNameKey;
+    });
+    const latestActionLog = residentActionLogs[0] || null;
 
     const motionEvents = residentEvents.filter(isMotionEventRow);
     const physicalWebhookMotionEvents = motionEvents.filter(isPhysicalMotionEventRow);
@@ -1172,6 +1201,13 @@ async function buildAIMotionSummary() {
       actionSummary: actionGuidance.actionSummary,
       actionItems: actionGuidance.actionItems,
       nextCheckMinutes: actionGuidance.nextCheckMinutes,
+      actionLogCount: residentActionLogs.length,
+      lastActionAt: latestActionLog?.createdAt || null,
+      lastActionLevel: latestActionLog?.actionLevel || null,
+      lastActionTitle: latestActionLog?.actionTitle || null,
+      lastActionStatus: latestActionLog?.actionStatus || null,
+      lastActionNote: latestActionLog?.actionNote || null,
+      lastActionBy: latestActionLog?.createdBy || null,
       sensors: residentSensors.map((sensor) => {
         const health = nodeHealthByNodeId.get(cleanText(sensor.nodeId));
 
@@ -1543,6 +1579,22 @@ function motionEventSelectSQL() {
       event_timestamp AS "timestamp",
       created_at AS "createdAt"
     FROM motion_events
+  `;
+}
+
+function aiActionLogSelectSQL() {
+  return `
+    SELECT
+      id,
+      resident_id AS "residentId",
+      resident_name AS "residentName",
+      action_level AS "actionLevel",
+      action_title AS "actionTitle",
+      action_status AS "actionStatus",
+      action_note AS "actionNote",
+      created_by AS "createdBy",
+      created_at AS "createdAt"
+    FROM ai_action_logs
   `;
 }
 
@@ -2887,6 +2939,8 @@ app.get("/", async (req, res) => {
         "GET /node-commands/:nodeId",
         "GET /ai/motion-summary",
         "GET /ai/motion-events",
+        "GET /ai/action-logs",
+        "POST /ai/action-logs",
         "GET /sensors",
         "GET /sensor-inventory",
         "PATCH /sensors/:nodeId/assignment",
@@ -2975,6 +3029,112 @@ app.get("/ai/motion-events", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to fetch AI motion events"
+    });
+  }
+});
+
+app.get("/ai/action-logs", async (req, res) => {
+  try {
+    const requestedLimit = normalizeInteger(req.query.limit, 100);
+    const limit = Math.min(Math.max(requestedLimit, 1), 500);
+    const residentId = cleanOptionalText(req.query.residentId);
+    const residentName = cleanOptionalText(req.query.residentName);
+
+    const result = await pool.query(
+      `
+      ${aiActionLogSelectSQL()}
+      WHERE ($2::text IS NULL OR resident_id::text = $2)
+        AND ($3::text IS NULL OR LOWER(TRIM(resident_name)) = LOWER(TRIM($3)))
+      ORDER BY created_at DESC
+      LIMIT $1
+      `,
+      [limit, residentId, residentName]
+    );
+
+    res.status(200).json({
+      success: true,
+      count: result.rows.length,
+      logs: result.rows
+    });
+  } catch (error) {
+    console.error("Failed to fetch AI action logs:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch AI action logs"
+    });
+  }
+});
+
+app.post("/ai/action-logs", async (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized action log request"
+      });
+    }
+
+    const residentId = cleanOptionalText(req.body?.residentId);
+    const residentName = cleanText(req.body?.residentName);
+    const actionLevel = cleanText(req.body?.actionLevel);
+    const actionTitle = cleanText(req.body?.actionTitle);
+    const actionStatus = cleanText(req.body?.actionStatus) || "completed";
+    const actionNote = cleanOptionalText(req.body?.actionNote);
+    const createdBy = cleanOptionalText(req.body?.createdBy);
+
+    if (!residentName || !actionLevel || !actionTitle) {
+      return res.status(400).json({
+        success: false,
+        error: "residentName, actionLevel, and actionTitle are required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO ai_action_logs (
+        id,
+        resident_id,
+        resident_name,
+        action_level,
+        action_title,
+        action_status,
+        action_note,
+        created_by,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      RETURNING
+        id,
+        resident_id AS "residentId",
+        resident_name AS "residentName",
+        action_level AS "actionLevel",
+        action_title AS "actionTitle",
+        action_status AS "actionStatus",
+        action_note AS "actionNote",
+        created_by AS "createdBy",
+        created_at AS "createdAt"
+      `,
+      [
+        randomUUID(),
+        residentId,
+        residentName,
+        actionLevel,
+        actionTitle,
+        actionStatus,
+        actionNote,
+        createdBy
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      log: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Failed to create AI action log:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to create AI action log"
     });
   }
 });
