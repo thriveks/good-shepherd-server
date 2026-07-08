@@ -1,11 +1,11 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v10 - AI Sensor Live Status Fix
-// Updated: 2026-07-07 10:41 AM CDT
-// iOS Dependency: AIDashboardView v13 - AI Live Refresh
+// Version: v11 - Resident Rename Identity Fix
+// Updated: 2026-07-08 09:30 AM CDT
+// iOS Dependency: ResidentsView resident edit flow
 //
-// Keeps AI sensor health current when fresh motion exists even if node heartbeat is stale.
+// Keeps resident renames tied to resident_id and prevents stale device payload names from recreating old residents.
 
 const express = require("express");
 const { Pool } = require("pg");
@@ -2297,6 +2297,55 @@ async function getResidentById(residentId) {
   return result.rows[0] || null;
 }
 
+async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
+  const resolvedSourceKey = cleanText(sourceKey);
+  const resolvedNodeId = cleanText(nodeId);
+
+  if (!resolvedSourceKey && !resolvedNodeId) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+    WITH device_resident_matches AS (
+      SELECT
+        s.resident_id,
+        s.updated_at,
+        1 AS priority
+      FROM sensors s
+      WHERE s.is_deleted = FALSE
+        AND s.resident_id IS NOT NULL
+        AND (
+          ($1::text <> '' AND s.source_key = $1)
+          OR ($2::text <> '' AND s.node_id = $2)
+        )
+
+      UNION ALL
+
+      SELECT
+        c.resident_id,
+        c.updated_at,
+        2 AS priority
+      FROM cameras c
+      WHERE c.is_deleted = FALSE
+        AND c.resident_id IS NOT NULL
+        AND (
+          ($1::text <> '' AND c.source_key = $1)
+          OR ($2::text <> '' AND c.assigned_node_id = $2)
+        )
+    )
+    ${residentSelectSQL()}
+    JOIN device_resident_matches drm ON drm.resident_id = residents.id
+    WHERE residents.is_deleted = FALSE
+    ORDER BY drm.priority ASC, drm.updated_at DESC
+    LIMIT 1
+    `,
+    [resolvedSourceKey, resolvedNodeId]
+  );
+
+  return result.rows[0] || null;
+}
+
 async function getLatestFirmwareRelease() {
   const result = await pool.query(
     `
@@ -2550,20 +2599,27 @@ async function upsertNodeHealth(payload) {
       ? `${heartbeatDeviceName} - ${heartbeatRoomName}`
       : heartbeatDeviceName;
 
-    const resident = await findOrCreateResidentFromEvent({
-      residentName: heartbeatResidentName,
-      locationName: heartbeatLocationName,
-      alertLevel: "Normal",
-      message: "ESP32 sensor heartbeat"
+    let resident = await getResidentForExistingDeviceIdentity({
+      sourceKey: diagnostics.sourceKey,
+      nodeId
     });
+
+    if (!resident) {
+      resident = await findOrCreateResidentFromEvent({
+        residentName: heartbeatResidentName,
+        locationName: heartbeatLocationName,
+        alertLevel: "Normal",
+        message: "ESP32 sensor heartbeat"
+      });
+    }
 
     await upsertSensorFromEvent({
       nodeId,
       sourceKey: diagnostics.sourceKey,
       sourceName: heartbeatSourceName,
       resident,
-      residentName: heartbeatResidentName,
-      locationName: heartbeatLocationName
+      residentName: resident?.name || heartbeatResidentName,
+      locationName: resident?.location || heartbeatLocationName
     });
   }
 
@@ -4568,6 +4624,9 @@ app.post("/residents", async (req, res) => {
 });
 
 app.patch("/residents/:residentId", async (req, res) => {
+  const client = await pool.connect();
+  let didBegin = false;
+
   try {
     if (!requireAuthorizedCurrentAppWrite(req, res)) {
       return;
@@ -4592,7 +4651,7 @@ app.patch("/residents/:residentId", async (req, res) => {
     }
 
     const nextName = cleanText(req.body?.name) || existingResident.name;
-    const nextLocation = cleanText(req.body?.location) || existingResident.location;
+    const nextLocation = cleanText(req.body?.location) || existingResident.location || "Unassigned location";
     const nextAlertLevel = req.body?.alertLevel
       ? normalizeAlertLevel(req.body.alertLevel)
       : existingResident.alertLevel;
@@ -4602,7 +4661,43 @@ app.patch("/residents/:residentId", async (req, res) => {
       : warningCountForAlertLevel(nextAlertLevel);
     const nextStatusText = cleanText(req.body?.statusText) || existingResident.statusText;
 
-    const result = await pool.query(
+    if (!nextName) {
+      return res.status(400).json({
+        success: false,
+        error: "Resident name is required"
+      });
+    }
+
+    await client.query("BEGIN");
+    didBegin = true;
+
+    const sourceResult = await client.query(
+      `
+      SELECT DISTINCT source_key
+      FROM (
+        SELECT source_key
+        FROM sensors
+        WHERE resident_id = $1
+          AND is_deleted = FALSE
+          AND source_key IS NOT NULL
+          AND TRIM(source_key) <> ''
+
+        UNION
+
+        SELECT source_key
+        FROM cameras
+        WHERE resident_id = $1
+          AND is_deleted = FALSE
+          AND source_key IS NOT NULL
+          AND TRIM(source_key) <> ''
+      ) related_sources
+      `,
+      [residentId]
+    );
+
+    const relatedSourceKeys = sourceResult.rows.map((row) => row.source_key).filter(Boolean);
+
+    const result = await client.query(
       `
       UPDATE residents
       SET
@@ -4638,7 +4733,7 @@ app.patch("/residents/:residentId", async (req, res) => {
       ]
     );
 
-    await pool.query(
+    await client.query(
       `
       UPDATE cameras
       SET
@@ -4650,7 +4745,7 @@ app.patch("/residents/:residentId", async (req, res) => {
       [residentId, nextName]
     );
 
-    await pool.query(
+    await client.query(
       `
       UPDATE sensors
       SET
@@ -4663,17 +4758,73 @@ app.patch("/residents/:residentId", async (req, res) => {
       [residentId, nextName, nextLocation]
     );
 
+    await client.query(
+      `
+      UPDATE motion_events
+      SET
+        resident_name = $2,
+        location_name = COALESCE(location_name, $3)
+      WHERE resident_id = $1
+      `,
+      [residentId, nextName, nextLocation]
+    );
+
+    await client.query(
+      `
+      UPDATE ai_action_logs
+      SET
+        resident_name = $2
+      WHERE resident_id = $1
+      `,
+      [residentId, nextName]
+    );
+
+    if (relatedSourceKeys.length > 0) {
+      await client.query(
+        `
+        UPDATE device_mappings
+        SET
+          resident_name = $2
+        WHERE source_key = ANY($1::text[])
+          AND LOWER(TRIM(resident_name)) = LOWER(TRIM($3))
+        `,
+        [relatedSourceKeys, nextName, existingResident.name]
+      );
+
+      await client.query(
+        `
+        UPDATE webhook_events
+        SET
+          resident_name = $2,
+          location_name = COALESCE(location_name, $3)
+        WHERE source_key = ANY($1::text[])
+          AND LOWER(TRIM(resident_name)) = LOWER(TRIM($4))
+        `,
+        [relatedSourceKeys, nextName, nextLocation, existingResident.name]
+      );
+    }
+
+    await client.query("COMMIT");
+    didBegin = false;
+
     return res.status(200).json({
       success: true,
       message: "Resident updated",
-      resident: result.rows[0]
+      resident: result.rows[0],
+      relatedSourceKeys
     });
   } catch (error) {
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
     console.error("Resident update failed:", error);
     return res.status(500).json({
       success: false,
       error: error.message
     });
+  } finally {
+    client.release();
   }
 });
 
@@ -6325,7 +6476,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     const resolvedNodeId = cleanText(nodeId);
-    const resolvedLocationName = cleanText(locationName);
+    let resolvedLocationName = cleanText(locationName);
     const resolvedSourceKey = cleanText(sourceKey);
 
     let resolvedSourceName = cleanText(sourceName);
@@ -6366,12 +6517,22 @@ app.post("/webhook", async (req, res) => {
       await touchNodeFromWebhook(resolvedNodeId);
     }
 
-    const resident = await findOrCreateResidentFromEvent({
-      residentName: resolvedResidentName,
-      locationName: resolvedLocationName,
-      alertLevel: resolvedAlertLevel,
-      message
+    let resident = await getResidentForExistingDeviceIdentity({
+      sourceKey: resolvedSourceKey,
+      nodeId: resolvedNodeId
     });
+
+    if (resident) {
+      resolvedResidentName = resident.name;
+      resolvedLocationName = resolvedLocationName || resident.location || "";
+    } else {
+      resident = await findOrCreateResidentFromEvent({
+        residentName: resolvedResidentName,
+        locationName: resolvedLocationName,
+        alertLevel: resolvedAlertLevel,
+        message
+      });
+    }
 
     const sensor = await upsertSensorFromEvent({
       nodeId: resolvedNodeId,
