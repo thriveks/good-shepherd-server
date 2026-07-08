@@ -1,11 +1,11 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11 - Resident Rename Identity Fix
-// Updated: 2026-07-08 09:30 AM CDT
+// Version: v11.1 - Resident Rename Identity Fix
+// Updated: 2026-07-08 10:58 AM CDT
 // iOS Dependency: ResidentsView resident edit flow
 //
-// Keeps resident renames tied to resident_id and prevents stale device payload names from recreating old residents.
+// Keeps resident renames tied to resident_id, prevents stale device payload names from recreating old residents, and fixes the device identity updated_at alias query.
 
 const express = require("express");
 const { Pool } = require("pg");
@@ -2310,7 +2310,7 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
     WITH device_resident_matches AS (
       SELECT
         s.resident_id,
-        s.updated_at,
+        s.updated_at AS match_updated_at,
         1 AS priority
       FROM sensors s
       WHERE s.is_deleted = FALSE
@@ -2324,7 +2324,7 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
 
       SELECT
         c.resident_id,
-        c.updated_at,
+        c.updated_at AS match_updated_at,
         2 AS priority
       FROM cameras c
       WHERE c.is_deleted = FALSE
@@ -2334,10 +2334,22 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
           OR ($2::text <> '' AND c.assigned_node_id = $2)
         )
     )
-    ${residentSelectSQL()}
-    JOIN device_resident_matches drm ON drm.resident_id = residents.id
-    WHERE residents.is_deleted = FALSE
-    ORDER BY drm.priority ASC, drm.updated_at DESC
+    SELECT
+      r.id,
+      r.name,
+      r.location,
+      r.alert_level AS "alertLevel",
+      r.last_activity AS "lastActivity",
+      r.active_warnings AS "activeWarnings",
+      r.status_text AS "statusText",
+      r.is_deleted AS "isDeleted",
+      r.deleted_at AS "deletedAt",
+      r.created_at AS "createdAt",
+      r.updated_at AS "updatedAt"
+    FROM residents r
+    JOIN device_resident_matches drm ON drm.resident_id = r.id
+    WHERE r.is_deleted = FALSE
+    ORDER BY drm.priority ASC, drm.match_updated_at DESC
     LIMIT 1
     `,
     [resolvedSourceKey, resolvedNodeId]
