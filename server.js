@@ -3294,7 +3294,7 @@ async function clearStaleSensorAssignmentsForNode(client, { nodeId, sourceKey, k
   return result.rows.length;
 }
 
-async function updateSensorAssignment({ nodeId, residentId, residentName, locationName, roomName, sourceName, sourceKey }) {
+async function updateSensorAssignment({ nodeId, residentId, residentName, locationName, roomName, sourceName, sourceKey, sensorType, sensorMode }) {
   const resolvedNodeId = cleanText(nodeId);
 
   if (!resolvedNodeId) {
@@ -3327,7 +3327,10 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
   const resolvedSourceName =
     cleanText(sourceName) ||
     (resolvedRoomName ? `Motion Sensor - ${resolvedRoomName}` : (existingNode.nodeName || "Motion Sensor"));
-  const resolvedSensorType = displaySensorTypeForValue(resolvedSourceName, "Motion Sensor");
+  const resolvedSensorType = displaySensorTypeForValue(
+    sensorType || sensorMode || resolvedSourceName || resolvedSourceKey,
+    "Motion Sensor"
+  );
   const setupState = resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned";
 
   const client = await pool.connect();
@@ -5581,7 +5584,9 @@ app.patch("/sensors/:nodeId/assignment", async (req, res) => {
       locationName: req.body?.locationName,
       roomName: req.body?.roomName,
       sourceName: req.body?.sourceName,
-      sourceKey: req.body?.sourceKey
+      sourceKey: req.body?.sourceKey,
+      sensorType: req.body?.sensorType,
+      sensorMode: req.body?.sensorMode
     });
 
     return res.status(200).json({
@@ -5649,7 +5654,9 @@ app.post("/sensor-bulk-actions", async (req, res) => {
             locationName: assignmentRequest?.locationName,
             roomName: assignmentRequest?.roomName,
             sourceName: assignmentRequest?.sourceName,
-            sourceKey: assignmentRequest?.sourceKey
+            sourceKey: assignmentRequest?.sourceKey,
+            sensorType: assignmentRequest?.sensorType,
+            sensorMode: assignmentRequest?.sensorMode
           });
 
           results.push({
