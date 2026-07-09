@@ -1,11 +1,12 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.1 - Resident Rename Identity Fix
-// Updated: 2026-07-08 10:58 AM CDT
-// iOS Dependency: ResidentsView resident edit flow
+// Version: v11.2 - LD2410 Telemetry Preservation
+// Updated: 2026-07-09
+// iOS Dependency: ResidentsView resident edit flow + future PresenceRadar3DView
 //
-// Keeps resident renames tied to resident_id, prevents stale device payload names from recreating old residents, and fixes the device identity updated_at alias query.
+// Keeps resident renames tied to resident_id, prevents stale device payload names from recreating old residents,
+// fixes the device identity updated_at alias query, and preserves full ESP32 webhook payloads for LD2410 radar telemetry.
 
 const express = require("express");
 const { Pool } = require("pg");
@@ -67,6 +68,11 @@ async function initializeDatabase() {
   await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS acknowledged BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS resolution_note TEXT`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS event_type TEXT`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS sensor_type TEXT`);
+  await pool.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS event_payload JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS webhook_events_event_type_timestamp_idx ON webhook_events (event_type, timestamp DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS webhook_events_source_key_event_type_timestamp_idx ON webhook_events (source_key, event_type, timestamp DESC)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
@@ -387,6 +393,106 @@ function normalizeJsonObject(value) {
   }
 
   return {};
+}
+
+function displaySensorTypeForValue(value, fallback = "Motion Sensor") {
+  const cleanValue = cleanText(value).toLowerCase().replace(/[-\s]+/g, "_");
+
+  if (
+    cleanValue === "human_presence" ||
+    cleanValue === "presence" ||
+    cleanValue === "presence_sensor" ||
+    cleanValue === "human_presence_sensor" ||
+    cleanValue === "ld2410" ||
+    cleanValue === "ld2410_presence"
+  ) {
+    return "Human Presence Sensor";
+  }
+
+  if (
+    cleanValue === "motion_presence" ||
+    cleanValue === "motion_presence_sensor" ||
+    cleanValue === "motion_plus_presence" ||
+    cleanValue === "motion+presence" ||
+    cleanValue === "combo"
+  ) {
+    return "Motion + Presence Sensor";
+  }
+
+  if (
+    cleanValue === "motion" ||
+    cleanValue === "motion_sensor" ||
+    cleanValue === "pir" ||
+    cleanValue === "pir_motion"
+  ) {
+    return "Motion Sensor";
+  }
+
+  return fallback;
+}
+
+function normalizeWebhookEventType(value, fallback = "webhook_event") {
+  const cleanValue = cleanText(value).toLowerCase().replace(/[-\s]+/g, "_");
+  return cleanValue || fallback;
+}
+
+function normalizeWebhookSensorType(value, fallback = "unknown") {
+  const cleanValue = cleanText(value).toLowerCase().replace(/[-\s]+/g, "_");
+  return cleanValue || fallback;
+}
+
+function readPayloadNumber(payload, key) {
+  const value = payload?.[key];
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readPayloadBoolean(payload, key) {
+  if (typeof payload?.[key] === "boolean") {
+    return payload[key];
+  }
+
+  const value = cleanText(payload?.[key]).toLowerCase();
+
+  if (value === "true" || value === "1" || value === "yes") {
+    return true;
+  }
+
+  if (value === "false" || value === "0" || value === "no") {
+    return false;
+  }
+
+  return null;
+}
+
+function buildPresenceTelemetryFromEventRow(row) {
+  const payload = normalizeJsonObject(row?.eventPayload || row?.event_payload);
+
+  return {
+    eventId: row?.id || null,
+    nodeId: row?.nodeId || row?.node_id || null,
+    locationName: row?.locationName || row?.location_name || null,
+    sourceKey: row?.sourceKey || row?.source_key || null,
+    sourceName: row?.sourceName || row?.source_name || null,
+    residentName: row?.residentName || row?.resident_name || null,
+    message: row?.message || null,
+    alertLevel: row?.alertLevel || row?.alert_level || null,
+    timeText: row?.timeText || row?.time_text || null,
+    timestamp: row?.timestamp || null,
+    eventType: row?.eventType || row?.event_type || payload.eventType || null,
+    sensorType: row?.sensorType || row?.sensor_type || payload.sensorType || null,
+    presence: readPayloadBoolean(payload, "presence"),
+    targetState: readPayloadNumber(payload, "targetState"),
+    movingTarget: readPayloadBoolean(payload, "movingTarget"),
+    movingDistanceCm: readPayloadNumber(payload, "movingDistanceCm"),
+    movingEnergy: readPayloadNumber(payload, "movingEnergy"),
+    stationaryTarget: readPayloadBoolean(payload, "stationaryTarget"),
+    stationaryDistanceCm: readPayloadNumber(payload, "stationaryDistanceCm"),
+    stationaryEnergy: readPayloadNumber(payload, "stationaryEnergy"),
+    detectionDistanceCm: readPayloadNumber(payload, "detectionDistanceCm"),
+    detectionZone: cleanText(payload.detectionZone) || null,
+    rawPayload: payload
+  };
 }
 
 function normalizeSetupState(value) {
@@ -2021,6 +2127,9 @@ function eventSelectSQL() {
       alert_level AS "alertLevel",
       time_text AS "timeText",
       timestamp,
+      event_type AS "eventType",
+      sensor_type AS "sensorType",
+      event_payload AS "eventPayload",
       acknowledged AS "isAcknowledged",
       acknowledged_at AS "acknowledgedAt",
       resolution_note AS "resolutionNote"
@@ -2629,6 +2738,7 @@ async function upsertNodeHealth(payload) {
       nodeId,
       sourceKey: diagnostics.sourceKey,
       sourceName: heartbeatSourceName,
+      sensorType: diagnostics.sensorMode || diagnostics.sensorType || heartbeatDeviceName,
       resident,
       residentName: resident?.name || heartbeatResidentName,
       locationName: resident?.location || heartbeatLocationName
@@ -2923,6 +3033,7 @@ async function upsertSensorFromEvent({
   nodeId,
   sourceKey,
   sourceName,
+  sensorType,
   resident,
   residentName,
   locationName
@@ -2934,6 +3045,7 @@ async function upsertSensorFromEvent({
   }
 
   const resolvedSourceName = cleanText(sourceName) || "Motion Sensor";
+  const resolvedSensorType = displaySensorTypeForValue(sensorType, "Motion Sensor");
   const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
   const resolvedLocationName = cleanText(locationName) || resident?.location || "Unassigned location";
   const resolvedRoomName = inferRoomNameFromSourceName(resolvedSourceName);
@@ -2957,7 +3069,7 @@ async function upsertSensorFromEvent({
       created_at,
       updated_at
     )
-    VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, $9, TRUE, FALSE, NULL, NOW(), NOW())
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, FALSE, NULL, NOW(), NOW())
     ON CONFLICT (source_key)
     DO UPDATE SET
       node_id = EXCLUDED.node_id,
@@ -2979,6 +3091,7 @@ async function upsertSensorFromEvent({
       cleanText(nodeId) || null,
       resolvedSourceKey,
       resolvedSourceName,
+      resolvedSensorType,
       resident?.id || null,
       resolvedResidentName,
       resolvedLocationName,
@@ -3214,6 +3327,7 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
   const resolvedSourceName =
     cleanText(sourceName) ||
     (resolvedRoomName ? `Motion Sensor - ${resolvedRoomName}` : (existingNode.nodeName || "Motion Sensor"));
+  const resolvedSensorType = displaySensorTypeForValue(resolvedSourceName, "Motion Sensor");
   const setupState = resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned";
 
   const client = await pool.connect();
@@ -3242,7 +3356,7 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, 'Motion Sensor', $5, $6, $7, $8, $9, TRUE, FALSE, NULL, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, FALSE, NULL, NOW(), NOW())
       ON CONFLICT (source_key)
       DO UPDATE SET
         node_id = EXCLUDED.node_id,
@@ -3264,6 +3378,7 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
         resolvedNodeId,
         resolvedSourceKey,
         resolvedSourceName,
+        resolvedSensorType,
         resolvedResidentId,
         resolvedResidentName,
         resolvedLocationName,
@@ -3527,6 +3642,47 @@ app.get("/events", async (req, res) => {
   }
 });
 
+
+app.get("/presence-telemetry/latest", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const sourceKey = cleanOptionalText(req.query.sourceKey);
+    const nodeId = cleanOptionalText(req.query.nodeId);
+    const residentName = cleanOptionalText(req.query.residentName);
+
+    const result = await pool.query(
+      `
+      ${eventSelectSQL()}
+      WHERE event_type = 'presence_telemetry'
+        AND ($1::text IS NULL OR source_key = $1)
+        AND ($2::text IS NULL OR node_id = $2)
+        AND ($3::text IS NULL OR LOWER(TRIM(resident_name)) = LOWER(TRIM($3)))
+      ORDER BY timestamp DESC
+      LIMIT 1
+      `,
+      [sourceKey, nodeId, residentName]
+    );
+
+    const event = result.rows[0] || null;
+
+    return res.status(200).json({
+      success: true,
+      found: Boolean(event),
+      telemetry: event ? buildPresenceTelemetryFromEventRow(event) : null,
+      event
+    });
+  } catch (error) {
+    console.error("Failed to fetch latest presence telemetry:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch latest presence telemetry"
+    });
+  }
+});
+
 app.get("/ai/briefing", async (req, res) => {
   try {
     const briefing = await buildAIBriefing();
@@ -3734,6 +3890,9 @@ app.patch("/events/:eventId/acknowledge", async (req, res) => {
         alert_level AS "alertLevel",
         time_text AS "timeText",
         timestamp,
+        event_type AS "eventType",
+        sensor_type AS "sensorType",
+        event_payload AS "eventPayload",
         acknowledged AS "isAcknowledged",
         acknowledged_at AS "acknowledgedAt",
         resolution_note AS "resolutionNote"
@@ -6477,7 +6636,10 @@ app.post("/webhook", async (req, res) => {
       residentName,
       message,
       alertLevel,
-      timeText
+      timeText,
+      eventType,
+      sensorType,
+      sensorMode
     } = req.body || {};
 
     if (!message) {
@@ -6495,6 +6657,23 @@ app.post("/webhook", async (req, res) => {
     let resolvedResidentName = cleanText(residentName);
     let resolvedAlertLevel = cleanText(alertLevel);
     let resolvedTimeText = cleanText(timeText);
+    const fullWebhookPayload = normalizeJsonObject(req.body || {});
+    const resolvedEventType = normalizeWebhookEventType(eventType);
+    const resolvedSensorType = normalizeWebhookSensorType(sensorType || sensorMode, "unknown");
+    const resolvedSensorDisplayType = displaySensorTypeForValue(sensorType || sensorMode || sourceName, "Motion Sensor");
+
+    if (resolvedEventType === "presence_telemetry") {
+      console.log("LD2410 telemetry received:");
+      console.log(JSON.stringify(fullWebhookPayload, null, 2));
+    }
+
+    if (resolvedSensorType === "human_presence" && !fullWebhookPayload.eventType) {
+      fullWebhookPayload.eventType = resolvedEventType;
+    }
+
+    if (resolvedSensorType && !fullWebhookPayload.sensorType) {
+      fullWebhookPayload.sensorType = resolvedSensorType;
+    }
 
     if (resolvedSourceKey) {
       const mapping = await getDeviceMapping(resolvedSourceKey);
@@ -6550,6 +6729,7 @@ app.post("/webhook", async (req, res) => {
       nodeId: resolvedNodeId,
       sourceKey: resolvedSourceKey,
       sourceName: resolvedSourceName,
+      sensorType: resolvedSensorDisplayType,
       resident,
       residentName: resolvedResidentName,
       locationName: resolvedLocationName
@@ -6565,7 +6745,10 @@ app.post("/webhook", async (req, res) => {
       message: String(message).trim(),
       alertLevel: resolvedAlertLevel,
       timeText: resolvedTimeText || "Webhook Event",
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      eventType: resolvedEventType,
+      sensorType: resolvedSensorType,
+      eventPayload: fullWebhookPayload
     };
 
     await pool.query(
@@ -6581,11 +6764,14 @@ app.post("/webhook", async (req, res) => {
         alert_level,
         time_text,
         timestamp,
+        event_type,
+        sensor_type,
+        event_payload,
         acknowledged,
         acknowledged_at,
         resolution_note
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, NULL, NULL)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, FALSE, NULL, NULL)
       `,
       [
         event.id,
@@ -6597,7 +6783,10 @@ app.post("/webhook", async (req, res) => {
         event.message,
         event.alertLevel,
         event.timeText,
-        event.timestamp
+        event.timestamp,
+        event.eventType,
+        event.sensorType,
+        JSON.stringify(event.eventPayload)
       ]
     );
 
