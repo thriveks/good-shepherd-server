@@ -1,7 +1,7 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.4 - Human Presence BLE Assignment Fix
+// Version: v11.5 - Heartbeat-First Reliability Fix
 // Updated: 2026-07-10
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
@@ -2747,56 +2747,46 @@ async function touchNodeFromWebhook(nodeId) {
   return result.rows[0];
 }
 
-async function upsertNodeHealth(payload) {
-  const nodeId = cleanText(payload?.nodeId);
-
-  if (!nodeId) {
-    throw new Error("Missing required field: nodeId");
-  }
-
-  const nodeName = normalizeHealthText(payload?.nodeName, "Good Shepherd Local Node");
-  let locationName = normalizeHealthText(payload?.locationName, "Unassigned Location");
-  const localIp = cleanOptionalText(payload?.localIp);
-  const localConfigPort = payload?.localConfigPort ? Number(payload.localConfigPort) : null;
-  const cameraCount = normalizeInteger(payload?.cameraCount, 0);
-  const cameraSummary = normalizeJsonArray(payload?.cameraSummary);
-  const softwareVersion = cleanOptionalText(payload?.softwareVersion);
-  const monitorStatus = normalizeHealthText(payload?.monitorStatus, "Online");
-  const ffmpegStatus = normalizeHealthText(payload?.ffmpegStatus, "Unknown");
-  const ffmpegPath = cleanOptionalText(payload?.ffmpegPath);
-  const platform = cleanOptionalText(payload?.platform);
-  const hostname = cleanOptionalText(payload?.hostname);
-  const uptimeSeconds = payload?.uptimeSeconds ? normalizeInteger(payload.uptimeSeconds, 0) : null;
-  const activeMonitorCount = normalizeInteger(payload?.activeMonitorCount, 0);
-  const lastError = cleanOptionalText(payload?.lastError);
-  const diagnostics = normalizeJsonObject(payload?.diagnostics);
-  const wifiSsid = cleanOptionalText(payload?.wifiSsid ?? payload?.ssid ?? diagnostics?.wifiSsid ?? diagnostics?.ssid);
-  const wifiRssi = Number.isFinite(Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi))
-    ? Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi)
-    : null;
-  let setupState = normalizeSetupState(payload?.setupState ?? diagnostics?.setupState);
-  const lastErrorAt = lastError ? new Date().toISOString() : null;
+async function syncNodeHealthMetadataBestEffort({
+  nodeId,
+  nodeName,
+  locationName,
+  localIp,
+  localConfigPort,
+  cameraCount,
+  cameraSummary,
+  softwareVersion,
+  wifiSsid,
+  wifiRssi,
+  setupState,
+  diagnostics
+}) {
+  let resolvedLocationName = locationName;
+  let resolvedSetupState = setupState;
+  const resolvedDiagnostics = {
+    ...normalizeJsonObject(diagnostics)
+  };
 
   const existingIdentitySensor = await getExistingSensorForDeviceIdentity({
-    sourceKey: diagnostics?.sourceKey,
+    sourceKey: resolvedDiagnostics?.sourceKey,
     nodeId
   });
   const preserveNodeUnassignedState = sensorIsExplicitlyUnassigned(existingIdentitySensor);
 
   if (preserveNodeUnassignedState) {
-    locationName = "Unassigned Location";
-    setupState = "unassigned";
-    diagnostics.residentName = "Unassigned";
-    diagnostics.locationName = "Unassigned Location";
-    diagnostics.roomName = "";
-    diagnostics.assignmentState = "Unassigned";
-    diagnostics.setupState = "unassigned";
+    resolvedLocationName = "Unassigned Location";
+    resolvedSetupState = "unassigned";
+    resolvedDiagnostics.residentName = "Unassigned";
+    resolvedDiagnostics.locationName = "Unassigned Location";
+    resolvedDiagnostics.roomName = "";
+    resolvedDiagnostics.assignmentState = "Unassigned";
+    resolvedDiagnostics.setupState = "unassigned";
   }
 
   await upsertNodeFromRegistration({
     nodeId,
     nodeName,
-    locationName,
+    locationName: resolvedLocationName,
     localIp,
     localConfigPort,
     cameraCount,
@@ -2804,29 +2794,29 @@ async function upsertNodeHealth(payload) {
     softwareVersion,
     wifiSsid,
     wifiRssi,
-    setupState
+    setupState: resolvedSetupState
   });
 
-  if (diagnostics && diagnostics.sourceKey) {
-    const heartbeatDeviceName = cleanText(diagnostics.deviceName) || "Motion Sensor";
-    const heartbeatRoomName = cleanText(diagnostics.roomName);
-    const heartbeatResidentName = cleanText(diagnostics.residentName);
-    const heartbeatLocationName = cleanText(locationName) || "Unassigned location";
-
+  if (resolvedDiagnostics?.sourceKey) {
+    const heartbeatDeviceName = cleanText(resolvedDiagnostics.deviceName) || "Motion Sensor";
+    const heartbeatRoomName = cleanText(resolvedDiagnostics.roomName);
+    const heartbeatResidentName = cleanText(resolvedDiagnostics.residentName);
+    const heartbeatLocationName = cleanText(resolvedLocationName) || "Unassigned location";
     const heartbeatSourceName = heartbeatRoomName
       ? `${heartbeatDeviceName} - ${heartbeatRoomName}`
       : heartbeatDeviceName;
 
     const existingSensor = existingIdentitySensor || await getExistingSensorForDeviceIdentity({
-      sourceKey: diagnostics.sourceKey,
+      sourceKey: resolvedDiagnostics.sourceKey,
       nodeId
     });
-    const preserveUnassignedState = preserveNodeUnassignedState || sensorIsExplicitlyUnassigned(existingSensor);
+    const preserveUnassignedState =
+      preserveNodeUnassignedState || sensorIsExplicitlyUnassigned(existingSensor);
 
     let resident = preserveUnassignedState
       ? null
       : await getResidentForExistingDeviceIdentity({
-          sourceKey: diagnostics.sourceKey,
+          sourceKey: resolvedDiagnostics.sourceKey,
           nodeId
         });
 
@@ -2841,18 +2831,90 @@ async function upsertNodeHealth(payload) {
 
     await upsertSensorFromEvent({
       nodeId,
-      sourceKey: diagnostics.sourceKey,
+      sourceKey: resolvedDiagnostics.sourceKey,
       sourceName: preserveUnassignedState
         ? (existingSensor?.sourceName || heartbeatSourceName)
         : heartbeatSourceName,
-      sensorType: diagnostics.sensorMode || diagnostics.sensorType || heartbeatDeviceName,
+      sensorType:
+        resolvedDiagnostics.sensorMode ||
+        resolvedDiagnostics.sensorType ||
+        heartbeatDeviceName,
       resident,
-      residentName: preserveUnassignedState ? "Unassigned" : (resident?.name || heartbeatResidentName),
-      locationName: preserveUnassignedState ? "Unassigned location" : (resident?.location || heartbeatLocationName),
+      residentName: preserveUnassignedState
+        ? "Unassigned"
+        : (resident?.name || heartbeatResidentName),
+      locationName: preserveUnassignedState
+        ? "Unassigned location"
+        : (resident?.location || heartbeatLocationName),
       forceUnassigned: preserveUnassignedState
     });
   }
 
+  if (
+    resolvedLocationName !== locationName ||
+    resolvedSetupState !== setupState ||
+    JSON.stringify(resolvedDiagnostics) !== JSON.stringify(diagnostics)
+  ) {
+    await pool.query(
+      `
+      UPDATE node_health
+      SET
+        location_name = $2,
+        setup_state = $3,
+        diagnostics = $4::jsonb,
+        updated_at = NOW()
+      WHERE node_id = $1
+      `,
+      [
+        nodeId,
+        resolvedLocationName,
+        resolvedSetupState,
+        JSON.stringify(resolvedDiagnostics)
+      ]
+    );
+  }
+}
+
+async function upsertNodeHealth(payload) {
+  const nodeId = cleanText(payload?.nodeId);
+
+  if (!nodeId) {
+    throw new Error("Missing required field: nodeId");
+  }
+
+  const nodeName = normalizeHealthText(payload?.nodeName, "Good Shepherd Local Node");
+  const locationName = normalizeHealthText(payload?.locationName, "Unassigned Location");
+  const localIp = cleanOptionalText(payload?.localIp);
+  const localConfigPort = payload?.localConfigPort ? Number(payload.localConfigPort) : null;
+  const cameraCount = normalizeInteger(payload?.cameraCount, 0);
+  const cameraSummary = normalizeJsonArray(payload?.cameraSummary);
+  const softwareVersion = cleanOptionalText(payload?.softwareVersion);
+  const monitorStatus = normalizeHealthText(payload?.monitorStatus, "Online");
+  const ffmpegStatus = normalizeHealthText(payload?.ffmpegStatus, "Unknown");
+  const ffmpegPath = cleanOptionalText(payload?.ffmpegPath);
+  const platform = cleanOptionalText(payload?.platform);
+  const hostname = cleanOptionalText(payload?.hostname);
+  const uptimeSeconds = payload?.uptimeSeconds ? normalizeInteger(payload.uptimeSeconds, 0) : null;
+  const activeMonitorCount = normalizeInteger(payload?.activeMonitorCount, 0);
+  const lastError = cleanOptionalText(payload?.lastError);
+  const diagnostics = normalizeJsonObject(payload?.diagnostics);
+  const wifiSsid = cleanOptionalText(
+    payload?.wifiSsid ??
+    payload?.ssid ??
+    diagnostics?.wifiSsid ??
+    diagnostics?.ssid
+  );
+  const wifiRssi = Number.isFinite(
+    Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi)
+  )
+    ? Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi)
+    : null;
+  const setupState = normalizeSetupState(payload?.setupState ?? diagnostics?.setupState);
+  const lastErrorAt = lastError ? new Date().toISOString() : null;
+
+  // Heartbeat reliability rule:
+  // Persist checked_in_at first. Assignment, resident, node, and sensor
+  // reconciliation must never block or invalidate a valid heartbeat.
   const result = await pool.query(
     `
     INSERT INTO node_health (
@@ -2969,7 +3031,34 @@ async function upsertNodeHealth(payload) {
     ]
   );
 
-  return result.rows[0];
+  const health = result.rows[0];
+
+  // Run assignment and inventory synchronization after the heartbeat has
+  // already been committed. This work is intentionally best-effort and
+  // cannot change the HTTP success response for the heartbeat.
+  setImmediate(() => {
+    syncNodeHealthMetadataBestEffort({
+      nodeId,
+      nodeName,
+      locationName,
+      localIp,
+      localConfigPort,
+      cameraCount,
+      cameraSummary,
+      softwareVersion,
+      wifiSsid,
+      wifiRssi,
+      setupState,
+      diagnostics
+    }).catch((error) => {
+      console.error("Node health secondary metadata sync failed:", {
+        nodeId,
+        error: error?.message || String(error)
+      });
+    });
+  });
+
+  return health;
 }
 
 async function createCommand({ nodeId, commandType, payload, requestedBy }) {
