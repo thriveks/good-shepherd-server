@@ -1,13 +1,14 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.3 - Resident Sensor Unassignment Protection
+// Version: v11.4 - Human Presence BLE Assignment Fix
 // Updated: 2026-07-10
-// iOS Dependency: ResidentDetailView sensor removal flow + existing resident edit flow
+// iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
-// Adds safe resident-level sensor unassignment, keeps unassigned sensors available for reassignment,
-// prevents stale ESP32 heartbeat/webhook payloads from silently reattaching a removed sensor,
-// and preserves full LD2410 radar telemetry payloads.
+// Fixes human_presence sensor assignment persistence by making source_key authoritative
+// before falling back to node_id, derives presence-[chipId] from human_presence assignment
+// payloads, avoids stale motion-[chipId] rows from forcing presence sensors back to
+// unassigned, and preserves full LD2410 radar telemetry payloads.
 
 const express = require("express");
 const { Pool } = require("pg");
@@ -430,6 +431,49 @@ function displaySensorTypeForValue(value, fallback = "Motion Sensor") {
   }
 
   return fallback;
+}
+
+function normalizedSensorModeForValue(value, fallback = "motion") {
+  const displayType = displaySensorTypeForValue(value, "");
+
+  if (displayType === "Human Presence Sensor") {
+    return "human_presence";
+  }
+
+  if (displayType === "Motion + Presence Sensor") {
+    return "motion_presence";
+  }
+
+  if (displayType === "Motion Sensor") {
+    return "motion";
+  }
+
+  return fallback;
+}
+
+function sourcePrefixForSensorMode(value) {
+  const normalizedMode = normalizedSensorModeForValue(value, "motion");
+
+  if (normalizedMode === "human_presence") {
+    return "presence";
+  }
+
+  if (normalizedMode === "motion_presence") {
+    return "motion-presence";
+  }
+
+  return "motion";
+}
+
+function defaultSourceNameForSensorType(sensorType, roomName, fallbackNodeName) {
+  const resolvedSensorType = displaySensorTypeForValue(sensorType, "Motion Sensor");
+  const cleanRoomName = cleanText(roomName);
+
+  if (cleanRoomName) {
+    return `${resolvedSensorType} - ${cleanRoomName}`;
+  }
+
+  return cleanText(fallbackNodeName) || resolvedSensorType;
 }
 
 function normalizeWebhookEventType(value, fallback = "webhook_event") {
@@ -2427,7 +2471,7 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
         AND s.resident_id IS NOT NULL
         AND (
           ($1::text <> '' AND s.source_key = $1)
-          OR ($2::text <> '' AND s.node_id = $2)
+          OR ($1::text = '' AND $2::text <> '' AND s.node_id = $2)
         )
 
       UNION ALL
@@ -2441,7 +2485,7 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
         AND c.resident_id IS NOT NULL
         AND (
           ($1::text <> '' AND c.source_key = $1)
-          OR ($2::text <> '' AND c.assigned_node_id = $2)
+          OR ($1::text = '' AND $2::text <> '' AND c.assigned_node_id = $2)
         )
     )
     SELECT
@@ -2483,11 +2527,9 @@ async function getExistingSensorForDeviceIdentity({ sourceKey, nodeId }) {
     WHERE is_deleted = FALSE
       AND (
         ($1::text <> '' AND source_key = $1)
-        OR ($2::text <> '' AND node_id = $2)
+        OR ($1::text = '' AND $2::text <> '' AND node_id = $2)
       )
-    ORDER BY
-      CASE WHEN $1::text <> '' AND source_key = $1 THEN 0 ELSE 1 END,
-      updated_at DESC
+    ORDER BY updated_at DESC
     LIMIT 1
     `,
     [resolvedSourceKey, resolvedNodeId]
@@ -3388,6 +3430,15 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
     locationName
   });
 
+  const requestedSensorIdentity =
+    sensorType ||
+    sensorMode ||
+    sourceName ||
+    sourceKey ||
+    existingNode.nodeName ||
+    "Motion Sensor";
+  const resolvedSensorMode = normalizedSensorModeForValue(requestedSensorIdentity, "motion");
+  const resolvedSensorType = displaySensorTypeForValue(requestedSensorIdentity, "Motion Sensor");
   const resolvedResidentId = resident?.id || null;
   const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
   const resolvedLocationName =
@@ -3398,14 +3449,10 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
   const resolvedRoomName = cleanOptionalText(roomName);
   const resolvedSourceKey =
     cleanText(sourceKey) ||
-    `motion-${resolvedNodeId.replace(/^esp32-/, "")}`;
+    `${sourcePrefixForSensorMode(resolvedSensorMode)}-${resolvedNodeId.replace(/^esp32-/, "")}`;
   const resolvedSourceName =
     cleanText(sourceName) ||
-    (resolvedRoomName ? `Motion Sensor - ${resolvedRoomName}` : (existingNode.nodeName || "Motion Sensor"));
-  const resolvedSensorType = displaySensorTypeForValue(
-    sensorType || sensorMode || resolvedSourceName || resolvedSourceKey,
-    "Motion Sensor"
-  );
+    defaultSourceNameForSensorType(resolvedSensorType, resolvedRoomName, existingNode.nodeName);
   const setupState = resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned";
 
   const client = await pool.connect();
@@ -3515,11 +3562,14 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
         diagnostics = COALESCE(diagnostics, '{}'::jsonb) ||
           jsonb_build_object(
             'sourceKey', $5::text,
-            'deviceName', 'Motion Sensor',
+            'deviceName', $8::text,
+            'sensorType', $8::text,
+            'sensorMode', $9::text,
             'roomName', COALESCE($6::text, ''),
             'residentName', $7::text,
             'locationName', $3::text,
-            'assignmentState', CASE WHEN $4 = 'assigned' THEN 'Assigned' ELSE 'Unassigned' END
+            'assignmentState', CASE WHEN $4 = 'assigned' THEN 'Assigned' ELSE 'Unassigned' END,
+            'setupState', $4::text
           ),
         updated_at = NOW()
       WHERE node_id = $1
@@ -3531,7 +3581,9 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
         setupState,
         resolvedSourceKey,
         resolvedRoomName,
-        resolvedResidentName
+        resolvedResidentName,
+        resolvedSensorType,
+        resolvedSensorMode
       ]
     );
 
@@ -3553,6 +3605,7 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
     client.release();
   }
 }
+
 async function createSensorCommand({ nodeId, commandType, payload, requestedBy, supersedeExisting = true }) {
   const client = await pool.connect();
   let didBegin = false;
