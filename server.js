@@ -1,12 +1,13 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.2 - LD2410 Telemetry Preservation
-// Updated: 2026-07-09
-// iOS Dependency: ResidentsView resident edit flow + future PresenceRadar3DView
+// Version: v11.3 - Resident Sensor Unassignment Protection
+// Updated: 2026-07-10
+// iOS Dependency: ResidentDetailView sensor removal flow + existing resident edit flow
 //
-// Keeps resident renames tied to resident_id, prevents stale device payload names from recreating old residents,
-// fixes the device identity updated_at alias query, and preserves full ESP32 webhook payloads for LD2410 radar telemetry.
+// Adds safe resident-level sensor unassignment, keeps unassigned sensors available for reassignment,
+// prevents stale ESP32 heartbeat/webhook payloads from silently reattaching a removed sensor,
+// and preserves full LD2410 radar telemetry payloads.
 
 const express = require("express");
 const { Pool } = require("pg");
@@ -2467,6 +2468,44 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
   return result.rows[0] || null;
 }
 
+
+async function getExistingSensorForDeviceIdentity({ sourceKey, nodeId }) {
+  const resolvedSourceKey = cleanText(sourceKey);
+  const resolvedNodeId = cleanText(nodeId);
+
+  if (!resolvedSourceKey && !resolvedNodeId) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+    ${sensorSelectSQL()}
+    WHERE is_deleted = FALSE
+      AND (
+        ($1::text <> '' AND source_key = $1)
+        OR ($2::text <> '' AND node_id = $2)
+      )
+    ORDER BY
+      CASE WHEN $1::text <> '' AND source_key = $1 THEN 0 ELSE 1 END,
+      updated_at DESC
+    LIMIT 1
+    `,
+    [resolvedSourceKey, resolvedNodeId]
+  );
+
+  return result.rows[0] || null;
+}
+
+function sensorIsExplicitlyUnassigned(sensor) {
+  if (!sensor) {
+    return false;
+  }
+
+  return !sensor.residentId &&
+    normalizeForMatch(sensor.residentName) === "unassigned" &&
+    normalizeSetupState(sensor.setupState) === "unassigned";
+}
+
 async function getLatestFirmwareRelease() {
   const result = await pool.query(
     `
@@ -2674,7 +2713,7 @@ async function upsertNodeHealth(payload) {
   }
 
   const nodeName = normalizeHealthText(payload?.nodeName, "Good Shepherd Local Node");
-  const locationName = normalizeHealthText(payload?.locationName, "Unassigned Location");
+  let locationName = normalizeHealthText(payload?.locationName, "Unassigned Location");
   const localIp = cleanOptionalText(payload?.localIp);
   const localConfigPort = payload?.localConfigPort ? Number(payload.localConfigPort) : null;
   const cameraCount = normalizeInteger(payload?.cameraCount, 0);
@@ -2693,8 +2732,24 @@ async function upsertNodeHealth(payload) {
   const wifiRssi = Number.isFinite(Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi))
     ? Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi)
     : null;
-  const setupState = normalizeSetupState(payload?.setupState ?? diagnostics?.setupState);
+  let setupState = normalizeSetupState(payload?.setupState ?? diagnostics?.setupState);
   const lastErrorAt = lastError ? new Date().toISOString() : null;
+
+  const existingIdentitySensor = await getExistingSensorForDeviceIdentity({
+    sourceKey: diagnostics?.sourceKey,
+    nodeId
+  });
+  const preserveNodeUnassignedState = sensorIsExplicitlyUnassigned(existingIdentitySensor);
+
+  if (preserveNodeUnassignedState) {
+    locationName = "Unassigned Location";
+    setupState = "unassigned";
+    diagnostics.residentName = "Unassigned";
+    diagnostics.locationName = "Unassigned Location";
+    diagnostics.roomName = "";
+    diagnostics.assignmentState = "Unassigned";
+    diagnostics.setupState = "unassigned";
+  }
 
   await upsertNodeFromRegistration({
     nodeId,
@@ -2720,12 +2775,20 @@ async function upsertNodeHealth(payload) {
       ? `${heartbeatDeviceName} - ${heartbeatRoomName}`
       : heartbeatDeviceName;
 
-    let resident = await getResidentForExistingDeviceIdentity({
+    const existingSensor = existingIdentitySensor || await getExistingSensorForDeviceIdentity({
       sourceKey: diagnostics.sourceKey,
       nodeId
     });
+    const preserveUnassignedState = preserveNodeUnassignedState || sensorIsExplicitlyUnassigned(existingSensor);
 
-    if (!resident) {
+    let resident = preserveUnassignedState
+      ? null
+      : await getResidentForExistingDeviceIdentity({
+          sourceKey: diagnostics.sourceKey,
+          nodeId
+        });
+
+    if (!resident && !preserveUnassignedState) {
       resident = await findOrCreateResidentFromEvent({
         residentName: heartbeatResidentName,
         locationName: heartbeatLocationName,
@@ -2737,11 +2800,14 @@ async function upsertNodeHealth(payload) {
     await upsertSensorFromEvent({
       nodeId,
       sourceKey: diagnostics.sourceKey,
-      sourceName: heartbeatSourceName,
+      sourceName: preserveUnassignedState
+        ? (existingSensor?.sourceName || heartbeatSourceName)
+        : heartbeatSourceName,
       sensorType: diagnostics.sensorMode || diagnostics.sensorType || heartbeatDeviceName,
       resident,
-      residentName: resident?.name || heartbeatResidentName,
-      locationName: resident?.location || heartbeatLocationName
+      residentName: preserveUnassignedState ? "Unassigned" : (resident?.name || heartbeatResidentName),
+      locationName: preserveUnassignedState ? "Unassigned location" : (resident?.location || heartbeatLocationName),
+      forceUnassigned: preserveUnassignedState
     });
   }
 
@@ -3036,7 +3102,8 @@ async function upsertSensorFromEvent({
   sensorType,
   resident,
   residentName,
-  locationName
+  locationName,
+  forceUnassigned = false
 }) {
   const resolvedSourceKey = cleanText(sourceKey);
 
@@ -3046,9 +3113,15 @@ async function upsertSensorFromEvent({
 
   const resolvedSourceName = cleanText(sourceName) || "Motion Sensor";
   const resolvedSensorType = displaySensorTypeForValue(sensorType, "Motion Sensor");
-  const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
-  const resolvedLocationName = cleanText(locationName) || resident?.location || "Unassigned location";
-  const resolvedRoomName = inferRoomNameFromSourceName(resolvedSourceName);
+  const resolvedResidentName = forceUnassigned
+    ? "Unassigned"
+    : (resident?.name || cleanText(residentName) || "Unassigned");
+  const resolvedLocationName = forceUnassigned
+    ? "Unassigned location"
+    : (cleanText(locationName) || resident?.location || "Unassigned location");
+  const resolvedRoomName = forceUnassigned
+    ? null
+    : inferRoomNameFromSourceName(resolvedSourceName);
 
   const result = await pool.query(
     `
@@ -3092,11 +3165,13 @@ async function upsertSensorFromEvent({
       resolvedSourceKey,
       resolvedSourceName,
       resolvedSensorType,
-      resident?.id || null,
+      forceUnassigned ? null : (resident?.id || null),
       resolvedResidentName,
       resolvedLocationName,
       resolvedRoomName,
-      resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned"
+      forceUnassigned
+        ? "unassigned"
+        : (resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned")
     ]
   );
 
@@ -6715,12 +6790,23 @@ app.post("/webhook", async (req, res) => {
       await touchNodeFromWebhook(resolvedNodeId);
     }
 
-    let resident = await getResidentForExistingDeviceIdentity({
+    const existingSensor = await getExistingSensorForDeviceIdentity({
       sourceKey: resolvedSourceKey,
       nodeId: resolvedNodeId
     });
+    const preserveUnassignedState = sensorIsExplicitlyUnassigned(existingSensor);
 
-    if (resident) {
+    let resident = preserveUnassignedState
+      ? null
+      : await getResidentForExistingDeviceIdentity({
+          sourceKey: resolvedSourceKey,
+          nodeId: resolvedNodeId
+        });
+
+    if (preserveUnassignedState) {
+      resolvedResidentName = "Unassigned";
+      resolvedLocationName = "Unassigned location";
+    } else if (resident) {
       resolvedResidentName = resident.name;
       resolvedLocationName = resolvedLocationName || resident.location || "";
     } else {
@@ -6735,11 +6821,14 @@ app.post("/webhook", async (req, res) => {
     const sensor = await upsertSensorFromEvent({
       nodeId: resolvedNodeId,
       sourceKey: resolvedSourceKey,
-      sourceName: resolvedSourceName,
+      sourceName: preserveUnassignedState
+        ? (existingSensor?.sourceName || resolvedSourceName)
+        : resolvedSourceName,
       sensorType: resolvedSensorDisplayType,
       resident,
       residentName: resolvedResidentName,
-      locationName: resolvedLocationName
+      locationName: resolvedLocationName,
+      forceUnassigned: preserveUnassignedState
     });
 
     const event = {
