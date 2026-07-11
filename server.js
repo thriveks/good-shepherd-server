@@ -1,8 +1,8 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.5 - Heartbeat-First Reliability Fix
-// Updated: 2026-07-10
+// Version: v11.6 - AI Effective Sensor Online Fix
+// Updated: 2026-07-11
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
 // Fixes human_presence sensor assignment persistence by making source_key authoritative
@@ -23,6 +23,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = 180;
 const AI_SENSOR_MOTION_ONLINE_GRACE_SECONDS = 600;
+const AI_SENSOR_EVENT_ONLINE_GRACE_SECONDS = 3600;
 const AI_INACTIVE_WATCH_MINUTES = 120;
 const AI_INACTIVE_WARNING_MINUTES = 240;
 const AI_INACTIVE_CRITICAL_MINUTES = 480;
@@ -758,28 +759,40 @@ function isRecentMotionEvent(event, graceSeconds = AI_SENSOR_MOTION_ONLINE_GRACE
   return eventDate.getTime() >= Date.now() - (graceSeconds * 1000);
 }
 
-function buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, residentMotionEvents) {
+function buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNodeId, residentMotionEvents) {
   const nodeId = cleanText(sensor?.nodeId);
   const health = nodeId ? nodeHealthByNodeId.get(nodeId) : null;
   const latestSensorMotionEvent = latestMotionEventForSensor(sensor, residentMotionEvents);
-  const motionIsFresh = isRecentMotionEvent(latestSensorMotionEvent);
-  const healthIsOnline = health ? health.isOnline === true : false;
-  const healthCheckedInAt = health?.checkedInAt || null;
   const latestMotionAt = latestSensorMotionEvent?.timestamp || null;
-  const healthDate = healthCheckedInAt ? new Date(healthCheckedInAt) : null;
-  const motionDate = latestMotionAt ? new Date(latestMotionAt) : null;
-  const shouldUseMotionLastSeen =
-    motionDate &&
-    !Number.isNaN(motionDate.getTime()) &&
-    (!healthDate || Number.isNaN(healthDate.getTime()) || motionDate.getTime() > healthDate.getTime());
+  const nodeLastSeenAt = nodeId ? (nodeLastSeenByNodeId.get(nodeId) || null) : null;
+  const healthCheckedInAt = health?.checkedInAt || null;
 
-  if (healthIsOnline || motionIsFresh) {
+  const motionIsFresh = isRecentMotionEvent(latestSensorMotionEvent);
+  const nodeEventDate = nodeLastSeenAt ? new Date(nodeLastSeenAt) : null;
+  const nodeEventIsFresh = Boolean(
+    nodeEventDate &&
+    !Number.isNaN(nodeEventDate.getTime()) &&
+    nodeEventDate.getTime() >= Date.now() - (AI_SENSOR_EVENT_ONLINE_GRACE_SECONDS * 1000)
+  );
+  const healthIsOnline = health ? health.isOnline === true : false;
+
+  const candidateLastSeen = [healthCheckedInAt, nodeLastSeenAt, latestMotionAt]
+    .map((value) => ({ value, date: value ? new Date(value) : null }))
+    .filter((item) => item.date && !Number.isNaN(item.date.getTime()))
+    .sort((first, second) => second.date.getTime() - first.date.getTime())[0];
+
+  let onlineSource = null;
+  if (healthIsOnline) onlineSource = "heartbeat";
+  else if (nodeEventIsFresh) onlineSource = "sensor_event";
+  else if (motionIsFresh) onlineSource = "motion";
+
+  if (healthIsOnline || nodeEventIsFresh || motionIsFresh) {
     return {
       isOnline: true,
       wifiRssi: health?.wifiRssi ?? null,
-      lastSeenAt: shouldUseMotionLastSeen ? latestMotionAt : healthCheckedInAt,
+      lastSeenAt: candidateLastSeen?.value || null,
       latestMotionAt,
-      onlineSource: motionIsFresh && !healthIsOnline ? "motion" : "node"
+      onlineSource
     };
   }
 
@@ -787,16 +800,16 @@ function buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, residentMotionEv
     return {
       isOnline: false,
       wifiRssi: health?.wifiRssi ?? null,
-      lastSeenAt: shouldUseMotionLastSeen ? latestMotionAt : healthCheckedInAt,
+      lastSeenAt: candidateLastSeen?.value || null,
       latestMotionAt,
-      onlineSource: "node"
+      onlineSource: healthCheckedInAt ? "heartbeat" : (nodeLastSeenAt ? "sensor_event" : null)
     };
   }
 
   return {
     isOnline: null,
     wifiRssi: health?.wifiRssi ?? null,
-    lastSeenAt: shouldUseMotionLastSeen ? latestMotionAt : healthCheckedInAt,
+    lastSeenAt: candidateLastSeen?.value || null,
     latestMotionAt,
     onlineSource: latestMotionAt ? "motion" : null
   };
@@ -1352,7 +1365,7 @@ function buildAIStatusForResident({
 }
 
 async function buildAIMotionSummary() {
-  const [residentResult, sensorResult, eventResult, motionEventResult, nodeHealthResult, actionLogResult] = await Promise.all([
+  const [residentResult, sensorResult, eventResult, motionEventResult, nodeHealthResult, nodeResult, actionLogResult] = await Promise.all([
     pool.query(`
       ${residentSelectSQL()}
       WHERE is_deleted = FALSE
@@ -1382,6 +1395,13 @@ async function buildAIMotionSummary() {
       ORDER BY checked_in_at DESC
     `),
     pool.query(`
+      SELECT
+        node_id AS "nodeId",
+        last_seen_at AS "lastSeenAt"
+      FROM nodes
+      WHERE is_archived = FALSE
+    `),
+    pool.query(`
       ${aiActionLogSelectSQL()}
       ORDER BY created_at DESC
       LIMIT 500
@@ -1394,6 +1414,9 @@ async function buildAIMotionSummary() {
   const actionLogs = actionLogResult.rows;
   const nodeHealthByNodeId = new Map(
     nodeHealthResult.rows.map((health) => [cleanText(health.nodeId), health])
+  );
+  const nodeLastSeenByNodeId = new Map(
+    nodeResult.rows.map((node) => [cleanText(node.nodeId), node.lastSeenAt])
   );
 
   const residents = residentResult.rows.map((resident) => {
@@ -1451,7 +1474,7 @@ async function buildAIMotionSummary() {
       residentSensors.map((sensor) => {
         return [
           sensor.id,
-          buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, residentMotionEvents)
+          buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNodeId, residentMotionEvents)
         ];
       })
     );
@@ -1575,7 +1598,7 @@ async function buildAIMotionSummary() {
       followUpDueAt: followUpStatus.followUpDueAt,
       minutesUntilFollowUpDue: followUpStatus.minutesUntilFollowUpDue,
       sensors: residentSensors.map((sensor) => {
-        const status = sensorStatusById.get(sensor.id) || buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, residentMotionEvents);
+        const status = sensorStatusById.get(sensor.id) || buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNodeId, residentMotionEvents);
 
         return {
           id: sensor.id,
@@ -1605,6 +1628,7 @@ async function buildAIMotionSummary() {
     inactiveCriticalMinutes: AI_INACTIVE_CRITICAL_MINUTES,
     motionHistoryDays: AI_MOTION_HISTORY_DAYS,
     sensorMotionOnlineGraceSeconds: AI_SENSOR_MOTION_ONLINE_GRACE_SECONDS,
+    sensorEventOnlineGraceSeconds: AI_SENSOR_EVENT_ONLINE_GRACE_SECONDS,
     baselineMinimumDays: AI_BASELINE_MIN_DAYS,
     baselineQuietRatio: AI_BASELINE_QUIET_RATIO,
     baselineActiveRatio: AI_BASELINE_ACTIVE_RATIO,
