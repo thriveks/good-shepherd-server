@@ -1,14 +1,14 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.6 - AI Effective Sensor Online Fix
-// Updated: 2026-07-11
+// Version: v11.7 - AI v2 Safe Cleanup
+// Updated: 2026-07-13
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
-// Fixes human_presence sensor assignment persistence by making source_key authoritative
-// before falling back to node_id, derives presence-[chipId] from human_presence assignment
-// payloads, avoids stale motion-[chipId] rows from forcing presence sensors back to
-// unassigned, and preserves full LD2410 radar telemetry payloads.
+// Safe cleanup plus AI v2 fields for ESP32 motion and simple human-presence sensors.
+// Keeps webhook-secret behavior unchanged. Normalizes ESP32 ffmpeg status, improves
+// old motion/presence event typing, and adds room routine, presence-duration, and
+// AI confidence metadata to the existing AI summary responses.
 
 const express = require("express");
 const { Pool } = require("pg");
@@ -33,6 +33,9 @@ const AI_BASELINE_MIN_DAYS = 3;
 const AI_BASELINE_QUIET_RATIO = 0.5;
 const AI_BASELINE_ACTIVE_RATIO = 1.75;
 const AI_TIME_ZONE = process.env.AI_TIME_ZONE || "America/Chicago";
+const AI_PRESENCE_ACTIVE_WATCH_MINUTES = 120;
+const AI_PRESENCE_ACTIVE_WARNING_MINUTES = 240;
+const AI_PRESENCE_ACTIVE_CRITICAL_MINUTES = 480;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
@@ -396,6 +399,194 @@ function normalizeJsonObject(value) {
   }
 
   return {};
+}
+
+function normalizedTextSignalForPayload(payload) {
+  const normalizedPayload = normalizeJsonObject(payload);
+
+  return [
+    normalizedPayload.nodeId,
+    normalizedPayload.sourceKey,
+    normalizedPayload.sourceName,
+    normalizedPayload.sensorType,
+    normalizedPayload.sensorMode,
+    normalizedPayload.eventType,
+    normalizedPayload.message,
+    normalizedPayload.timeText,
+    normalizedPayload.softwareVersion,
+    normalizedPayload.platform,
+    normalizedPayload?.diagnostics?.sourceKey,
+    normalizedPayload?.diagnostics?.sensorMode,
+    normalizedPayload?.diagnostics?.sensorType,
+    normalizedPayload?.diagnostics?.deviceName
+  ]
+    .map((value) => cleanText(value))
+    .join(" ")
+    .toLowerCase()
+    .replace(/[-\s]+/g, "_");
+}
+
+function isEsp32Payload(payload) {
+  const signal = normalizedTextSignalForPayload(payload);
+  return signal.includes("esp32") ||
+    signal.includes("good_shepherd_esp32") ||
+    signal.includes("motion_") ||
+    signal.includes("presence_") ||
+    signal.includes("human_presence") ||
+    signal.includes("pir");
+}
+
+function normalizeFfmpegStatusForPayload(payload, fallback = "Unknown") {
+  const explicitStatus = cleanText(payload?.ffmpegStatus);
+
+  if (explicitStatus && explicitStatus.toLowerCase() !== "unknown") {
+    return explicitStatus;
+  }
+
+  if (isEsp32Payload(payload)) {
+    return "Not Applicable";
+  }
+
+  return explicitStatus || fallback;
+}
+
+function normalizeWebhookEventTypeFromPayload(payload, fallback = "webhook_event") {
+  const normalizedPayload = normalizeJsonObject(payload);
+  const explicitEventType = normalizeWebhookEventType(normalizedPayload.eventType, "");
+
+  if (explicitEventType) {
+    return explicitEventType;
+  }
+
+  const sensorSignal = normalizedTextSignalForPayload(normalizedPayload);
+  const messageText = [
+    normalizedPayload.message,
+    normalizedPayload.timeText
+  ]
+    .map((value) => cleanText(value))
+    .join(" ")
+    .toLowerCase();
+
+  if (
+    sensorSignal.includes("human_presence") ||
+    sensorSignal.includes("presence_") ||
+    sensorSignal.includes("ld2410")
+  ) {
+    const presenceValue = readPayloadBoolean(normalizedPayload, "presence");
+
+    if (presenceValue === true ||
+      messageText.includes("presence detected") ||
+      messageText.includes("human presence detected")) {
+      return "presence_detected";
+    }
+
+    if (presenceValue === false ||
+      messageText.includes("presence cleared") ||
+      messageText.includes("human presence cleared")) {
+      return "presence_cleared";
+    }
+  }
+
+  if (
+    sensorSignal.includes("motion") ||
+    sensorSignal.includes("pir") ||
+    messageText.includes("motion detected") ||
+    messageText.includes("activity detected")
+  ) {
+    return "motion_detected";
+  }
+
+  return fallback;
+}
+
+function normalizeWebhookSensorTypeFromPayload(payload, fallback = "unknown") {
+  const normalizedPayload = normalizeJsonObject(payload);
+  const explicitSensorType = normalizeWebhookSensorType(
+    normalizedPayload.sensorType || normalizedPayload.sensorMode,
+    ""
+  );
+
+  if (explicitSensorType && explicitSensorType !== "unknown") {
+    return explicitSensorType;
+  }
+
+  const signal = normalizedTextSignalForPayload(normalizedPayload);
+
+  if (
+    signal.includes("human_presence") ||
+    signal.includes("presence_") ||
+    signal.includes("ld2410")
+  ) {
+    return "human_presence";
+  }
+
+  if (
+    signal.includes("motion") ||
+    signal.includes("pir") ||
+    signal.includes("activity_detected")
+  ) {
+    return "motion";
+  }
+
+  return fallback;
+}
+
+function isPresenceEventRow(event) {
+  const eventType = cleanText(event?.eventType || event?.event_type).toLowerCase();
+  const sensorType = cleanText(event?.sensorType || event?.sensor_type).toLowerCase();
+  const payload = normalizeJsonObject(event?.eventPayload || event?.event_payload);
+  const payloadPresence = readPayloadBoolean(payload, "presence");
+  const searchableText = [
+    event?.message,
+    event?.sourceName,
+    event?.sourceKey,
+    event?.timeText,
+    eventType,
+    sensorType,
+    payload?.eventType,
+    payload?.sensorType,
+    payload?.sensorMode
+  ]
+    .map((value) => cleanText(value))
+    .join(" ")
+    .toLowerCase();
+
+  return eventType === "presence_detected" ||
+    eventType === "presence_cleared" ||
+    sensorType === "human_presence" ||
+    sensorType === "presence" ||
+    payloadPresence !== null ||
+    searchableText.includes("human presence") ||
+    searchableText.includes("presence detected") ||
+    searchableText.includes("presence cleared") ||
+    searchableText.includes("ld2410");
+}
+
+function presenceEventIsActive(event) {
+  const eventType = cleanText(event?.eventType || event?.event_type).toLowerCase();
+  const payload = normalizeJsonObject(event?.eventPayload || event?.event_payload);
+  const payloadPresence = readPayloadBoolean(payload, "presence");
+  const messageText = [
+    event?.message,
+    event?.timeText
+  ]
+    .map((value) => cleanText(value))
+    .join(" ")
+    .toLowerCase();
+
+  if (payloadPresence !== null) {
+    return payloadPresence;
+  }
+
+  if (eventType === "presence_detected" || messageText.includes("presence detected")) {
+    return true;
+  }
+
+  if (eventType === "presence_cleared" || messageText.includes("presence cleared")) {
+    return false;
+  }
+
+  return null;
 }
 
 function displaySensorTypeForValue(value, fallback = "Motion Sensor") {
@@ -1043,10 +1234,211 @@ function buildResidentRoomIntelligence(residentSensors, residentMotionEvents) {
   };
 }
 
+function presenceEventRoomName(event, sensor) {
+  const cleanSensorRoom = cleanText(sensor?.roomName);
+
+  if (cleanSensorRoom) {
+    return cleanSensorRoom;
+  }
+
+  return inferRoomNameFromSourceName(event?.sourceName) ||
+    cleanText(event?.locationName) ||
+    "Unknown room";
+}
+
+function buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents) {
+  const presenceSensors = residentSensors.filter((sensor) => {
+    const sensorType = cleanText(sensor.sensorType).toLowerCase();
+    const sourceKey = cleanText(sensor.sourceKey).toLowerCase();
+    const sourceName = cleanText(sensor.sourceName).toLowerCase();
+
+    return sensorType.includes("presence") ||
+      sourceKey.startsWith("presence-") ||
+      sourceName.includes("presence");
+  });
+
+  const latestBySourceKey = new Map();
+
+  for (const event of residentPresenceEvents) {
+    const sourceKey = cleanText(event.sourceKey);
+
+    if (!sourceKey) {
+      continue;
+    }
+
+    const eventDate = new Date(event.timestamp);
+
+    if (Number.isNaN(eventDate.getTime())) {
+      continue;
+    }
+
+    const current = latestBySourceKey.get(sourceKey);
+    const currentDate = current?.timestamp ? new Date(current.timestamp) : null;
+
+    if (!current || !currentDate || Number.isNaN(currentDate.getTime()) || eventDate.getTime() > currentDate.getTime()) {
+      latestBySourceKey.set(sourceKey, event);
+    }
+  }
+
+  const activePresenceEvents = [...latestBySourceKey.values()].filter((event) => presenceEventIsActive(event) === true);
+  const latestPresenceEvent = residentPresenceEvents
+    .slice()
+    .sort((first, second) => new Date(second.timestamp).getTime() - new Date(first.timestamp).getTime())[0] || null;
+  const latestPresenceAt = latestPresenceEvent?.timestamp || null;
+  const latestPresenceState = latestPresenceEvent ? presenceEventIsActive(latestPresenceEvent) : null;
+
+  const currentPresenceRooms = activePresenceEvents
+    .map((event) => {
+      const sensor = presenceSensors.find((candidate) => sensorMatchesMotionEvent(candidate, event));
+      return presenceEventRoomName(event, sensor);
+    })
+    .filter(Boolean)
+    .filter((roomName, index, rooms) => rooms.indexOf(roomName) === index)
+    .sort((first, second) => first.localeCompare(second));
+
+  const activeDurations = activePresenceEvents
+    .map((event) => minutesSince(event.timestamp))
+    .filter((minutes) => Number.isFinite(minutes));
+  const activePresenceDurationMinutes = activeDurations.length > 0 ? Math.max(...activeDurations) : null;
+
+  let presenceStatus = "No Presence Sensor";
+  let presenceExplanation = "No human-presence sensor is assigned to this resident.";
+
+  if (presenceSensors.length > 0 && !latestPresenceEvent) {
+    presenceStatus = "No Presence Events";
+    presenceExplanation = "Human-presence sensor is assigned, but no presence event is available yet.";
+  } else if (presenceSensors.length > 0 && latestPresenceState === false) {
+    presenceStatus = "Presence Clear";
+    presenceExplanation = "Latest human-presence event says the monitored room is clear.";
+  } else if (presenceSensors.length > 0 && latestPresenceState === true) {
+    if (Number.isFinite(activePresenceDurationMinutes) && activePresenceDurationMinutes >= AI_PRESENCE_ACTIVE_CRITICAL_MINUTES) {
+      presenceStatus = "Presence Active Very Long";
+      presenceExplanation = `Human presence has remained active for about ${activePresenceDurationMinutes} minutes. Review this against the resident's normal routine.`;
+    } else if (Number.isFinite(activePresenceDurationMinutes) && activePresenceDurationMinutes >= AI_PRESENCE_ACTIVE_WARNING_MINUTES) {
+      presenceStatus = "Presence Active Long";
+      presenceExplanation = `Human presence has remained active for about ${activePresenceDurationMinutes} minutes. Continue watching or verify if this is expected.`;
+    } else {
+      presenceStatus = "Presence Active";
+      presenceExplanation = currentPresenceRooms.length > 0
+        ? `Human presence is currently active in ${currentPresenceRooms.join(", ")}.`
+        : "Human presence is currently active.";
+    }
+  }
+
+  return {
+    presenceSensorCount: presenceSensors.length,
+    presenceEventCount: residentPresenceEvents.length,
+    latestPresenceAt,
+    latestPresenceState,
+    currentPresenceRooms,
+    activePresenceDurationMinutes,
+    presenceStatus,
+    presenceExplanation
+  };
+}
+
+function buildResidentAIConfidence({ motionBaseline, activeSensorCount, onlineSensorCount, offlineSensorCount, residentMotionEvents, presenceIntelligence }) {
+  let score = 25;
+  const reasons = [];
+
+  const baselineDayCount = normalizeInteger(motionBaseline?.baselineDayCount, 0);
+
+  if (baselineDayCount >= 7) {
+    score += 25;
+    reasons.push(`${baselineDayCount} baseline days`);
+  } else if (baselineDayCount >= AI_BASELINE_MIN_DAYS) {
+    score += 15;
+    reasons.push(`${baselineDayCount} baseline days`);
+  } else {
+    reasons.push("limited baseline history");
+  }
+
+  if (activeSensorCount > 0 && onlineSensorCount === activeSensorCount) {
+    score += 25;
+    reasons.push("all active sensors online");
+  } else if (onlineSensorCount > 0) {
+    score += 12;
+    reasons.push(`${onlineSensorCount} sensor(s) online`);
+  } else {
+    score -= 20;
+    reasons.push("no active sensor currently online");
+  }
+
+  if (offlineSensorCount > 0) {
+    score -= Math.min(25, offlineSensorCount * 10);
+    reasons.push(`${offlineSensorCount} offline sensor(s)`);
+  }
+
+  if (Array.isArray(residentMotionEvents) && residentMotionEvents.length >= 20) {
+    score += 10;
+    reasons.push("enough recent motion events");
+  }
+
+  if (presenceIntelligence?.presenceSensorCount > 0) {
+    score += 5;
+    reasons.push("presence sensor available");
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  let confidence = "Low";
+
+  if (score >= 75) {
+    confidence = "High";
+  } else if (score >= 50) {
+    confidence = "Medium";
+  }
+
+  return {
+    aiConfidence: confidence,
+    aiConfidenceScore: score,
+    aiConfidenceExplanation: reasons.length > 0 ? reasons.join("; ") : "Not enough monitoring context yet."
+  };
+}
+
+function buildResidentBehaviorInsights({ motionBaseline, roomIntelligence, presenceIntelligence, aiStatus }) {
+  const insights = [];
+
+  if (motionBaseline?.patternStatus) {
+    insights.push({
+      type: "motion_pattern",
+      title: motionBaseline.patternStatus,
+      detail: motionBaseline.patternExplanation
+    });
+  }
+
+  if (roomIntelligence?.coverageStatus) {
+    insights.push({
+      type: "room_coverage",
+      title: roomIntelligence.coverageStatus,
+      detail: roomIntelligence.coverageExplanation
+    });
+  }
+
+  if (presenceIntelligence?.presenceStatus && presenceIntelligence.presenceStatus !== "No Presence Sensor") {
+    insights.push({
+      type: "presence",
+      title: presenceIntelligence.presenceStatus,
+      detail: presenceIntelligence.presenceExplanation
+    });
+  }
+
+  if (aiStatus?.aiExplanation) {
+    insights.push({
+      type: "overall_ai",
+      title: aiStatus.aiLevel || aiStatus.aiStatus || "AI Status",
+      detail: aiStatus.aiExplanation
+    });
+  }
+
+  return insights;
+}
+
 function buildResidentActionGuidance({
   aiStatus,
   motionBaseline,
   roomIntelligence,
+  presenceIntelligence,
   activeSensorCount,
   offlineSensorCount,
   recentCriticalOpenAlertCount,
@@ -1056,6 +1448,7 @@ function buildResidentActionGuidance({
   const aiLevel = cleanText(aiStatus?.aiLevel || aiStatus?.aiStatus);
   const patternStatus = cleanText(motionBaseline?.patternStatus);
   const coverageStatus = cleanText(roomIntelligence?.coverageStatus);
+  const presenceStatus = cleanText(presenceIntelligence?.presenceStatus);
 
   if (aiLevel === "Critical" || recentCriticalOpenAlertCount > 0) {
     return {
@@ -1108,6 +1501,20 @@ function buildResidentActionGuidance({
         "Review last motion time and the quiet rooms for this resident.",
         "Compare activity against the resident's expected routine for this time of day.",
         "Escalate if the resident cannot be reached or if quiet activity continues."
+      ],
+      nextCheckMinutes: 30
+    };
+  }
+
+  if (presenceStatus === "Presence Active Very Long" || presenceStatus === "Presence Active Long") {
+    return {
+      actionLevel: "Watch",
+      actionTitle: "Review sustained presence",
+      actionSummary: presenceIntelligence?.presenceExplanation || "Human presence has remained active longer than the current watch threshold.",
+      actionItems: [
+        "Compare this sustained presence with the resident's expected routine.",
+        "Check the room if the active presence does not match normal activity.",
+        "Confirm the sensor is aimed correctly and is not detecting a fan, chair, or other false presence source."
       ],
       nextCheckMinutes: 30
     };
@@ -1365,7 +1772,7 @@ function buildAIStatusForResident({
 }
 
 async function buildAIMotionSummary() {
-  const [residentResult, sensorResult, eventResult, motionEventResult, nodeHealthResult, nodeResult, actionLogResult] = await Promise.all([
+  const [residentResult, sensorResult, eventResult, presenceEventResult, motionEventResult, nodeHealthResult, nodeResult, actionLogResult] = await Promise.all([
     pool.query(`
       ${residentSelectSQL()}
       WHERE is_deleted = FALSE
@@ -1381,6 +1788,13 @@ async function buildAIMotionSummary() {
       ORDER BY timestamp DESC
       LIMIT 200
     `),
+    pool.query(`
+      ${eventSelectSQL()}
+      WHERE event_type IN ('presence_detected', 'presence_cleared')
+        OR sensor_type IN ('human_presence', 'presence')
+      ORDER BY timestamp DESC
+      LIMIT $1
+    `, [AI_MOTION_HISTORY_EVENT_LIMIT]),
     pool.query(
       `
       ${motionEventSelectSQL()}
@@ -1410,6 +1824,7 @@ async function buildAIMotionSummary() {
 
   const sensors = sensorResult.rows;
   const events = eventResult.rows;
+  const presenceEvents = presenceEventResult.rows.filter(isPresenceEventRow);
   const motionHistoryEvents = motionEventResult.rows;
   const actionLogs = actionLogResult.rows;
   const nodeHealthByNodeId = new Map(
@@ -1428,6 +1843,10 @@ async function buildAIMotionSummary() {
     });
 
     const residentEvents = events.filter((event) => {
+      const eventResidentNameKey = normalizeForMatch(event.residentName);
+      return eventResidentNameKey === residentNameKey;
+    });
+    const residentPresenceEvents = presenceEvents.filter((event) => {
       const eventResidentNameKey = normalizeForMatch(event.residentName);
       return eventResidentNameKey === residentNameKey;
     });
@@ -1470,6 +1889,7 @@ async function buildAIMotionSummary() {
     }).length;
     const motionBaseline = buildResidentMotionBaseline(residentMotionEvents);
     const roomIntelligence = buildResidentRoomIntelligence(residentSensors, residentMotionEvents);
+    const presenceIntelligence = buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents);
     const sensorStatusById = new Map(
       residentSensors.map((sensor) => {
         return [
@@ -1517,10 +1937,19 @@ async function buildAIMotionSummary() {
       onlineSensorCount,
       offlineSensorCount: offlineSensors.length
     });
+    const aiConfidence = buildResidentAIConfidence({
+      motionBaseline,
+      activeSensorCount: activeSensors.length,
+      onlineSensorCount,
+      offlineSensorCount: offlineSensors.length,
+      residentMotionEvents,
+      presenceIntelligence
+    });
     const actionGuidance = buildResidentActionGuidance({
       aiStatus,
       motionBaseline,
       roomIntelligence,
+      presenceIntelligence,
       activeSensorCount: activeSensors.length,
       offlineSensorCount: offlineSensors.length,
       recentCriticalOpenAlertCount: recentCriticalOpenAlerts.length,
@@ -1530,6 +1959,12 @@ async function buildAIMotionSummary() {
     const followUpStatus = buildResidentFollowUpStatus({
       actionGuidance,
       latestActionLog
+    });
+    const behaviorInsights = buildResidentBehaviorInsights({
+      motionBaseline,
+      roomIntelligence,
+      presenceIntelligence,
+      aiStatus
     });
 
     return {
@@ -1545,6 +1980,7 @@ async function buildAIMotionSummary() {
       offlineSensorCount: offlineSensors.length,
       onlineSensorCount,
       motionEventCount: residentMotionEvents.length,
+      presenceEventCount: residentPresenceEvents.length,
       persistentMotionEventCount: residentMotionHistoryEvents.length,
       retainedMotionEventFallbackCount: physicalWebhookMotionEvents.length,
       motionCountToday,
@@ -1568,6 +2004,17 @@ async function buildAIMotionSummary() {
       roomMotionCountsToday: roomIntelligence.roomMotionCountsToday,
       coverageStatus: roomIntelligence.coverageStatus,
       coverageExplanation: roomIntelligence.coverageExplanation,
+      presenceSensorCount: presenceIntelligence.presenceSensorCount,
+      latestPresenceAt: presenceIntelligence.latestPresenceAt,
+      latestPresenceState: presenceIntelligence.latestPresenceState,
+      currentPresenceRooms: presenceIntelligence.currentPresenceRooms,
+      activePresenceDurationMinutes: presenceIntelligence.activePresenceDurationMinutes,
+      presenceStatus: presenceIntelligence.presenceStatus,
+      presenceExplanation: presenceIntelligence.presenceExplanation,
+      aiConfidence: aiConfidence.aiConfidence,
+      aiConfidenceScore: aiConfidence.aiConfidenceScore,
+      aiConfidenceExplanation: aiConfidence.aiConfidenceExplanation,
+      behaviorInsights,
       openAlertCount: openAlerts.length,
       recentOpenAlertCount: recentOpenAlerts.length,
       recentCriticalOpenAlertCount: recentCriticalOpenAlerts.length,
@@ -1632,6 +2079,9 @@ async function buildAIMotionSummary() {
     baselineMinimumDays: AI_BASELINE_MIN_DAYS,
     baselineQuietRatio: AI_BASELINE_QUIET_RATIO,
     baselineActiveRatio: AI_BASELINE_ACTIVE_RATIO,
+    presenceActiveWatchMinutes: AI_PRESENCE_ACTIVE_WATCH_MINUTES,
+    presenceActiveWarningMinutes: AI_PRESENCE_ACTIVE_WARNING_MINUTES,
+    presenceActiveCriticalMinutes: AI_PRESENCE_ACTIVE_CRITICAL_MINUTES,
     aiTimeZone: AI_TIME_ZONE,
     nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
     residentCount: residents.length,
@@ -1759,6 +2209,9 @@ function aiBriefingPriorityItem(resident) {
     lastMotionSourceName: resident.lastMotionSourceName,
     coverageStatus: resident.coverageStatus,
     patternStatus: resident.patternStatus,
+    presenceStatus: resident.presenceStatus,
+    aiConfidence: resident.aiConfidence,
+    aiConfidenceScore: resident.aiConfidenceScore,
     lastActionAt: resident.lastActionAt,
     lastActionBy: resident.lastActionBy,
     lastActionStatus: resident.lastActionStatus
@@ -1874,7 +2327,10 @@ function buildAIBriefingFromSummary(summary) {
       residentReviewCount: residentReviewResidents.length,
       offlineSensorCount: residents.reduce((total, resident) => total + normalizeInteger(resident.offlineSensorCount, 0), 0),
       motionCountToday: residents.reduce((total, resident) => total + normalizeInteger(resident.motionCountToday, 0), 0),
-      motionCountLastHour: residents.reduce((total, resident) => total + normalizeInteger(resident.motionCountLastHour, 0), 0)
+      motionCountLastHour: residents.reduce((total, resident) => total + normalizeInteger(resident.motionCountLastHour, 0), 0),
+      activePresenceCount: residents.reduce((total, resident) => {
+        return total + (resident.latestPresenceState === true ? 1 : 0);
+      }, 0)
     },
     topPriorities,
     followUpDueResidents: followUpDueResidents.map(aiBriefingPriorityItem),
@@ -2914,7 +3370,7 @@ async function upsertNodeHealth(payload) {
   const cameraSummary = normalizeJsonArray(payload?.cameraSummary);
   const softwareVersion = cleanOptionalText(payload?.softwareVersion);
   const monitorStatus = normalizeHealthText(payload?.monitorStatus, "Online");
-  const ffmpegStatus = normalizeHealthText(payload?.ffmpegStatus, "Unknown");
+  const ffmpegStatus = normalizeFfmpegStatusForPayload(payload, "Unknown");
   const ffmpegPath = cleanOptionalText(payload?.ffmpegPath);
   const platform = cleanOptionalText(payload?.platform);
   const hostname = cleanOptionalText(payload?.hostname);
@@ -6906,16 +7362,16 @@ app.post("/webhook", async (req, res) => {
     let resolvedAlertLevel = cleanText(alertLevel);
     let resolvedTimeText = cleanText(timeText);
     const fullWebhookPayload = normalizeJsonObject(req.body || {});
-    const resolvedEventType = normalizeWebhookEventType(eventType);
-    const resolvedSensorType = normalizeWebhookSensorType(sensorType || sensorMode, "unknown");
-    const resolvedSensorDisplayType = displaySensorTypeForValue(sensorType || sensorMode || sourceName, "Motion Sensor");
+    const resolvedEventType = normalizeWebhookEventTypeFromPayload(fullWebhookPayload);
+    const resolvedSensorType = normalizeWebhookSensorTypeFromPayload(fullWebhookPayload, "unknown");
+    const resolvedSensorDisplayType = displaySensorTypeForValue(resolvedSensorType || sensorType || sensorMode || sourceName, "Motion Sensor");
 
     if (resolvedEventType === "presence_telemetry") {
-      console.log("LD2410 telemetry received:");
+      console.log("Legacy LD2410 telemetry received:");
       console.log(JSON.stringify(fullWebhookPayload, null, 2));
     }
 
-    if (resolvedSensorType === "human_presence" && !fullWebhookPayload.eventType) {
+    if (!fullWebhookPayload.eventType) {
       fullWebhookPayload.eventType = resolvedEventType;
     }
 
