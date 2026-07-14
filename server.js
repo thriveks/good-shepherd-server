@@ -1,7 +1,7 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.8 - Lightweight AI Dashboard Endpoint
+// Version: v11.9.1 - Safe Scalable Cached AI Dashboard
 // Updated: 2026-07-14
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
@@ -36,6 +36,8 @@ const AI_TIME_ZONE = process.env.AI_TIME_ZONE || "America/Chicago";
 const AI_PRESENCE_ACTIVE_WATCH_MINUTES = 120;
 const AI_PRESENCE_ACTIVE_WARNING_MINUTES = 240;
 const AI_PRESENCE_ACTIVE_CRITICAL_MINUTES = 480;
+const AI_DASHBOARD_CACHE_MAX_AGE_SECONDS = 30;
+const AI_DASHBOARD_REFRESH_DEBOUNCE_MS = 2000;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
@@ -308,6 +310,59 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS ai_action_logs_resident_id_created_at_idx ON ai_action_logs (resident_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS ai_action_logs_resident_name_created_at_idx ON ai_action_logs (LOWER(TRIM(resident_name)), created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS ai_action_logs_created_at_idx ON ai_action_logs (created_at DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS resident_activity_daily (
+      resident_id UUID NOT NULL REFERENCES residents(id) ON DELETE CASCADE,
+      activity_date DATE NOT NULL,
+      motion_count INTEGER NOT NULL DEFAULT 0,
+      first_motion_at TIMESTAMPTZ,
+      last_motion_at TIMESTAMPTZ,
+      room_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+      hourly_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (resident_id, activity_date)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS resident_activity_daily_date_idx ON resident_activity_daily (activity_date DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_dashboard_cache (
+      cache_key TEXT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      generated_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO resident_activity_daily (
+      resident_id, activity_date, motion_count, first_motion_at, last_motion_at, room_counts, hourly_counts, updated_at
+    )
+    SELECT
+      resident_id,
+      (event_timestamp AT TIME ZONE '${AI_TIME_ZONE}')::date AS activity_date,
+      COUNT(*)::int AS motion_count,
+      MIN(event_timestamp) AS first_motion_at,
+      MAX(event_timestamp) AS last_motion_at,
+      jsonb_object_agg(COALESCE(NULLIF(TRIM(room_name), ''), 'Unknown room'), room_count),
+      jsonb_object_agg(local_hour::text, hour_count),
+      NOW()
+    FROM (
+      SELECT
+        resident_id, event_timestamp, room_name,
+        EXTRACT(HOUR FROM event_timestamp AT TIME ZONE '${AI_TIME_ZONE}')::int AS local_hour,
+        COUNT(*) OVER (PARTITION BY resident_id, (event_timestamp AT TIME ZONE '${AI_TIME_ZONE}')::date, COALESCE(NULLIF(TRIM(room_name), ''), 'Unknown room'))::int AS room_count,
+        COUNT(*) OVER (PARTITION BY resident_id, (event_timestamp AT TIME ZONE '${AI_TIME_ZONE}')::date, EXTRACT(HOUR FROM event_timestamp AT TIME ZONE '${AI_TIME_ZONE}'))::int AS hour_count
+      FROM motion_events
+      WHERE resident_id IS NOT NULL
+        AND event_timestamp >= NOW() - (${AI_MOTION_HISTORY_DAYS} * INTERVAL '1 day')
+    ) source_rows
+    GROUP BY resident_id, (event_timestamp AT TIME ZONE '${AI_TIME_ZONE}')::date
+    ON CONFLICT (resident_id, activity_date) DO NOTHING
+  `).catch((error) => {
+    console.warn('Resident activity backfill skipped:', error.message);
+  });
 
   await pool.query(`
     INSERT INTO device_mappings (
@@ -1834,34 +1889,42 @@ async function buildAIMotionSummary() {
     nodeResult.rows.map((node) => [cleanText(node.nodeId), node.lastSeenAt])
   );
 
+  const groupByResident = (rows, idField = 'residentId', nameField = 'residentName') => {
+    const byId = new Map();
+    const byName = new Map();
+    for (const row of rows) {
+      const id = cleanText(row?.[idField]);
+      const name = normalizeForMatch(row?.[nameField]);
+      if (id) { if (!byId.has(id)) byId.set(id, []); byId.get(id).push(row); }
+      if (name) { if (!byName.has(name)) byName.set(name, []); byName.get(name).push(row); }
+    }
+    return { byId, byName };
+  };
+  const sensorGroups = groupByResident(sensors);
+  const eventGroups = groupByResident(events, 'residentId', 'residentName');
+  const presenceGroups = groupByResident(presenceEvents, 'residentId', 'residentName');
+  const motionGroups = groupByResident(motionHistoryEvents);
+  const actionGroups = groupByResident(actionLogs);
+  const rowsForResident = (groups, resident) => {
+    const byIdRows = groups.byId.get(cleanText(resident.id)) || [];
+    const byNameRows = groups.byName.get(normalizeForMatch(resident.name)) || [];
+    if (byIdRows.length === 0) return byNameRows;
+    if (byNameRows.length === 0) return byIdRows;
+    return [...new Map([...byIdRows, ...byNameRows].map((row) => [row.id || JSON.stringify(row), row])).values()];
+  };
+
   const residents = residentResult.rows.map((resident) => {
     const residentNameKey = normalizeForMatch(resident.name);
 
-    const residentSensors = sensors.filter((sensor) => {
-      const sensorResidentNameKey = normalizeForMatch(sensor.residentName);
-      return sensor.residentId === resident.id || sensorResidentNameKey === residentNameKey;
-    });
-
-    const residentEvents = events.filter((event) => {
-      const eventResidentNameKey = normalizeForMatch(event.residentName);
-      return eventResidentNameKey === residentNameKey;
-    });
-    const residentPresenceEvents = presenceEvents.filter((event) => {
-      const eventResidentNameKey = normalizeForMatch(event.residentName);
-      return eventResidentNameKey === residentNameKey;
-    });
-    const residentActionLogs = actionLogs.filter((log) => {
-      const logResidentNameKey = normalizeForMatch(log.residentName);
-      return log.residentId === resident.id || logResidentNameKey === residentNameKey;
-    });
+    const residentSensors = rowsForResident(sensorGroups, resident);
+    const residentEvents = rowsForResident(eventGroups, resident);
+    const residentPresenceEvents = rowsForResident(presenceGroups, resident);
+    const residentActionLogs = rowsForResident(actionGroups, resident);
     const latestActionLog = residentActionLogs[0] || null;
 
     const motionEvents = residentEvents.filter(isMotionEventRow);
     const physicalWebhookMotionEvents = motionEvents.filter(isPhysicalMotionEventRow);
-    const residentMotionHistoryEvents = motionHistoryEvents.filter((event) => {
-      const eventResidentNameKey = normalizeForMatch(event.residentName);
-      return event.residentId === resident.id || eventResidentNameKey === residentNameKey;
-    });
+    const residentMotionHistoryEvents = rowsForResident(motionGroups, resident);
     const residentMotionEvents = residentMotionHistoryEvents.length > 0
       ? residentMotionHistoryEvents
       : physicalWebhookMotionEvents;
@@ -2345,18 +2408,102 @@ async function buildAIBriefing() {
   return buildAIBriefingFromSummary(summary);
 }
 
+let aiDashboardRefreshPromise = null;
+let aiDashboardRefreshTimer = null;
+
+async function persistAIDashboardPayload(payload) {
+  try {
+    await pool.query(
+      `
+      INSERT INTO ai_dashboard_cache (cache_key, payload, generated_at, updated_at)
+      VALUES ('default', $1::jsonb, $2, NOW())
+      ON CONFLICT (cache_key)
+      DO UPDATE SET payload = EXCLUDED.payload, generated_at = EXCLUDED.generated_at, updated_at = NOW()
+      `,
+      [JSON.stringify(payload), payload.generatedAt]
+    );
+    return true;
+  } catch (error) {
+    // Cache persistence is an optimization only. A cache write failure must
+    // never make a successfully built dashboard fail.
+    console.error('AI dashboard cache persistence failed:', error);
+    return false;
+  }
+}
+
+async function loadCachedAIDashboardPayload() {
+  const result = await pool.query(`
+    SELECT payload, generated_at AS "generatedAt"
+    FROM ai_dashboard_cache
+    WHERE cache_key = 'default'
+    LIMIT 1
+  `);
+  return result.rows[0] || null;
+}
+
 async function buildAIDashboardPayload() {
-  // Build the expensive resident summary once, then derive the briefing from
-  // that same in-memory result. This replaces two full AI calculations on iOS.
   const summary = await buildAIMotionSummary();
   const briefing = buildAIBriefingFromSummary(summary);
-
-  return {
+  const payload = {
     success: true,
     generatedAt: new Date().toISOString(),
     summary,
     briefing
   };
+  await persistAIDashboardPayload(payload);
+  return payload;
+}
+
+async function refreshAIDashboardPayloadSingleFlight() {
+  if (aiDashboardRefreshPromise) return aiDashboardRefreshPromise;
+  aiDashboardRefreshPromise = buildAIDashboardPayload()
+    .catch((error) => {
+      console.error('AI dashboard background refresh failed:', error);
+      throw error;
+    })
+    .finally(() => { aiDashboardRefreshPromise = null; });
+  return aiDashboardRefreshPromise;
+}
+
+function scheduleAIDashboardRefresh() {
+  if (aiDashboardRefreshTimer) clearTimeout(aiDashboardRefreshTimer);
+  aiDashboardRefreshTimer = setTimeout(() => {
+    aiDashboardRefreshTimer = null;
+    refreshAIDashboardPayloadSingleFlight().catch(() => {});
+  }, AI_DASHBOARD_REFRESH_DEBOUNCE_MS);
+}
+
+async function incrementResidentDailyActivity({ resident, event, sensor }) {
+  if (!resident?.id || !isPhysicalMotionEventRow(event)) return;
+  const roomName = cleanText(sensor?.roomName) || inferRoomNameFromSourceName(event.sourceName) || 'Unknown room';
+  await pool.query(
+    `
+    INSERT INTO resident_activity_daily (
+      resident_id, activity_date, motion_count, first_motion_at, last_motion_at, room_counts, hourly_counts, updated_at
+    )
+    VALUES (
+      $1, ($2::timestamptz AT TIME ZONE $3)::date, 1, $2, $2,
+      jsonb_build_object($4::text, 1),
+      jsonb_build_object(EXTRACT(HOUR FROM $2::timestamptz AT TIME ZONE $3)::int::text, 1), NOW()
+    )
+    ON CONFLICT (resident_id, activity_date)
+    DO UPDATE SET
+      motion_count = resident_activity_daily.motion_count + 1,
+      first_motion_at = LEAST(resident_activity_daily.first_motion_at, EXCLUDED.first_motion_at),
+      last_motion_at = GREATEST(resident_activity_daily.last_motion_at, EXCLUDED.last_motion_at),
+      room_counts = jsonb_set(
+        resident_activity_daily.room_counts, ARRAY[$4::text],
+        to_jsonb(COALESCE((resident_activity_daily.room_counts ->> $4::text)::int, 0) + 1), true
+      ),
+      hourly_counts = jsonb_set(
+        resident_activity_daily.hourly_counts,
+        ARRAY[EXTRACT(HOUR FROM $2::timestamptz AT TIME ZONE $3)::int::text],
+        to_jsonb(COALESCE((resident_activity_daily.hourly_counts ->> EXTRACT(HOUR FROM $2::timestamptz AT TIME ZONE $3)::int::text)::int, 0) + 1), true
+      ),
+      updated_at = NOW()
+    `,
+    [resident.id, event.timestamp, AI_TIME_ZONE, roomName]
+  );
 }
 
 
@@ -4401,15 +4548,36 @@ app.get("/presence-telemetry/latest", async (req, res) => {
 
 app.get("/ai/dashboard", async (req, res) => {
   try {
-    const payload = await buildAIDashboardPayload();
+    let cached = null;
+
+    try {
+      cached = await loadCachedAIDashboardPayload();
+    } catch (cacheReadError) {
+      // A missing, unavailable, or temporarily failed cache must not take the
+      // dashboard down. Fall through to the existing live calculation path.
+      console.error("AI dashboard cache read failed; using live calculation:", cacheReadError);
+    }
+
+    if (cached?.payload) {
+      const generatedAt = new Date(cached.generatedAt);
+      const ageSeconds = Number.isNaN(generatedAt.getTime())
+        ? AI_DASHBOARD_CACHE_MAX_AGE_SECONDS + 1
+        : Math.max(0, Math.floor((Date.now() - generatedAt.getTime()) / 1000));
+
+      if (ageSeconds > AI_DASHBOARD_CACHE_MAX_AGE_SECONDS) {
+        refreshAIDashboardPayloadSingleFlight().catch(() => {});
+      }
+
+      res.set("Cache-Control", "private, max-age=10");
+      return res.status(200).json({ ...cached.payload, cacheAgeSeconds: ageSeconds, servedFromCache: true });
+    }
+
+    const payload = await refreshAIDashboardPayloadSingleFlight();
     res.set("Cache-Control", "private, max-age=10");
-    res.status(200).json(payload);
+    return res.status(200).json({ ...payload, cacheAgeSeconds: 0, servedFromCache: false });
   } catch (error) {
-    console.error("Failed to build lightweight AI dashboard:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to build AI dashboard"
-    });
+    console.error("Failed to load scalable AI dashboard:", error);
+    return res.status(500).json({ success: false, error: "Failed to load AI dashboard" });
   }
 });
 
@@ -7544,6 +7712,25 @@ app.post("/webhook", async (req, res) => {
       sensor
     });
 
+    if (motionHistoryEvent) {
+      // Daily aggregation is deliberately best-effort and asynchronous.
+      // The raw webhook event and motion-history record are already saved;
+      // an aggregate failure must never turn a valid sensor event into HTTP 500.
+      setImmediate(() => {
+        incrementResidentDailyActivity({ resident, event, sensor }).catch((error) => {
+          console.error("Resident daily activity aggregation failed:", {
+            residentId: resident?.id || null,
+            eventId: event?.id || null,
+            error: error?.message || String(error)
+          });
+        });
+      });
+    }
+
+    // Dashboard refresh is also an optimization and is already internally
+    // debounced. Scheduling it must not delay the sensor webhook response.
+    scheduleAIDashboardRefresh();
+
     await pool.query(
       `
       DELETE FROM webhook_events
@@ -7585,6 +7772,8 @@ initializeDatabase()
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
       console.log("Remote node command queue enabled.");
       console.log("ESP32 OTA firmware update command support enabled.");
+      console.log("Scalable persisted AI dashboard cache enabled.");
+      scheduleAIDashboardRefresh();
     });
   })
   .catch((error) => {
