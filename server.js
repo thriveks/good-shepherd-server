@@ -1,7 +1,7 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.9.1 - Safe Scalable Cached AI Dashboard
+// Version: v11.9.2 - Canonical AI Time-Zone Motion Counts
 // Updated: 2026-07-14
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
@@ -1936,21 +1936,17 @@ async function buildAIMotionSummary() {
         })
       : null;
 
-    const motionCountToday = residentMotionEvents.filter((event) => {
-      const eventDate = new Date(event.timestamp);
-      const now = new Date();
-      return !Number.isNaN(eventDate.getTime()) &&
-        eventDate.getFullYear() === now.getFullYear() &&
-        eventDate.getMonth() === now.getMonth() &&
-        eventDate.getDate() === now.getDate();
-    }).length;
+    const motionBaseline = buildResidentMotionBaseline(residentMotionEvents);
+    // Use one canonical AI-time-zone calculation for every "today" count.
+    // This keeps the displayed total, room totals, hourly totals, briefing totals,
+    // and pattern comparison aligned even when the server process runs in UTC.
+    const motionCountToday = motionBaseline.todayMotionCount;
 
     const motionCountLastHour = residentMotionEvents.filter((event) => {
       const eventDate = new Date(event.timestamp);
       return !Number.isNaN(eventDate.getTime()) &&
         eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
     }).length;
-    const motionBaseline = buildResidentMotionBaseline(residentMotionEvents);
     const roomIntelligence = buildResidentRoomIntelligence(residentSensors, residentMotionEvents);
     const presenceIntelligence = buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents);
     const sensorStatusById = new Map(
