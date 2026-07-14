@@ -1,8 +1,8 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.7 - AI v2 Safe Cleanup
-// Updated: 2026-07-13
+// Version: v11.8 - Lightweight AI Dashboard Endpoint
+// Updated: 2026-07-14
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
 // Safe cleanup plus AI v2 fields for ESP32 motion and simple human-presence sensors.
@@ -2345,6 +2345,20 @@ async function buildAIBriefing() {
   return buildAIBriefingFromSummary(summary);
 }
 
+async function buildAIDashboardPayload() {
+  // Build the expensive resident summary once, then derive the briefing from
+  // that same in-memory result. This replaces two full AI calculations on iOS.
+  const summary = await buildAIMotionSummary();
+  const briefing = buildAIBriefingFromSummary(summary);
+
+  return {
+    success: true,
+    generatedAt: new Date().toISOString(),
+    summary,
+    briefing
+  };
+}
+
 
 function isAuthorizedWebhook(req) {
   if (!WEBHOOK_SECRET) {
@@ -4288,6 +4302,7 @@ app.get("/", async (req, res) => {
         "GET /node-commands/:nodeId/pending",
         "POST /node-commands/:commandId/result",
         "GET /node-commands/:nodeId",
+        "GET /ai/dashboard",
         "GET /ai/briefing",
         "GET /ai/motion-summary",
         "GET /ai/motion-events",
@@ -4379,6 +4394,21 @@ app.get("/presence-telemetry/latest", async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Failed to fetch latest presence telemetry"
+    });
+  }
+});
+
+
+app.get("/ai/dashboard", async (req, res) => {
+  try {
+    const payload = await buildAIDashboardPayload();
+    res.set("Cache-Control", "private, max-age=10");
+    res.status(200).json(payload);
+  } catch (error) {
+    console.error("Failed to build lightweight AI dashboard:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to build AI dashboard"
     });
   }
 });
