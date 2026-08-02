@@ -825,6 +825,15 @@ function normalizeForMatch(value) {
   return cleanText(value).toLowerCase();
 }
 
+class SensorAssignmentConflictError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SensorAssignmentConflictError";
+    this.statusCode = 409;
+    this.code = "SENSOR_ASSIGNMENT_CONFLICT";
+  }
+}
+
 function isMotionEventRow(event) {
   const searchableText = [
     event?.message,
@@ -3398,6 +3407,7 @@ async function syncNodeHealthMetadataBestEffort({
   setupState,
   diagnostics
 }) {
+  let resolvedNodeName = nodeName;
   let resolvedLocationName = locationName;
   let resolvedSetupState = setupState;
   const resolvedDiagnostics = {
@@ -3411,6 +3421,7 @@ async function syncNodeHealthMetadataBestEffort({
   const preserveNodeUnassignedState = sensorIsExplicitlyUnassigned(existingIdentitySensor);
 
   if (preserveNodeUnassignedState) {
+    resolvedNodeName = existingIdentitySensor?.sourceName || "Unassigned Sensor";
     resolvedLocationName = "Unassigned Location";
     resolvedSetupState = "unassigned";
     resolvedDiagnostics.residentName = "Unassigned";
@@ -3422,7 +3433,7 @@ async function syncNodeHealthMetadataBestEffort({
 
   await upsertNodeFromRegistration({
     nodeId,
-    nodeName,
+    nodeName: resolvedNodeName,
     locationName: resolvedLocationName,
     localIp,
     localConfigPort,
@@ -4012,16 +4023,25 @@ async function recordMotionHistoryEvent({ event, resident, sensor }) {
 }
 
 
-async function findResidentForSensorAssignment({ residentId, residentName, locationName }) {
+async function findResidentForSensorAssignment(client, { residentId, residentName, locationName }) {
   const resolvedResidentId = cleanOptionalText(residentId);
   const resolvedResidentName = cleanText(residentName);
   const resolvedLocationName = cleanText(locationName) || "Unassigned location";
 
   if (resolvedResidentId) {
-    const resident = await getResidentById(resolvedResidentId);
+    const residentResult = await client.query(
+      `
+      ${residentSelectSQL()}
+      WHERE id = $1
+        AND is_deleted = FALSE
+      FOR UPDATE
+      `,
+      [resolvedResidentId]
+    );
+    const resident = residentResult.rows[0] || null;
 
-    if (!resident || resident.isDeleted) {
-      throw new Error(`Resident not found: ${resolvedResidentId}`);
+    if (!resident) {
+      throw new SensorAssignmentConflictError(`Resident is deleted or unavailable: ${resolvedResidentId}`);
     }
 
     return {
@@ -4035,7 +4055,7 @@ async function findResidentForSensorAssignment({ residentId, residentName, locat
     return null;
   }
 
-  const existing = await pool.query(
+  const existing = await client.query(
     `
     ${residentSelectSQL()}
     WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
@@ -4043,6 +4063,7 @@ async function findResidentForSensorAssignment({ residentId, residentName, locat
       AND is_deleted = FALSE
     ORDER BY created_at ASC
     LIMIT 1
+    FOR UPDATE
     `,
     [resolvedResidentName, resolvedLocationName]
   );
@@ -4055,7 +4076,7 @@ async function findResidentForSensorAssignment({ residentId, residentName, locat
     };
   }
 
-  const created = await pool.query(
+  const created = await client.query(
     `
     INSERT INTO residents (
       id,
@@ -4106,6 +4127,33 @@ async function findResidentForSensorAssignment({ residentId, residentName, locat
   };
 }
 
+async function tryLockSensorAssignmentIdentity(client, identityValues) {
+  const lockKeys = [...new Set(identityValues.map((value) => cleanText(value)).filter(Boolean))]
+    .map((value) => `sensor-assignment:${value}`)
+    .sort();
+
+  for (const lockKey of lockKeys) {
+    const result = await client.query(
+      `SELECT pg_try_advisory_xact_lock(hashtext($1)) AS "acquired"`,
+      [lockKey]
+    );
+
+    if (result.rows[0]?.acquired !== true) {
+      throw new SensorAssignmentConflictError("Sensor assignment is being changed by another request. Refresh and try again.");
+    }
+  }
+}
+
+async function lockSensorIdentityForResidentDeletion(client, identityValues) {
+  const lockKeys = [...new Set(identityValues.map((value) => cleanText(value)).filter(Boolean))]
+    .map((value) => `sensor-assignment:${value}`)
+    .sort();
+
+  for (const lockKey of lockKeys) {
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKey]);
+  }
+}
+
 async function clearStaleSensorAssignmentsForNode(client, { nodeId, sourceKey, keepSensorId }) {
   const resolvedNodeId = cleanText(nodeId);
   const resolvedSourceKey = cleanText(sourceKey);
@@ -4144,49 +4192,86 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
     throw new Error("Missing required field: nodeId");
   }
 
-  const existingNode = await getNodeById(resolvedNodeId);
-
-  if (!existingNode) {
-    throw new Error(`Node not found: ${resolvedNodeId}`);
-  }
-
-  const resident = await findResidentForSensorAssignment({
-    residentId,
-    residentName,
-    locationName
-  });
-
-  const requestedSensorIdentity =
-    sensorType ||
-    sensorMode ||
-    sourceName ||
-    sourceKey ||
-    existingNode.nodeName ||
-    "Motion Sensor";
-  const resolvedSensorMode = normalizedSensorModeForValue(requestedSensorIdentity, "motion");
-  const resolvedSensorType = displaySensorTypeForValue(requestedSensorIdentity, "Motion Sensor");
-  const resolvedResidentId = resident?.id || null;
-  const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
-  const resolvedLocationName =
-    cleanText(locationName) ||
-    resident?.location ||
-    existingNode.locationName ||
-    "Unassigned Location";
-  const resolvedRoomName = cleanOptionalText(roomName);
-  const resolvedSourceKey =
-    cleanText(sourceKey) ||
-    `${sourcePrefixForSensorMode(resolvedSensorMode)}-${resolvedNodeId.replace(/^esp32-/, "")}`;
-  const resolvedSourceName =
-    cleanText(sourceName) ||
-    defaultSourceNameForSensorType(resolvedSensorType, resolvedRoomName, existingNode.nodeName);
-  const setupState = resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned";
-
   const client = await pool.connect();
   let didBegin = false;
 
   try {
     await client.query("BEGIN");
     didBegin = true;
+
+    const resident = await findResidentForSensorAssignment(client, {
+      residentId,
+      residentName,
+      locationName
+    });
+
+    const requestedSourceKey = cleanText(sourceKey);
+    await tryLockSensorAssignmentIdentity(client, [resolvedNodeId, requestedSourceKey]);
+
+    const nodeResultForLock = await client.query(
+      `
+      SELECT
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName"
+      FROM nodes
+      WHERE node_id = $1
+      FOR UPDATE
+      `,
+      [resolvedNodeId]
+    );
+    const existingNode = nodeResultForLock.rows[0] || null;
+
+    if (!existingNode) {
+      throw new Error(`Node not found: ${resolvedNodeId}`);
+    }
+
+    const existingNodeSensorResult = await client.query(
+      `
+      ${sensorSelectSQL()}
+      WHERE node_id = $1
+        AND is_deleted = FALSE
+      ORDER BY created_at ASC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [resolvedNodeId]
+    );
+    const existingNodeSensor = existingNodeSensorResult.rows[0] || null;
+
+    if (requestedSourceKey) {
+      const requestedSourceResult = await client.query(
+        `
+        ${sensorSelectSQL()}
+        WHERE source_key = $1
+          AND is_deleted = FALSE
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [requestedSourceKey]
+      );
+      const requestedSourceSensor = requestedSourceResult.rows[0] || null;
+
+      if (requestedSourceSensor && cleanText(requestedSourceSensor.nodeId) !== resolvedNodeId) {
+        throw new SensorAssignmentConflictError(`Source identity ${requestedSourceKey} belongs to another physical node.`);
+      }
+    }
+
+    const requestedSensorIdentity =
+      sensorType || sensorMode || sourceName || requestedSourceKey || existingNode.nodeName || "Motion Sensor";
+    const resolvedSensorMode = normalizedSensorModeForValue(requestedSensorIdentity, "motion");
+    const resolvedSensorType = displaySensorTypeForValue(requestedSensorIdentity, "Motion Sensor");
+    const resolvedResidentId = resident?.id || null;
+    const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
+    const resolvedLocationName = cleanText(locationName) || resident?.location || existingNode.locationName || "Unassigned Location";
+    const resolvedRoomName = cleanOptionalText(roomName);
+    const resolvedSourceKey = existingNodeSensor?.sourceKey || requestedSourceKey ||
+      `${sourcePrefixForSensorMode(resolvedSensorMode)}-${resolvedNodeId.replace(/^esp32-/, "")}`;
+    const resolvedSourceName = cleanText(sourceName) ||
+      defaultSourceNameForSensorType(resolvedSensorType, resolvedRoomName, existingNode.nodeName);
+    const setupState = resolvedResidentName !== "Unassigned" || Boolean(resolvedRoomName) ? "assigned" : "unassigned";
+
+    await tryLockSensorAssignmentIdentity(client, [resolvedSourceKey]);
 
     const sensorResult = await client.query(
       `
@@ -5650,6 +5735,7 @@ app.post("/residents", async (req, res) => {
         is_deleted = FALSE,
         deleted_at = NULL,
         updated_at = NOW()
+      WHERE residents.is_deleted = FALSE
       RETURNING
         id,
         name,
@@ -5673,6 +5759,14 @@ app.post("/residents", async (req, res) => {
         statusText
       ]
     );
+
+    if (!result.rows[0]) {
+      return res.status(409).json({
+        success: false,
+        error: `Resident ${residentId} was deleted and cannot be restored by an ordinary save request.`,
+        code: "RESIDENT_RESTORE_REQUIRED"
+      });
+    }
 
     return res.status(200).json({
       success: true,
@@ -5948,6 +6042,7 @@ app.delete("/residents/:residentId", async (req, res) => {
       }
 
       const deletedResidentName = residentResult.rows[0].name;
+      const deletedResidentLocation = residentResult.rows[0].location;
 
       const cameraResult = await client.query(
         `
@@ -5972,21 +6067,96 @@ app.delete("/residents/:residentId", async (req, res) => {
 
       const sensorResult = await client.query(
         `
+        SELECT
+          id,
+          node_id AS "nodeId",
+          source_key AS "sourceKey"
+        FROM sensors
+        WHERE is_deleted = FALSE
+          AND (
+            resident_id = $1
+            OR (
+              resident_id IS NULL
+              AND LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
+              AND LOWER(TRIM(location_name)) = LOWER(TRIM($3))
+            )
+          )
+        ORDER BY node_id NULLS LAST, source_key
+        `,
+        [residentId, deletedResidentName, deletedResidentLocation]
+      );
+
+      await lockSensorIdentityForResidentDeletion(
+        client,
+        sensorResult.rows.flatMap((sensor) => [sensor.nodeId, sensor.sourceKey])
+      );
+
+      const unassignedSensorResult = await client.query(
+        `
         UPDATE sensors
         SET
           resident_id = NULL,
           resident_name = 'Unassigned',
+          location_name = 'Unassigned Location',
+          room_name = NULL,
+          source_name = COALESCE(NULLIF(TRIM(sensor_type), ''), 'Sensor'),
           setup_state = 'unassigned',
+          is_active = TRUE,
           updated_at = NOW()
         WHERE is_deleted = FALSE
           AND (
             resident_id = $1
-            OR LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
+            OR (
+              resident_id IS NULL
+              AND LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
+              AND LOWER(TRIM(location_name)) = LOWER(TRIM($3))
+            )
           )
-        RETURNING id
+        RETURNING id, node_id AS "nodeId", source_key AS "sourceKey"
         `,
-        [residentId, deletedResidentName]
+        [residentId, deletedResidentName, deletedResidentLocation]
       );
+
+      const affectedNodeIds = [...new Set(
+        unassignedSensorResult.rows.map((sensor) => cleanText(sensor.nodeId)).filter(Boolean)
+      )];
+
+      if (affectedNodeIds.length > 0) {
+        await client.query(
+          `
+          UPDATE nodes
+          SET
+            node_name = 'Unassigned Sensor',
+            location_name = 'Unassigned Location',
+            status = 'Pending Setup',
+            setup_state = 'unassigned'
+          WHERE node_id = ANY($1::text[])
+          `,
+          [affectedNodeIds]
+        );
+
+        await client.query(
+          `
+          UPDATE node_health
+          SET
+            node_name = 'Unassigned Sensor',
+            location_name = 'Unassigned Location',
+            setup_state = 'unassigned',
+            diagnostics = COALESCE(diagnostics, '{}'::jsonb) ||
+              jsonb_build_object(
+                'deviceName', 'Unassigned Sensor',
+                'roomName', '',
+                'residentName', 'Unassigned',
+                'locationName', 'Unassigned Location',
+                'assignmentState', 'Unassigned',
+                'setupState', 'unassigned'
+              ),
+            updated_at = NOW()
+          WHERE node_id = ANY($1::text[])
+          `,
+          [affectedNodeIds]
+        );
+      }
 
       await client.query("COMMIT");
 
@@ -5995,7 +6165,7 @@ app.delete("/residents/:residentId", async (req, res) => {
         message: "Resident deleted",
         resident: residentResult.rows[0],
         affectedCameraCount: cameraResult.rows.length,
-        affectedSensorCount: sensorResult.rows.length
+        affectedSensorCount: unassignedSensorResult.rows.length
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -6487,9 +6657,10 @@ app.patch("/sensors/:nodeId/assignment", async (req, res) => {
     });
   } catch (error) {
     console.error("Sensor assignment update failed:", error);
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      ...(error.code ? { code: error.code } : {})
     });
   }
 });
@@ -6559,7 +6730,8 @@ app.post("/sensor-bulk-actions", async (req, res) => {
           errors.push({
             nodeId: assignmentNodeId || null,
             success: false,
-            error: error.message
+            error: error.message,
+            ...(error.code ? { code: error.code } : {})
           });
         }
       }
