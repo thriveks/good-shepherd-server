@@ -1,8 +1,8 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v11.9.2 - Canonical AI Time-Zone Motion Counts
-// Updated: 2026-07-14
+// Version: v12.0.0 - Phase 1 Server Stabilization
+// Updated: 2026-08-03
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
 // Safe cleanup plus AI v2 fields for ESP32 motion and simple human-presence sensors.
@@ -40,6 +40,10 @@ const AI_DASHBOARD_CACHE_MAX_AGE_SECONDS = 30;
 const AI_DASHBOARD_REFRESH_DEBOUNCE_MS = 2000;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
+const MONITOR_COMMAND_TYPES = ["ping", "ffmpeg_check", "diagnostic_report", "reload_cameras", "sync_cameras_from_cloud", "restart_monitors", "clear_last_error", "rtsp_test"];
+const WATCHDOG_COMMAND_TYPES = ["watchdog_ping", "watchdog_health", "start_local_monitor", "stop_local_monitor", "restart_local_monitor"];
+let acceptedWebhookCountSinceStart = 0;
+const ASSIGNMENT_AUTHORITIES = ["never_assigned", "device_bootstrap", "operator_explicit", "resident_deleted", "legacy_unknown"];
 const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
 const FIRMWARE_GITHUB_REPO = process.env.FIRMWARE_GITHUB_REPO || "good-shepherd-esp32-firmware";
 const FIRMWARE_DOWNLOAD_ASSET_NAME = process.env.FIRMWARE_DOWNLOAD_ASSET_NAME || "good_shepherd_esp32_motion.ino.bin";
@@ -265,6 +269,7 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS sensors_resident_id_idx ON sensors (resident_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS sensors_node_id_idx ON sensors (node_id)`);
   await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS setup_state TEXT NOT NULL DEFAULT 'unassigned'`);
+  await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS assignment_authority TEXT NOT NULL DEFAULT 'legacy_unknown'`);
   await pool.query(`CREATE INDEX IF NOT EXISTS sensors_is_deleted_idx ON sensors (is_deleted)`);
 
   await pool.query(`
@@ -797,6 +802,104 @@ function normalizeSetupState(value) {
   return "unassigned";
 }
 
+function normalizeOptionalSetupState(value) {
+  const normalized = cleanText(value).toLowerCase();
+  if (normalized === "assigned" || normalized === "active") return "assigned";
+  if (normalized === "unassigned" || normalized === "pending setup" || normalized === "pending_setup") return "unassigned";
+  return null;
+}
+
+function normalizeReportedSetupState(payload, diagnostics = normalizeJsonObject(payload?.diagnostics)) {
+  const candidates = [
+    ["setupState", payload?.setupState],
+    ["assignmentState", payload?.assignmentState],
+    ["diagnostics.setupState", diagnostics?.setupState],
+    ["diagnostics.assignmentState", diagnostics?.assignmentState]
+  ].map(([field, value]) => ({ field, state: normalizeOptionalSetupState(value) }))
+    .filter((candidate) => candidate.state);
+  const selected = candidates[0] || null;
+  const disagreement = Boolean(selected && candidates.some((candidate) => candidate.state !== selected.state));
+  return {
+    state: selected?.state || null,
+    field: selected?.field || null,
+    present: candidates.length > 0,
+    disagreement,
+    candidates
+  };
+}
+
+function isEsp32NodeId(value) {
+  return cleanText(value).toLowerCase().startsWith("esp32-");
+}
+
+function normalizeAssignmentAuthority(value, fallback = "legacy_unknown") {
+  const authority = cleanText(value).toLowerCase();
+  return ASSIGNMENT_AUTHORITIES.includes(authority) ? authority : fallback;
+}
+
+function assignmentAuthorityProtectsServerState(value) {
+  return ["device_bootstrap", "operator_explicit", "resident_deleted", "legacy_unknown"].includes(
+    normalizeAssignmentAuthority(value)
+  );
+}
+
+function isCompleteFirmwareAssignment(payload, diagnostics = normalizeJsonObject(payload?.diagnostics)) {
+  const reported = normalizeReportedSetupState(payload, diagnostics);
+  const residentName = cleanText(payload?.residentName ?? diagnostics?.residentName);
+  const locationName = cleanText(payload?.locationName ?? diagnostics?.locationName);
+  const roomName = cleanText(payload?.roomName ?? diagnostics?.roomName);
+  return reported.state === "assigned" &&
+    residentName && normalizeForMatch(residentName) !== "unassigned" &&
+    locationName && !normalizeForMatch(locationName).startsWith("unassigned") &&
+    roomName;
+}
+
+const SAFE_DIAGNOSTIC_KEYS = new Set([
+  "nodeId", "sensorId", "sourceKey", "reportedSourceKey", "conflictingNodeId", "conflictingSensorId",
+  "canonicalSensorId", "canonicalSourceKey", "retiredSensorId", "retiredSourceKey", "aliasCount", "reason",
+  "field", "state", "reportedState", "storedState", "assignmentAuthority", "commandId", "commandType",
+  "runner", "route", "oldStatus", "newStatus", "submittedStatus", "healthAgeSeconds", "lastKnownPresenceState",
+  "lastKnownPresenceAt", "diagnosticState", "archivedNodeCount", "inactiveSensorCount", "deletedSensorCount",
+  "rowCount", "oldestTimestamp", "newestTimestamp", "requestedAt", "pickedUpAt", "accepted", "late"
+]);
+
+function logStructuredDiagnostic(code, severity = "info", details = {}) {
+  try {
+    const safeDetails = {};
+    for (const [key, value] of Object.entries(normalizeJsonObject(details))) {
+      if (!SAFE_DIAGNOSTIC_KEYS.has(key)) continue;
+      if (value === null || ["string", "number", "boolean"].includes(typeof value)) safeDetails[key] = value;
+    }
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      serverVersion: "12.0.0-phase1",
+      code: cleanText(code) || "PHASE1_DIAGNOSTIC",
+      severity: cleanText(severity) || "info",
+      details: safeDetails
+    }));
+  } catch {
+    // Diagnostics are best-effort and must never fail a valid request.
+  }
+}
+
+function commandOwnerFor(nodeId, commandType) {
+  const type = cleanText(commandType).toLowerCase();
+  if (isEsp32NodeId(nodeId)) return ESP32_SENSOR_COMMAND_TYPES.includes(type) ? "sensor" : null;
+  if (WATCHDOG_COMMAND_TYPES.includes(type)) return "watchdog";
+  if (MONITOR_COMMAND_TYPES.includes(type)) return "monitor";
+  return null;
+}
+
+function commandTypesForRunner(runner) {
+  if (runner === "monitor") return MONITOR_COMMAND_TYPES;
+  if (runner === "watchdog") return WATCHDOG_COMMAND_TYPES;
+  return null;
+}
+
+function isTerminalCommandStatus(status) {
+  return status === "success" || status === "failed";
+}
+
 function isAssignedSensorRow(row) {
   if (!row) {
     return false;
@@ -1022,32 +1125,25 @@ function buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNo
   const nodeLastSeenAt = nodeId ? (nodeLastSeenByNodeId.get(nodeId) || null) : null;
   const healthCheckedInAt = health?.checkedInAt || null;
 
-  const motionIsFresh = isRecentMotionEvent(latestSensorMotionEvent);
-  const nodeEventDate = nodeLastSeenAt ? new Date(nodeLastSeenAt) : null;
-  const nodeEventIsFresh = Boolean(
-    nodeEventDate &&
-    !Number.isNaN(nodeEventDate.getTime()) &&
-    nodeEventDate.getTime() >= Date.now() - (AI_SENSOR_EVENT_ONLINE_GRACE_SECONDS * 1000)
+  const healthDate = healthCheckedInAt ? new Date(healthCheckedInAt) : null;
+  const healthIsOnline = Boolean(
+    healthDate &&
+    !Number.isNaN(healthDate.getTime()) &&
+    healthDate.getTime() >= Date.now() - (NODE_OFFLINE_AFTER_SECONDS * 1000)
   );
-  const healthIsOnline = health ? health.isOnline === true : false;
 
   const candidateLastSeen = [healthCheckedInAt, nodeLastSeenAt, latestMotionAt]
     .map((value) => ({ value, date: value ? new Date(value) : null }))
     .filter((item) => item.date && !Number.isNaN(item.date.getTime()))
     .sort((first, second) => second.date.getTime() - first.date.getTime())[0];
 
-  let onlineSource = null;
-  if (healthIsOnline) onlineSource = "heartbeat";
-  else if (nodeEventIsFresh) onlineSource = "sensor_event";
-  else if (motionIsFresh) onlineSource = "motion";
-
-  if (healthIsOnline || nodeEventIsFresh || motionIsFresh) {
+  if (healthIsOnline) {
     return {
       isOnline: true,
       wifiRssi: health?.wifiRssi ?? null,
       lastSeenAt: candidateLastSeen?.value || null,
       latestMotionAt,
-      onlineSource
+      onlineSource: "heartbeat"
     };
   }
 
@@ -1057,7 +1153,7 @@ function buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNo
       wifiRssi: health?.wifiRssi ?? null,
       lastSeenAt: candidateLastSeen?.value || null,
       latestMotionAt,
-      onlineSource: healthCheckedInAt ? "heartbeat" : (nodeLastSeenAt ? "sensor_event" : null)
+      onlineSource: null
     };
   }
 
@@ -1066,7 +1162,7 @@ function buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNo
     wifiRssi: health?.wifiRssi ?? null,
     lastSeenAt: candidateLastSeen?.value || null,
     latestMotionAt,
-    onlineSource: latestMotionAt ? "motion" : null
+    onlineSource: null
   };
 }
 
@@ -1310,7 +1406,7 @@ function presenceEventRoomName(event, sensor) {
     "Unknown room";
 }
 
-function buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents) {
+function buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents, nodeHealthByNodeId) {
   const presenceSensors = residentSensors.filter((sensor) => {
     const sensorType = cleanText(sensor.sensorType).toLowerCase();
     const sourceKey = cleanText(sensor.sourceKey).toLowerCase();
@@ -1318,6 +1414,7 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
 
     return sensorType.includes("presence") ||
       sourceKey.startsWith("presence-") ||
+      sourceKey.startsWith("motion-presence-") ||
       sourceName.includes("presence");
   });
 
@@ -1344,12 +1441,41 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
     }
   }
 
-  const activePresenceEvents = [...latestBySourceKey.values()].filter((event) => presenceEventIsActive(event) === true);
   const latestPresenceEvent = residentPresenceEvents
     .slice()
     .sort((first, second) => new Date(second.timestamp).getTime() - new Date(first.timestamp).getTime())[0] || null;
-  const latestPresenceAt = latestPresenceEvent?.timestamp || null;
-  const latestPresenceState = latestPresenceEvent ? presenceEventIsActive(latestPresenceEvent) : null;
+  const lastKnownPresenceAt = latestPresenceEvent?.timestamp || null;
+  const lastKnownPresenceState = latestPresenceEvent ? presenceEventIsActive(latestPresenceEvent) : null;
+  const latestSensor = latestPresenceEvent
+    ? presenceSensors.find((sensor) => sensorMatchesMotionEvent(sensor, latestPresenceEvent))
+    : presenceSensors[0] || null;
+  const health = latestSensor?.nodeId ? nodeHealthByNodeId.get(cleanText(latestSensor.nodeId)) : null;
+  const healthDate = health?.checkedInAt ? new Date(health.checkedInAt) : null;
+  const healthIsFresh = Boolean(
+    healthDate &&
+    !Number.isNaN(healthDate.getTime()) &&
+    healthDate.getTime() >= Date.now() - (NODE_OFFLINE_AFTER_SECONDS * 1000)
+  );
+  const diagnosticState = readPayloadBoolean(normalizeJsonObject(health?.diagnostics), "presenceState");
+  const presenceIsFresh = Boolean(
+    latestPresenceEvent &&
+    healthIsFresh &&
+    diagnosticState !== null &&
+    diagnosticState === lastKnownPresenceState
+  );
+  let presenceFreshnessReason = "no_presence_sensor";
+  if (presenceSensors.length > 0 && !latestPresenceEvent) presenceFreshnessReason = "no_retained_presence_edge";
+  else if (presenceSensors.length > 0 && !health) presenceFreshnessReason = "missing_heartbeat";
+  else if (presenceSensors.length > 0 && !healthIsFresh) presenceFreshnessReason = "stale_heartbeat";
+  else if (presenceSensors.length > 0 && diagnosticState === null) presenceFreshnessReason = "missing_presence_diagnostic";
+  else if (presenceSensors.length > 0 && diagnosticState !== lastKnownPresenceState) presenceFreshnessReason = "heartbeat_event_disagreement";
+  else if (presenceIsFresh) presenceFreshnessReason = "fresh_heartbeat_corroborates_last_edge";
+
+  const latestPresenceAt = lastKnownPresenceAt;
+  const latestPresenceState = presenceIsFresh ? lastKnownPresenceState : null;
+  const activePresenceEvents = presenceIsFresh && latestPresenceState === true
+    ? [latestPresenceEvent]
+    : [];
 
   const currentPresenceRooms = activePresenceEvents
     .map((event) => {
@@ -1368,9 +1494,22 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
   let presenceStatus = "No Presence Sensor";
   let presenceExplanation = "No human-presence sensor is assigned to this resident.";
 
-  if (presenceSensors.length > 0 && !latestPresenceEvent) {
-    presenceStatus = "No Presence Events";
-    presenceExplanation = "Human-presence sensor is assigned, but no presence event is available yet.";
+  if (presenceSensors.length > 0 && !presenceIsFresh) {
+    presenceStatus = "Presence Unknown";
+    presenceExplanation = latestPresenceEvent
+      ? `Last-known presence is retained, but current presence is unknown because ${presenceFreshnessReason.replaceAll("_", " ")}.`
+      : "Current presence is unknown because no retained presence edge is available.";
+    logStructuredDiagnostic("PRESENCE_STALE_OR_DISAGREED", "warning", {
+      nodeId: latestSensor?.nodeId || null,
+      sensorId: latestSensor?.id || null,
+      reason: presenceFreshnessReason,
+      healthAgeSeconds: healthDate && !Number.isNaN(healthDate.getTime())
+        ? Math.max(0, Math.floor((Date.now() - healthDate.getTime()) / 1000))
+        : null,
+      lastKnownPresenceState,
+      lastKnownPresenceAt,
+      diagnosticState
+    });
   } else if (presenceSensors.length > 0 && latestPresenceState === false) {
     presenceStatus = "Presence Clear";
     presenceExplanation = "Latest human-presence event says the monitored room is clear.";
@@ -1394,6 +1533,10 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
     presenceEventCount: residentPresenceEvents.length,
     latestPresenceAt,
     latestPresenceState,
+    lastKnownPresenceState,
+    lastKnownPresenceAt,
+    presenceIsFresh,
+    presenceFreshnessReason,
     currentPresenceRooms,
     activePresenceDurationMinutes,
     presenceStatus,
@@ -1836,7 +1979,7 @@ function buildAIStatusForResident({
 }
 
 async function buildAIMotionSummary() {
-  const [residentResult, sensorResult, eventResult, presenceEventResult, motionEventResult, nodeHealthResult, nodeResult, actionLogResult] = await Promise.all([
+  const [residentResult, sensorResult, eventResult, presenceEventResult, motionEventResult, nodeHealthResult, nodeResult, actionLogResult, excludedResult] = await Promise.all([
     pool.query(`
       ${residentSelectSQL()}
       WHERE is_deleted = FALSE
@@ -1845,17 +1988,34 @@ async function buildAIMotionSummary() {
     pool.query(`
       ${sensorSelectSQL()}
       WHERE is_deleted = FALSE
+        AND is_active = TRUE
+        AND EXISTS (
+          SELECT 1 FROM nodes n
+          WHERE n.node_id = sensors.node_id
+            AND n.is_archived = FALSE
+        )
       ORDER BY resident_name ASC, room_name ASC NULLS LAST, source_name ASC
     `),
     pool.query(`
       ${eventSelectSQL()}
+      WHERE node_id IS NULL
+        OR node_id NOT LIKE 'esp32-%'
+        OR EXISTS (SELECT 1 FROM nodes n WHERE n.node_id = webhook_events.node_id AND n.is_archived = FALSE)
       ORDER BY timestamp DESC
       LIMIT 200
     `),
     pool.query(`
       ${eventSelectSQL()}
-      WHERE event_type IN ('presence_detected', 'presence_cleared')
-        OR sensor_type IN ('human_presence', 'presence')
+      WHERE (event_type IN ('presence_detected', 'presence_cleared')
+        OR sensor_type IN ('human_presence', 'presence'))
+        AND EXISTS (
+          SELECT 1 FROM sensors s
+          JOIN nodes n ON n.node_id = s.node_id
+          WHERE s.node_id = webhook_events.node_id
+            AND s.is_active = TRUE
+            AND s.is_deleted = FALSE
+            AND n.is_archived = FALSE
+        )
       ORDER BY timestamp DESC
       LIMIT $1
     `, [AI_MOTION_HISTORY_EVENT_LIMIT]),
@@ -1863,6 +2023,14 @@ async function buildAIMotionSummary() {
       `
       ${motionEventSelectSQL()}
       WHERE event_timestamp >= NOW() - ($1::int * INTERVAL '1 day')
+        AND EXISTS (
+          SELECT 1 FROM sensors s
+          JOIN nodes n ON n.node_id = s.node_id
+          WHERE s.id = motion_events.sensor_id
+            AND s.is_active = TRUE
+            AND s.is_deleted = FALSE
+            AND n.is_archived = FALSE
+        )
       ORDER BY event_timestamp DESC
       LIMIT $2
       `,
@@ -1870,6 +2038,7 @@ async function buildAIMotionSummary() {
     ),
     pool.query(`
       ${nodeHealthSelectSQL()}
+      WHERE EXISTS (SELECT 1 FROM nodes n WHERE n.node_id = node_health.node_id AND n.is_archived = FALSE)
       ORDER BY checked_in_at DESC
     `),
     pool.query(`
@@ -1883,8 +2052,22 @@ async function buildAIMotionSummary() {
       ${aiActionLogSelectSQL()}
       ORDER BY created_at DESC
       LIMIT 500
+    `),
+    pool.query(`
+      SELECT
+        COUNT(DISTINCT n.node_id) FILTER (WHERE n.is_archived = TRUE)::int AS "archivedNodeCount",
+        COUNT(s.id) FILTER (WHERE s.is_active = FALSE AND s.is_deleted = FALSE)::int AS "inactiveSensorCount",
+        COUNT(s.id) FILTER (WHERE s.is_deleted = TRUE)::int AS "deletedSensorCount"
+      FROM nodes n
+      LEFT JOIN sensors s ON s.node_id = n.node_id
+      WHERE n.node_id LIKE 'esp32-%'
     `)
   ]);
+
+  const excluded = excludedResult.rows[0] || {};
+  if ((excluded.archivedNodeCount || 0) + (excluded.inactiveSensorCount || 0) + (excluded.deletedSensorCount || 0) > 0) {
+    logStructuredDiagnostic("ARCHIVED_INACTIVE_EXCLUDED", "info", excluded);
+  }
 
   const sensors = sensorResult.rows;
   const events = eventResult.rows;
@@ -1957,7 +2140,11 @@ async function buildAIMotionSummary() {
         eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
     }).length;
     const roomIntelligence = buildResidentRoomIntelligence(residentSensors, residentMotionEvents);
-    const presenceIntelligence = buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents);
+    const presenceIntelligence = buildResidentPresenceIntelligence(
+      residentSensors,
+      residentPresenceEvents,
+      nodeHealthByNodeId
+    );
     const sensorStatusById = new Map(
       residentSensors.map((sensor) => {
         return [
@@ -2595,19 +2782,9 @@ function normalizeNodeCommandType(value) {
   const commandType = cleanText(value).toLowerCase();
 
   const allowedCommands = new Set([
-    "ping",
-    "reload_cameras",
-    "restart_monitors",
-    "ffmpeg_check",
-    "diagnostic_report",
-    "clear_last_error",
-    "rtsp_test",
-    "factory_reset",
-    "reconfigure",
-    "reboot",
-    "identify",
-    "locate",
-    "update_firmware"
+    ...ESP32_SENSOR_COMMAND_TYPES,
+    ...MONITOR_COMMAND_TYPES,
+    ...WATCHDOG_COMMAND_TYPES
   ]);
 
   return allowedCommands.has(commandType) ? commandType : null;
@@ -2988,6 +3165,7 @@ function sensorSelectSQL() {
       location_name AS "locationName",
       room_name AS "roomName",
       setup_state AS "setupState",
+      assignment_authority AS "assignmentAuthority",
       is_active AS "isActive",
       is_deleted AS "isDeleted",
       deleted_at AS "deletedAt",
@@ -3010,6 +3188,7 @@ function sensorReturningSQL() {
       location_name AS "locationName",
       room_name AS "roomName",
       setup_state AS "setupState",
+      assignment_authority AS "assignmentAuthority",
       is_active AS "isActive",
       is_deleted AS "isDeleted",
       deleted_at AS "deletedAt",
@@ -3100,6 +3279,7 @@ async function getResidentById(residentId) {
 async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
   const resolvedSourceKey = cleanText(sourceKey);
   const resolvedNodeId = cleanText(nodeId);
+  const lookupSourceKey = isEsp32NodeId(resolvedNodeId) ? "" : resolvedSourceKey;
 
   if (!resolvedSourceKey && !resolvedNodeId) {
     return null;
@@ -3152,7 +3332,7 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
     ORDER BY drm.priority ASC, drm.match_updated_at DESC
     LIMIT 1
     `,
-    [resolvedSourceKey, resolvedNodeId]
+    [lookupSourceKey, resolvedNodeId]
   );
 
   return result.rows[0] || null;
@@ -3162,6 +3342,7 @@ async function getResidentForExistingDeviceIdentity({ sourceKey, nodeId }) {
 async function getExistingSensorForDeviceIdentity({ sourceKey, nodeId }) {
   const resolvedSourceKey = cleanText(sourceKey);
   const resolvedNodeId = cleanText(nodeId);
+  const lookupSourceKey = isEsp32NodeId(resolvedNodeId) ? "" : resolvedSourceKey;
 
   if (!resolvedSourceKey && !resolvedNodeId) {
     return null;
@@ -3178,7 +3359,7 @@ async function getExistingSensorForDeviceIdentity({ sourceKey, nodeId }) {
     ORDER BY updated_at DESC
     LIMIT 1
     `,
-    [resolvedSourceKey, resolvedNodeId]
+    [lookupSourceKey, resolvedNodeId]
   );
 
   return result.rows[0] || null;
@@ -3189,7 +3370,8 @@ function sensorIsExplicitlyUnassigned(sensor) {
     return false;
   }
 
-  return !sensor.residentId &&
+  return assignmentAuthorityProtectsServerState(sensor.assignmentAuthority) &&
+    !sensor.residentId &&
     normalizeForMatch(sensor.residentName) === "unassigned" &&
     normalizeSetupState(sensor.setupState) === "unassigned";
 }
@@ -3218,7 +3400,9 @@ async function upsertNodeFromRegistration({
   softwareVersion,
   wifiSsid,
   wifiRssi,
-  setupState
+  setupState,
+  assignmentState,
+  diagnostics
 }) {
   const resolvedNodeId = cleanText(nodeId);
 
@@ -3238,7 +3422,13 @@ async function upsertNodeFromRegistration({
   const resolvedSoftwareVersion = cleanText(softwareVersion) || null;
   const resolvedWifiSsid = cleanOptionalText(wifiSsid);
   const resolvedWifiRssi = Number.isFinite(Number(wifiRssi)) ? Number(wifiRssi) : null;
-  const resolvedSetupState = normalizeSetupState(setupState || resolvedStatus);
+  const reportedSetup = normalizeReportedSetupState({ setupState, assignmentState, diagnostics });
+  const resolvedSetupState = reportedSetup.state || normalizeSetupState(resolvedStatus);
+  if (reportedSetup.disagreement) {
+    logStructuredDiagnostic("ASSIGNMENT_PAYLOAD_DISAGREEMENT", "warning", {
+      nodeId: resolvedNodeId, field: reportedSetup.field, state: reportedSetup.state
+    });
+  }
 
   const result = await pool.query(
     `
@@ -3405,7 +3595,8 @@ async function syncNodeHealthMetadataBestEffort({
   wifiSsid,
   wifiRssi,
   setupState,
-  diagnostics
+  diagnostics,
+  assignmentPayload
 }) {
   let resolvedNodeName = nodeName;
   let resolvedLocationName = locationName;
@@ -3418,17 +3609,20 @@ async function syncNodeHealthMetadataBestEffort({
     sourceKey: resolvedDiagnostics?.sourceKey,
     nodeId
   });
-  const preserveNodeUnassignedState = sensorIsExplicitlyUnassigned(existingIdentitySensor);
+  const preserveServerAssignment = Boolean(
+    existingIdentitySensor && assignmentAuthorityProtectsServerState(existingIdentitySensor.assignmentAuthority)
+  );
+  const preserveNodeUnassignedState = preserveServerAssignment && sensorIsExplicitlyUnassigned(existingIdentitySensor);
 
-  if (preserveNodeUnassignedState) {
+  if (preserveServerAssignment) {
     resolvedNodeName = existingIdentitySensor?.sourceName || "Unassigned Sensor";
-    resolvedLocationName = "Unassigned Location";
-    resolvedSetupState = "unassigned";
-    resolvedDiagnostics.residentName = "Unassigned";
-    resolvedDiagnostics.locationName = "Unassigned Location";
-    resolvedDiagnostics.roomName = "";
-    resolvedDiagnostics.assignmentState = "Unassigned";
-    resolvedDiagnostics.setupState = "unassigned";
+    resolvedLocationName = existingIdentitySensor?.locationName || "Unassigned Location";
+    resolvedSetupState = existingIdentitySensor?.setupState || "unassigned";
+    resolvedDiagnostics.residentName = existingIdentitySensor?.residentName || "Unassigned";
+    resolvedDiagnostics.locationName = resolvedLocationName;
+    resolvedDiagnostics.roomName = existingIdentitySensor?.roomName || "";
+    resolvedDiagnostics.assignmentState = resolvedSetupState === "assigned" ? "Assigned" : "Unassigned";
+    resolvedDiagnostics.setupState = resolvedSetupState;
   }
 
   await upsertNodeFromRegistration({
@@ -3458,17 +3652,20 @@ async function syncNodeHealthMetadataBestEffort({
       sourceKey: resolvedDiagnostics.sourceKey,
       nodeId
     });
-    const preserveUnassignedState =
-      preserveNodeUnassignedState || sensorIsExplicitlyUnassigned(existingSensor);
+    const existingAuthority = existingSensor
+      ? normalizeAssignmentAuthority(existingSensor.assignmentAuthority)
+      : "never_assigned";
+    const canBootstrap = existingAuthority === "never_assigned" &&
+      isCompleteFirmwareAssignment(assignmentPayload || { diagnostics: resolvedDiagnostics });
 
-    let resident = preserveUnassignedState
-      ? null
-      : await getResidentForExistingDeviceIdentity({
+    let resident = existingSensor?.residentId
+      ? await getResidentForExistingDeviceIdentity({
           sourceKey: resolvedDiagnostics.sourceKey,
           nodeId
-        });
+        })
+      : null;
 
-    if (!resident && !preserveUnassignedState) {
+    if (!resident && canBootstrap) {
       resident = await findOrCreateResidentFromEvent({
         residentName: heartbeatResidentName,
         locationName: heartbeatLocationName,
@@ -3480,21 +3677,24 @@ async function syncNodeHealthMetadataBestEffort({
     await upsertSensorFromEvent({
       nodeId,
       sourceKey: resolvedDiagnostics.sourceKey,
-      sourceName: preserveUnassignedState
+      sourceName: preserveServerAssignment
         ? (existingSensor?.sourceName || heartbeatSourceName)
         : heartbeatSourceName,
       sensorType:
         resolvedDiagnostics.sensorMode ||
         resolvedDiagnostics.sensorType ||
         heartbeatDeviceName,
+      sensorMode: resolvedDiagnostics.sensorMode,
       resident,
-      residentName: preserveUnassignedState
+      residentName: preserveServerAssignment
         ? "Unassigned"
         : (resident?.name || heartbeatResidentName),
-      locationName: preserveUnassignedState
+      locationName: preserveServerAssignment
         ? "Unassigned location"
         : (resident?.location || heartbeatLocationName),
-      forceUnassigned: preserveUnassignedState
+      forceUnassigned: preserveNodeUnassignedState,
+      allowDeviceBootstrap: true,
+      assignmentPayload: assignmentPayload || { diagnostics: resolvedDiagnostics }
     });
   }
 
@@ -3557,7 +3757,13 @@ async function upsertNodeHealth(payload) {
   )
     ? Number(payload?.wifiRssi ?? payload?.rssi ?? diagnostics?.wifiRssi ?? diagnostics?.rssi)
     : null;
-  const setupState = normalizeSetupState(payload?.setupState ?? diagnostics?.setupState);
+  const reportedSetup = normalizeReportedSetupState(payload, diagnostics);
+  const setupState = reportedSetup.state || "unassigned";
+  if (reportedSetup.disagreement) {
+    logStructuredDiagnostic("ASSIGNMENT_PAYLOAD_DISAGREEMENT", "warning", {
+      nodeId, field: reportedSetup.field, state: reportedSetup.state
+    });
+  }
   const lastErrorAt = lastError ? new Date().toISOString() : null;
 
   // Heartbeat reliability rule:
@@ -3697,7 +3903,8 @@ async function upsertNodeHealth(payload) {
       wifiSsid,
       wifiRssi,
       setupState,
-      diagnostics
+      diagnostics,
+      assignmentPayload: payload
     }).catch((error) => {
       console.error("Node health secondary metadata sync failed:", {
         nodeId,
@@ -3710,6 +3917,9 @@ async function upsertNodeHealth(payload) {
 }
 
 async function createCommand({ nodeId, commandType, payload, requestedBy }) {
+  if (!commandOwnerFor(nodeId, commandType)) {
+    throw new Error("Command type is not supported for this target");
+  }
   const result = await pool.query(
     `
     INSERT INTO node_commands (
@@ -3874,15 +4084,73 @@ function inferRoomNameFromSourceName(sourceName) {
   return null;
 }
 
+function resolvedCanonicalSensorType(existingSensor, sensorMode, sensorType) {
+  if (displaySensorTypeForValue(existingSensor?.sensorType, "") === "Motion + Presence Sensor") {
+    return "Motion + Presence Sensor";
+  }
+  const normalizedMode = normalizedSensorModeForValue(sensorMode, "");
+  if (normalizedMode) return displaySensorTypeForValue(normalizedMode, existingSensor?.sensorType || "Motion Sensor");
+  return displaySensorTypeForValue(sensorType, existingSensor?.sensorType || "Motion Sensor");
+}
+
+async function resolveCanonicalEsp32Sensor(client, { nodeId, reportedSourceKey }) {
+  const resolvedNodeId = cleanText(nodeId);
+  const resolvedReportedKey = cleanText(reportedSourceKey);
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`sensor-identity:${resolvedNodeId}`]);
+
+  const keyOwnerResult = resolvedReportedKey
+    ? await client.query(`${sensorSelectSQL()} WHERE source_key = $1 LIMIT 1`, [resolvedReportedKey])
+    : { rows: [] };
+  const keyOwner = keyOwnerResult.rows[0] || null;
+  if (keyOwner && cleanText(keyOwner.nodeId) && cleanText(keyOwner.nodeId) !== resolvedNodeId) {
+    logStructuredDiagnostic("IDENTITY_SOURCE_CONFLICT", "warning", {
+      nodeId: resolvedNodeId,
+      reportedSourceKey: resolvedReportedKey,
+      conflictingNodeId: keyOwner.nodeId,
+      conflictingSensorId: keyOwner.id
+    });
+  }
+
+  const rowsResult = await client.query(
+    `${sensorSelectSQL()}
+     WHERE node_id = $1
+     ORDER BY
+       is_deleted ASC,
+       CASE assignment_authority
+         WHEN 'operator_explicit' THEN 0
+         WHEN 'resident_deleted' THEN 1
+         WHEN 'device_bootstrap' THEN 2
+         WHEN 'legacy_unknown' THEN 3
+         ELSE 4
+       END,
+       CASE WHEN resident_id IS NOT NULL OR setup_state = 'assigned' THEN 0 ELSE 1 END,
+       is_active DESC,
+       created_at ASC,
+       id ASC
+     FOR UPDATE`,
+    [resolvedNodeId]
+  );
+
+  let canonical = rowsResult.rows[0] || null;
+  if (!canonical && keyOwner && cleanText(keyOwner.nodeId) === resolvedNodeId) canonical = keyOwner;
+  if (!canonical && keyOwner && cleanText(keyOwner.nodeId) !== resolvedNodeId) {
+    throw new SensorAssignmentConflictError(`Source key is already owned by another node: ${resolvedReportedKey}`);
+  }
+  return { canonical, rows: rowsResult.rows, keyOwner };
+}
+
 async function upsertSensorFromEvent({
   nodeId,
   sourceKey,
   sourceName,
   sensorType,
+  sensorMode,
   resident,
   residentName,
   locationName,
-  forceUnassigned = false
+  forceUnassigned = false,
+  allowDeviceBootstrap = false,
+  assignmentPayload = null
 }) {
   const resolvedSourceKey = cleanText(sourceKey);
 
@@ -3901,6 +4169,126 @@ async function upsertSensorFromEvent({
   const resolvedRoomName = forceUnassigned
     ? null
     : inferRoomNameFromSourceName(resolvedSourceName);
+
+  if (isEsp32NodeId(nodeId)) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const identity = await resolveCanonicalEsp32Sensor(client, {
+        nodeId,
+        reportedSourceKey: resolvedSourceKey
+      });
+      const existing = identity.canonical;
+      const existingAuthority = existing
+        ? normalizeAssignmentAuthority(existing.assignmentAuthority)
+        : "never_assigned";
+      const canBootstrap = allowDeviceBootstrap &&
+        existingAuthority === "never_assigned" &&
+        isCompleteFirmwareAssignment(assignmentPayload || {});
+      const protectedState = Boolean(existing && assignmentAuthorityProtectsServerState(existingAuthority));
+      const assignmentAuthority = canBootstrap ? "device_bootstrap" : existingAuthority;
+      const canonicalSensorType = resolvedCanonicalSensorType(existing, sensorMode, sensorType);
+      const mustRemainUnassigned = forceUnassigned || (!existing && !canBootstrap);
+
+      const nextResidentId = protectedState || (existing && !canBootstrap)
+        ? existing.residentId
+        : (mustRemainUnassigned ? null : (resident?.id || null));
+      const nextResidentName = protectedState || (existing && !canBootstrap)
+        ? existing.residentName
+        : (mustRemainUnassigned ? "Unassigned" : resolvedResidentName);
+      const nextLocationName = protectedState || (existing && !canBootstrap)
+        ? existing.locationName
+        : (mustRemainUnassigned ? "Unassigned location" : resolvedLocationName);
+      const nextRoomName = protectedState || (existing && !canBootstrap)
+        ? existing.roomName
+        : (mustRemainUnassigned ? null : resolvedRoomName);
+      const nextSetupState = nextResidentId ||
+        (normalizeForMatch(nextResidentName) !== "unassigned" && cleanText(nextResidentName)) ||
+        cleanText(nextRoomName)
+        ? "assigned"
+        : "unassigned";
+      const nextSourceName = protectedState || (existing && !canBootstrap)
+        ? existing.sourceName
+        : resolvedSourceName;
+
+      let result;
+      if (existing) {
+        result = await client.query(
+          `UPDATE sensors SET
+             source_name = $2,
+             sensor_type = $3,
+             resident_id = $4,
+             resident_name = $5,
+             location_name = $6,
+             room_name = $7,
+             setup_state = $8,
+             assignment_authority = $9,
+             is_active = TRUE,
+             is_deleted = FALSE,
+             deleted_at = NULL,
+             updated_at = NOW()
+           WHERE id = $1
+           ${sensorReturningSQL()}`,
+          [existing.id, nextSourceName, canonicalSensorType, nextResidentId, nextResidentName,
+            nextLocationName, nextRoomName, nextSetupState, assignmentAuthority]
+        );
+      } else {
+        result = await client.query(
+          `INSERT INTO sensors (
+             id, node_id, source_key, source_name, sensor_type, resident_id, resident_name,
+             location_name, room_name, setup_state, assignment_authority, is_active, is_deleted,
+             deleted_at, created_at, updated_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,FALSE,NULL,NOW(),NOW())
+           ${sensorReturningSQL()}`,
+          [randomUUID(), cleanText(nodeId), resolvedSourceKey, nextSourceName, canonicalSensorType,
+            nextResidentId, nextResidentName, nextLocationName, nextRoomName, nextSetupState, assignmentAuthority]
+        );
+      }
+
+      const canonical = result.rows[0];
+      const retiredResult = await client.query(
+        `UPDATE sensors SET
+           is_active = FALSE,
+           is_deleted = TRUE,
+           deleted_at = COALESCE(deleted_at, NOW()),
+           updated_at = NOW()
+         WHERE node_id = $1 AND id <> $2 AND (is_active = TRUE OR is_deleted = FALSE)
+         RETURNING id, source_key AS "sourceKey"`,
+        [cleanText(nodeId), canonical.id]
+      );
+      if (retiredResult.rows.length > 0) {
+        logStructuredDiagnostic("IDENTITY_MULTIPLE_ACTIVE", "warning", {
+          nodeId: cleanText(nodeId), canonicalSensorId: canonical.id,
+          canonicalSourceKey: canonical.sourceKey, aliasCount: retiredResult.rows.length
+        });
+        for (const retired of retiredResult.rows) {
+          logStructuredDiagnostic("IDENTITY_ALIAS_RETIRED", "info", {
+            nodeId: cleanText(nodeId), canonicalSensorId: canonical.id,
+            canonicalSourceKey: canonical.sourceKey, retiredSensorId: retired.id,
+            retiredSourceKey: retired.sourceKey, reason: "mode_alias"
+          });
+        }
+      }
+      if (protectedState && assignmentPayload) {
+        const reported = normalizeReportedSetupState(assignmentPayload);
+        if ((reported.present && reported.state !== existing.setupState) ||
+            (cleanText(assignmentPayload?.residentName ?? assignmentPayload?.diagnostics?.residentName) &&
+             normalizeForMatch(assignmentPayload?.residentName ?? assignmentPayload?.diagnostics?.residentName) !== normalizeForMatch(existing.residentName))) {
+          logStructuredDiagnostic("ASSIGNMENT_SERVER_DEVICE_DISAGREEMENT", "warning", {
+            nodeId: cleanText(nodeId), sensorId: canonical.id, assignmentAuthority,
+            reportedState: reported.state, storedState: existing.setupState
+          });
+        }
+      }
+      await client.query("COMMIT");
+      return canonical;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 
   const result = await pool.query(
     `
@@ -4226,18 +4614,27 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
       throw new Error(`Node not found: ${resolvedNodeId}`);
     }
 
-    const existingNodeSensorResult = await client.query(
-      `
-      ${sensorSelectSQL()}
-      WHERE node_id = $1
-        AND is_deleted = FALSE
-      ORDER BY created_at ASC
-      LIMIT 1
-      FOR UPDATE
-      `,
-      [resolvedNodeId]
-    );
-    const existingNodeSensor = existingNodeSensorResult.rows[0] || null;
+    let existingNodeSensor = null;
+    if (isEsp32NodeId(resolvedNodeId)) {
+      const identity = await resolveCanonicalEsp32Sensor(client, {
+        nodeId: resolvedNodeId,
+        reportedSourceKey: requestedSourceKey
+      });
+      existingNodeSensor = identity.canonical;
+    } else {
+      const existingNodeSensorResult = await client.query(
+        `
+        ${sensorSelectSQL()}
+        WHERE node_id = $1
+          AND is_deleted = FALSE
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [resolvedNodeId]
+      );
+      existingNodeSensor = existingNodeSensorResult.rows[0] || null;
+    }
 
     if (requestedSourceKey) {
       const requestedSourceResult = await client.query(
@@ -4286,13 +4683,14 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
         location_name,
         room_name,
         setup_state,
+        assignment_authority,
         is_active,
         is_deleted,
         deleted_at,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, FALSE, NULL, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'operator_explicit', TRUE, FALSE, NULL, NOW(), NOW())
       ON CONFLICT (source_key)
       DO UPDATE SET
         node_id = EXCLUDED.node_id,
@@ -4303,6 +4701,7 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
         location_name = EXCLUDED.location_name,
         room_name = EXCLUDED.room_name,
         setup_state = EXCLUDED.setup_state,
+        assignment_authority = 'operator_explicit',
         is_active = TRUE,
         is_deleted = FALSE,
         deleted_at = NULL,
@@ -4418,6 +4817,9 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
 }
 
 async function createSensorCommand({ nodeId, commandType, payload, requestedBy, supersedeExisting = true }) {
+  if (!isEsp32NodeId(nodeId) || !ESP32_SENSOR_COMMAND_TYPES.includes(commandType)) {
+    throw new Error("ESP32 sensor command requires an esp32-* target and firmware-owned command type");
+  }
   const client = await pool.connect();
   let didBegin = false;
 
@@ -4880,6 +5282,8 @@ app.patch("/events/:eventId/acknowledge", async (req, res) => {
     );
 
     if (!result.rows[0]) {
+      await client.query("ROLLBACK");
+      didBegin = false;
       return res.status(404).json({
         success: false,
         error: `Event not found: ${eventId}`
@@ -5120,6 +5524,13 @@ app.post("/node-commands", async (req, res) => {
       });
     }
 
+    if (!commandOwnerFor(nodeId, commandType)) {
+      return res.status(400).json({
+        success: false,
+        error: "Command type is not supported for this target"
+      });
+    }
+
     const existingNode = await getNodeById(nodeId);
 
     if (!existingNode) {
@@ -5163,11 +5574,27 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
     }
 
     const nodeId = cleanText(req.params.nodeId);
+    const runner = cleanText(req.query.runner).toLowerCase();
+    const allowedCommandTypes = commandTypesForRunner(runner);
 
     if (!nodeId) {
       return res.status(400).json({
         success: false,
         error: "Missing nodeId"
+      });
+    }
+
+    if (!allowedCommandTypes) {
+      return res.status(400).json({
+        success: false,
+        error: "runner must be monitor or watchdog"
+      });
+    }
+
+    if (isEsp32NodeId(nodeId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Generic runners cannot claim ESP32 sensor commands"
       });
     }
 
@@ -5182,9 +5609,10 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
         picked_up_at = NULL
       WHERE node_id = $1
         AND status = 'running'
+        AND command_type = ANY($2::text[])
         AND picked_up_at < NOW() - INTERVAL '5 minutes'
       `,
-      [nodeId]
+      [nodeId, allowedCommandTypes]
     );
 
     const pendingResult = await client.query(
@@ -5193,11 +5621,12 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
       FROM node_commands
       WHERE node_id = $1
         AND status = 'pending'
+        AND command_type = ANY($2::text[])
       ORDER BY requested_at ASC
       LIMIT 5
       FOR UPDATE SKIP LOCKED
       `,
-      [nodeId]
+      [nodeId, allowedCommandTypes]
     );
 
     const commandIds = pendingResult.rows.map((row) => row.command_id);
@@ -5228,6 +5657,18 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
       );
 
       commands = updateResult.rows;
+      for (const command of commands) {
+        logStructuredDiagnostic("COMMAND_CLAIM", "info", {
+          commandId: command.commandId,
+          nodeId,
+          commandType: command.commandType,
+          runner,
+          route: "node-commands-pending",
+          newStatus: "running",
+          requestedAt: command.requestedAt,
+          pickedUpAt: command.pickedUpAt
+        });
+      }
     }
 
     await client.query("COMMIT");
@@ -5255,6 +5696,8 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
 });
 
 app.post("/node-commands/:commandId/result", async (req, res) => {
+  const client = await pool.connect();
+  let didBegin = false;
   try {
     if (!requireAuthorizedRequest(req, res)) {
       return;
@@ -5272,19 +5715,59 @@ app.post("/node-commands/:commandId/result", async (req, res) => {
       });
     }
 
-    if (status !== "success" && status !== "failed") {
+    if (!["running", "success", "failed"].includes(status)) {
       return res.status(400).json({
         success: false,
-        error: "Command result status must be success or failed"
+        error: "Command result status must be running, success, or failed"
       });
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+    didBegin = true;
+
+    const existingResult = await client.query(
+      `${nodeCommandSelectSQL()} WHERE command_id = $1 FOR UPDATE`,
+      [commandId]
+    );
+    const existingCommand = existingResult.rows[0] || null;
+    if (!existingCommand) {
+      await client.query("ROLLBACK");
+      didBegin = false;
+      return res.status(404).json({ success: false, error: `Command not found: ${commandId}` });
+    }
+
+    if (isTerminalCommandStatus(existingCommand.status)) {
+      await client.query("COMMIT");
+      didBegin = false;
+      logStructuredDiagnostic("COMMAND_LATE_RESULT", "warning", {
+        commandId,
+        nodeId: existingCommand.nodeId,
+        commandType: existingCommand.commandType,
+        oldStatus: existingCommand.status,
+        submittedStatus: status,
+        route: "node-command-result",
+        accepted: false,
+        late: true
+      });
+      return res.status(200).json({ success: true, message: "Late command result ignored", command: existingCommand });
+    }
+
+    if (status === "running" && existingCommand.status !== "running") {
+      await client.query("ROLLBACK");
+      didBegin = false;
+      return res.status(400).json({
+        success: false,
+        error: "running is only valid for a command already claimed as running"
+      });
+    }
+
+    const result = await client.query(
       `
       UPDATE node_commands
       SET
         status = $2,
-        completed_at = NOW(),
+        completed_at = CASE WHEN $2 IN ('success', 'failed') THEN NOW() ELSE NULL END,
+        picked_up_at = COALESCE(picked_up_at, NOW()),
         result = $3::jsonb,
         error = $4
       WHERE command_id = $1
@@ -5316,6 +5799,20 @@ app.post("/node-commands/:commandId/result", async (req, res) => {
       });
     }
 
+
+    await client.query("COMMIT");
+    didBegin = false;
+    logStructuredDiagnostic("COMMAND_RESULT", "info", {
+      commandId,
+      nodeId: result.rows[0].nodeId,
+      commandType: result.rows[0].commandType,
+      oldStatus: existingCommand.status,
+      newStatus: status,
+      route: "node-command-result",
+      accepted: true,
+      late: false
+    });
+
     console.log("Node command result received:");
     console.log(JSON.stringify(result.rows[0], null, 2));
 
@@ -5325,11 +5822,14 @@ app.post("/node-commands/:commandId/result", async (req, res) => {
       command: result.rows[0]
     });
   } catch (error) {
+    if (didBegin) await client.query("ROLLBACK");
     console.error("Save node command result failed:", error);
     return res.status(500).json({
       success: false,
       error: error.message
     });
+  } finally {
+    client.release();
   }
 });
 
@@ -6101,6 +6601,7 @@ app.delete("/residents/:residentId", async (req, res) => {
           room_name = NULL,
           source_name = COALESCE(NULLIF(TRIM(sensor_type), ''), 'Sensor'),
           setup_state = 'unassigned',
+          assignment_authority = 'resident_deleted',
           is_active = TRUE,
           updated_at = NOW()
         WHERE is_deleted = FALSE
@@ -6513,6 +7014,22 @@ app.get("/sensor-inventory", async (req, res) => {
     const includeArchived = parseBooleanQuery(req.query.includeArchived);
     const includeDeleted = parseBooleanQuery(req.query.includeDeleted);
 
+    if (!includeArchived || !includeDeleted) {
+      const excludedResult = await pool.query(`
+        SELECT
+          COUNT(DISTINCT n.node_id) FILTER (WHERE n.is_archived = TRUE)::int AS "archivedNodeCount",
+          COUNT(s.id) FILTER (WHERE s.is_active = FALSE AND s.is_deleted = FALSE)::int AS "inactiveSensorCount",
+          COUNT(s.id) FILTER (WHERE s.is_deleted = TRUE)::int AS "deletedSensorCount"
+        FROM nodes n
+        LEFT JOIN sensors s ON s.node_id = n.node_id
+        WHERE n.node_id LIKE 'esp32-%'
+      `);
+      const excluded = excludedResult.rows[0] || {};
+      if ((excluded.archivedNodeCount || 0) + (excluded.inactiveSensorCount || 0) + (excluded.deletedSensorCount || 0) > 0) {
+        logStructuredDiagnostic("ARCHIVED_INACTIVE_EXCLUDED", "info", excluded);
+      }
+    }
+
     const result = await pool.query(
       `
       SELECT
@@ -6584,7 +7101,7 @@ app.get("/sensor-inventory", async (req, res) => {
       FROM nodes n
       LEFT JOIN node_health h ON h.node_id = n.node_id
       LEFT JOIN sensors s ON s.node_id = n.node_id
-        AND ($2::boolean = TRUE OR s.is_deleted = FALSE)
+        AND ($2::boolean = TRUE OR (s.is_deleted = FALSE AND s.is_active = TRUE))
       WHERE n.node_id LIKE 'esp32-%'
         AND ($1::boolean = TRUE OR n.is_archived = FALSE)
       ORDER BY
@@ -6840,6 +7357,11 @@ app.get("/sensors", async (req, res) => {
       ${sensorSelectSQL()}
       WHERE ($1::boolean = TRUE OR is_deleted = FALSE)
         AND ($2::boolean = FALSE OR is_active = TRUE)
+        AND ($2::boolean = FALSE OR EXISTS (
+          SELECT 1 FROM nodes n
+          WHERE n.node_id = sensors.node_id
+            AND n.is_archived = FALSE
+        ))
         AND ($3::text IS NULL OR resident_id::text = $3)
         AND ($4::text IS NULL OR node_id = $4)
       ORDER BY is_deleted ASC, source_name ASC, created_at ASC
@@ -6929,6 +7451,8 @@ app.get("/sensor-config/:nodeId", async (req, res) => {
       ${sensorSelectSQL()}
       WHERE node_id = $1
         AND is_deleted = FALSE
+        AND is_active = TRUE
+        AND EXISTS (SELECT 1 FROM nodes n WHERE n.node_id = sensors.node_id AND n.is_archived = FALSE)
       ORDER BY source_name ASC, created_at ASC
       `,
       [nodeId]
@@ -7063,6 +7587,13 @@ app.post("/sensor-commands", async (req, res) => {
           "reboot",
           "factory_reset"
         ]
+      });
+    }
+
+    if (!isEsp32NodeId(nodeId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Sensor commands require an esp32-* target"
       });
     }
 
@@ -7203,6 +7734,13 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
       });
     }
 
+    if (!isEsp32NodeId(nodeId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Sensor pending route requires an esp32-* target"
+      });
+    }
+
     await client.query("BEGIN");
     didBegin = true;
 
@@ -7217,7 +7755,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
         AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset')
         AND requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
       ORDER BY requested_at ASC
-      LIMIT 5
+      LIMIT 1
       FOR UPDATE SKIP LOCKED
       `,
       [nodeId, SENSOR_COMMAND_EXPIRATION_MINUTES]
@@ -7251,6 +7789,18 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
       );
 
       commands = updateResult.rows;
+      for (const command of commands) {
+        logStructuredDiagnostic("COMMAND_CLAIM", "info", {
+          commandId: command.commandId,
+          nodeId,
+          commandType: command.commandType,
+          runner: "sensor",
+          route: "sensor-commands-pending",
+          newStatus: "running",
+          requestedAt: command.requestedAt,
+          pickedUpAt: command.pickedUpAt
+        });
+      }
     }
 
     await client.query("COMMIT");
@@ -7298,22 +7848,64 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
       });
     }
 
-    if (status !== "success" && status !== "failed") {
+    if (!["running", "success", "failed"].includes(status)) {
       return res.status(400).json({
         success: false,
-        error: "Command result status must be success or failed"
+        error: "Command result status must be running, success, or failed"
       });
     }
 
     await client.query("BEGIN");
     didBegin = true;
 
+    const existingResult = await client.query(
+      `${nodeCommandSelectSQL()} WHERE command_id = $1 FOR UPDATE`,
+      [commandId]
+    );
+    const existingCommand = existingResult.rows[0] || null;
+
+    if (!existingCommand) {
+      await client.query("ROLLBACK");
+      didBegin = false;
+      return res.status(404).json({ success: false, error: `Command not found: ${commandId}` });
+    }
+
+    if (isTerminalCommandStatus(existingCommand.status)) {
+      await client.query("COMMIT");
+      didBegin = false;
+      logStructuredDiagnostic("COMMAND_LATE_RESULT", "warning", {
+        commandId,
+        nodeId: existingCommand.nodeId,
+        commandType: existingCommand.commandType,
+        oldStatus: existingCommand.status,
+        submittedStatus: status,
+        route: "sensor-command-result",
+        accepted: false,
+        late: true
+      });
+      return res.status(200).json({
+        success: true,
+        message: "Late sensor command result ignored",
+        command: existingCommand
+      });
+    }
+
+    if (status === "running" && existingCommand.status !== "running") {
+      await client.query("ROLLBACK");
+      didBegin = false;
+      return res.status(400).json({
+        success: false,
+        error: "running is only valid for a command already claimed as running"
+      });
+    }
+
     const result = await client.query(
       `
       UPDATE node_commands
       SET
         status = $2,
-        completed_at = NOW(),
+        picked_up_at = COALESCE(picked_up_at, NOW()),
+        completed_at = CASE WHEN $2 IN ('success', 'failed') THEN NOW() ELSE NULL END,
         result = $3::jsonb,
         error = $4
       WHERE command_id = $1
@@ -7338,35 +7930,20 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
       ]
     );
 
-    if (!result.rows[0]) {
-      await client.query("ROLLBACK");
-      didBegin = false;
-
-      return res.status(404).json({
-        success: false,
-        error: `Command not found: ${commandId}`
-      });
-    }
-
     const completedCommand = result.rows[0];
-
-    await client.query(
-      `
-      UPDATE node_commands
-      SET
-        status = 'failed',
-        completed_at = NOW(),
-        error = 'Cleared after sensor command result'
-      WHERE node_id = $1
-        AND command_id <> $2
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
-        AND status IN ('pending', 'running')
-      `,
-      [completedCommand.nodeId, commandId]
-    );
 
     await client.query("COMMIT");
     didBegin = false;
+    logStructuredDiagnostic("COMMAND_RESULT", "info", {
+      commandId,
+      nodeId: completedCommand.nodeId,
+      commandType: completedCommand.commandType,
+      oldStatus: existingCommand.status,
+      newStatus: status,
+      route: "sensor-command-result",
+      accepted: true,
+      late: false
+    });
 
     return res.status(200).json({
       success: true,
@@ -7592,6 +8169,13 @@ app.post("/firmware/update-node", async (req, res) => {
       });
     }
 
+    if (!isEsp32NodeId(nodeId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Firmware update commands require an esp32-* target"
+      });
+    }
+
     const node = await getNodeById(nodeId);
 
     if (!node) {
@@ -7782,28 +8366,40 @@ app.post("/webhook", async (req, res) => {
       sourceKey: resolvedSourceKey,
       nodeId: resolvedNodeId
     });
-    const preserveUnassignedState = sensorIsExplicitlyUnassigned(existingSensor);
+    const preserveServerAssignment = Boolean(
+      existingSensor && assignmentAuthorityProtectsServerState(existingSensor.assignmentAuthority)
+    );
+    const preserveUnassignedState = preserveServerAssignment && sensorIsExplicitlyUnassigned(existingSensor);
 
-    let resident = preserveUnassignedState
-      ? null
-      : await getResidentForExistingDeviceIdentity({
+    let resident = existingSensor?.residentId
+      ? await getResidentForExistingDeviceIdentity({
           sourceKey: resolvedSourceKey,
           nodeId: resolvedNodeId
-        });
+        })
+      : null;
 
     if (preserveUnassignedState) {
       resolvedResidentName = "Unassigned";
       resolvedLocationName = "Unassigned location";
-    } else if (resident) {
+    } else if (resident && preserveServerAssignment) {
       resolvedResidentName = resident.name;
       resolvedLocationName = resolvedLocationName || resident.location || "";
     } else {
-      resident = await findOrCreateResidentFromEvent({
-        residentName: resolvedResidentName,
-        locationName: resolvedLocationName,
-        alertLevel: resolvedAlertLevel,
-        message
-      });
+      // Webhook free text is never an assignment authority. A new/incomplete
+      // ESP32 remains never_assigned until a complete registration/heartbeat
+      // bootstrap or an authorized assignment action occurs.
+      if (isEsp32NodeId(resolvedNodeId)) {
+        resident = null;
+        resolvedResidentName = "Unassigned";
+        resolvedLocationName = "Unassigned location";
+      } else {
+        resident = await findOrCreateResidentFromEvent({
+          residentName: resolvedResidentName,
+          locationName: resolvedLocationName,
+          alertLevel: resolvedAlertLevel,
+          message
+        });
+      }
     }
 
     const sensor = await upsertSensorFromEvent({
@@ -7813,17 +8409,27 @@ app.post("/webhook", async (req, res) => {
         ? (existingSensor?.sourceName || resolvedSourceName)
         : resolvedSourceName,
       sensorType: resolvedSensorDisplayType,
+      sensorMode,
       resident,
       residentName: resolvedResidentName,
       locationName: resolvedLocationName,
-      forceUnassigned: preserveUnassignedState
+      forceUnassigned: preserveUnassignedState,
+      allowDeviceBootstrap: false,
+      assignmentPayload: fullWebhookPayload
     });
+
+    if (sensor && isEsp32NodeId(resolvedNodeId)) {
+      resolvedSourceName = sensor.sourceName;
+      resolvedResidentName = sensor.residentName;
+      resolvedLocationName = sensor.locationName;
+      resident = sensor.residentId ? await getResidentById(sensor.residentId) : null;
+    }
 
     const event = {
       id: randomUUID(),
       nodeId: resolvedNodeId || null,
       locationName: resolvedLocationName || null,
-      sourceKey: resolvedSourceKey || null,
+      sourceKey: sensor?.sourceKey || resolvedSourceKey || null,
       sourceName: resolvedSourceName,
       residentName: resolvedResidentName,
       message: String(message).trim(),
@@ -7899,18 +8505,13 @@ app.post("/webhook", async (req, res) => {
     // debounced. Scheduling it must not delay the sensor webhook response.
     scheduleAIDashboardRefresh();
 
-    await pool.query(
-      `
-      DELETE FROM webhook_events
-      WHERE id IN (
-        SELECT id
-        FROM webhook_events
-        ORDER BY timestamp DESC
-        OFFSET $1
-      )
-      `,
-      [MAX_EVENTS]
-    );
+    acceptedWebhookCountSinceStart += 1;
+    if (acceptedWebhookCountSinceStart === 1 || acceptedWebhookCountSinceStart % 100 === 0) {
+      logStructuredDiagnostic("EVENT_RETENTION_DEFERRED", "info", {
+        rowCount: acceptedWebhookCountSinceStart,
+        reason: "request_time_deletion_disabled"
+      });
+    }
 
     console.log("Webhook event received:");
     console.log(JSON.stringify(event, null, 2));
