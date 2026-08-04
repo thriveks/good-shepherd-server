@@ -38,7 +38,10 @@ const AI_PRESENCE_ACTIVE_WARNING_MINUTES = 240;
 const AI_PRESENCE_ACTIVE_CRITICAL_MINUTES = 480;
 const AI_DASHBOARD_CACHE_MAX_AGE_SECONDS = 30;
 const AI_DASHBOARD_REFRESH_DEBOUNCE_MS = 2000;
-const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
+// Recovery commands must survive a normal BLE setup/service window and brief
+// Wi-Fi registration recovery. Firmware still claims only one command per
+// poll, so extending delivery time does not increase execution fan-out.
+const SENSOR_COMMAND_EXPIRATION_MINUTES = 15;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const MONITOR_COMMAND_TYPES = ["ping", "ffmpeg_check", "diagnostic_report", "reload_cameras", "sync_cameras_from_cloud", "restart_monitors", "clear_last_error", "rtsp_test"];
 const WATCHDOG_COMMAND_TYPES = ["watchdog_ping", "watchdog_health", "start_local_monitor", "stop_local_monitor", "restart_local_monitor"];
