@@ -4738,6 +4738,9 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
         location_name = $3,
         status = CASE WHEN $4 = 'assigned' THEN 'Active' ELSE 'Pending Setup' END,
         setup_state = $4,
+        is_archived = FALSE,
+        archived_at = NULL,
+        archived_reason = NULL,
         last_seen_at = NOW()
       WHERE node_id = $1
       RETURNING
