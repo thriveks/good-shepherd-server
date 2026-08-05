@@ -52,6 +52,28 @@ const FIRMWARE_DOWNLOAD_TIMEOUT_MS = 120000;
 
 app.use(express.json({ limit: "25mb" }));
 
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+
+    const allowedOrigins = [
+        "https://thriveks.com",
+        "https://www.thriveks.com",
+        "https://thriveks.neocities.org"
+    ];
+
+    if (allowedOrigins.includes(origin)) {
+        res.header("Access-Control-Allow-Origin", origin);
+        res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, x-webhook-secret");
+        res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS");
+    }
+
+    if (req.method === "OPTIONS") {
+        return res.sendStatus(204);
+    }
+
+    next();
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL
