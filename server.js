@@ -1,8 +1,8 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v12.0.0 - Phase 1 Server Stabilization
-// Updated: 2026-08-03
+// Version: v12.0.1 - Canonical nodeId identity stabilization
+// Updated: 2026-08-06
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
 // Safe cleanup plus AI v2 fields for ESP32 motion and simple human-presence sensors.
@@ -4161,6 +4161,49 @@ async function resolveCanonicalEsp32Sensor(client, { nodeId, reportedSourceKey }
   return { canonical, rows: rowsResult.rows, keyOwner };
 }
 
+async function releaseSourceKeyForCanonicalSensor(client, { nodeId, canonicalSensorId, sourceKey }) {
+  const resolvedNodeId = cleanText(nodeId);
+  const resolvedSourceKey = cleanText(sourceKey);
+
+  if (!resolvedNodeId || !canonicalSensorId || !resolvedSourceKey) {
+    return;
+  }
+
+  const ownerResult = await client.query(
+    `${sensorSelectSQL()} WHERE source_key = $1 LIMIT 1 FOR UPDATE`,
+    [resolvedSourceKey]
+  );
+  const owner = ownerResult.rows[0] || null;
+
+  if (!owner || owner.id === canonicalSensorId) {
+    return;
+  }
+
+  if (cleanText(owner.nodeId) !== resolvedNodeId) {
+    throw new SensorAssignmentConflictError(`Source key is already owned by another node: ${resolvedSourceKey}`);
+  }
+
+  const retiredSourceKey = `${resolvedSourceKey}--retired-${String(owner.id).replace(/-/g, "").slice(0, 12)}`;
+  await client.query(
+    `UPDATE sensors
+     SET source_key = $2,
+         is_active = FALSE,
+         is_deleted = TRUE,
+         deleted_at = COALESCE(deleted_at, NOW()),
+         updated_at = NOW()
+     WHERE id = $1`,
+    [owner.id, retiredSourceKey]
+  );
+
+  logStructuredDiagnostic("IDENTITY_ALIAS_RELEASED", "info", {
+    nodeId: resolvedNodeId,
+    canonicalSensorId,
+    releasedSensorId: owner.id,
+    reportedSourceKey: resolvedSourceKey,
+    retiredSourceKey
+  });
+}
+
 async function upsertSensorFromEvent({
   nodeId,
   sourceKey,
@@ -4235,23 +4278,30 @@ async function upsertSensorFromEvent({
 
       let result;
       if (existing) {
+        await releaseSourceKeyForCanonicalSensor(client, {
+          nodeId,
+          canonicalSensorId: existing.id,
+          sourceKey: resolvedSourceKey
+        });
+
         result = await client.query(
           `UPDATE sensors SET
-             source_name = $2,
-             sensor_type = $3,
-             resident_id = $4,
-             resident_name = $5,
-             location_name = $6,
-             room_name = $7,
-             setup_state = $8,
-             assignment_authority = $9,
+             source_key = $2,
+             source_name = $3,
+             sensor_type = $4,
+             resident_id = $5,
+             resident_name = $6,
+             location_name = $7,
+             room_name = $8,
+             setup_state = $9,
+             assignment_authority = $10,
              is_active = TRUE,
              is_deleted = FALSE,
              deleted_at = NULL,
              updated_at = NOW()
            WHERE id = $1
            ${sensorReturningSQL()}`,
-          [existing.id, nextSourceName, canonicalSensorType, nextResidentId, nextResidentName,
+          [existing.id, resolvedSourceKey, nextSourceName, canonicalSensorType, nextResidentId, nextResidentName,
             nextLocationName, nextRoomName, nextSetupState, assignmentAuthority]
         );
       } else {
@@ -4684,7 +4734,7 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
     const resolvedResidentName = resident?.name || cleanText(residentName) || "Unassigned";
     const resolvedLocationName = cleanText(locationName) || resident?.location || existingNode.locationName || "Unassigned Location";
     const resolvedRoomName = cleanOptionalText(roomName);
-    const resolvedSourceKey = existingNodeSensor?.sourceKey || requestedSourceKey ||
+    const resolvedSourceKey = requestedSourceKey || existingNodeSensor?.sourceKey ||
       `${sourcePrefixForSensorMode(resolvedSensorMode)}-${resolvedNodeId.replace(/^esp32-/, "")}`;
     const resolvedSourceName = cleanText(sourceName) ||
       defaultSourceNameForSensorType(resolvedSensorType, resolvedRoomName, existingNode.nodeName);
@@ -4692,57 +4742,65 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
 
     await tryLockSensorAssignmentIdentity(client, [resolvedSourceKey]);
 
-    const sensorResult = await client.query(
-      `
-      INSERT INTO sensors (
-        id,
-        node_id,
-        source_key,
-        source_name,
-        sensor_type,
-        resident_id,
-        resident_name,
-        location_name,
-        room_name,
-        setup_state,
-        assignment_authority,
-        is_active,
-        is_deleted,
-        deleted_at,
-        created_at,
-        updated_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'operator_explicit', TRUE, FALSE, NULL, NOW(), NOW())
-      ON CONFLICT (source_key)
-      DO UPDATE SET
-        node_id = EXCLUDED.node_id,
-        source_name = EXCLUDED.source_name,
-        sensor_type = EXCLUDED.sensor_type,
-        resident_id = EXCLUDED.resident_id,
-        resident_name = EXCLUDED.resident_name,
-        location_name = EXCLUDED.location_name,
-        room_name = EXCLUDED.room_name,
-        setup_state = EXCLUDED.setup_state,
-        assignment_authority = 'operator_explicit',
-        is_active = TRUE,
-        is_deleted = FALSE,
-        deleted_at = NULL,
-        updated_at = NOW()
-      ${sensorReturningSQL()}
-      `,
-      [
-        randomUUID(),
-        resolvedNodeId,
-        resolvedSourceKey,
-        resolvedSourceName,
-        resolvedSensorType,
-        resolvedResidentId,
-        resolvedResidentName,
-        resolvedLocationName,
-        resolvedRoomName,
-        setupState
-      ]
-    );
+    let sensorResult;
+    if (existingNodeSensor) {
+      await releaseSourceKeyForCanonicalSensor(client, {
+        nodeId: resolvedNodeId,
+        canonicalSensorId: existingNodeSensor.id,
+        sourceKey: resolvedSourceKey
+      });
+
+      sensorResult = await client.query(
+        `UPDATE sensors SET
+           source_key = $2,
+           source_name = $3,
+           sensor_type = $4,
+           resident_id = $5,
+           resident_name = $6,
+           location_name = $7,
+           room_name = $8,
+           setup_state = $9,
+           assignment_authority = 'operator_explicit',
+           is_active = TRUE,
+           is_deleted = FALSE,
+           deleted_at = NULL,
+           updated_at = NOW()
+         WHERE id = $1
+         ${sensorReturningSQL()}`,
+        [
+          existingNodeSensor.id,
+          resolvedSourceKey,
+          resolvedSourceName,
+          resolvedSensorType,
+          resolvedResidentId,
+          resolvedResidentName,
+          resolvedLocationName,
+          resolvedRoomName,
+          setupState
+        ]
+      );
+    } else {
+      sensorResult = await client.query(
+        `INSERT INTO sensors (
+           id, node_id, source_key, source_name, sensor_type, resident_id, resident_name,
+           location_name, room_name, setup_state, assignment_authority, is_active, is_deleted,
+           deleted_at, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'operator_explicit',TRUE,FALSE,NULL,NOW(),NOW())
+         ${sensorReturningSQL()}`,
+        [
+          randomUUID(),
+          resolvedNodeId,
+          resolvedSourceKey,
+          resolvedSourceName,
+          resolvedSensorType,
+          resolvedResidentId,
+          resolvedResidentName,
+          resolvedLocationName,
+          resolvedRoomName,
+          setupState
+        ]
+      );
+    }
 
     const sensor = sensorResult.rows[0];
 
