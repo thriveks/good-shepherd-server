@@ -1,7 +1,7 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v12.0.2 - Hybrid device liveness
+// Version: v12.0.1 - Canonical nodeId identity stabilization
 // Updated: 2026-08-06
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
@@ -21,7 +21,12 @@ const PORT = process.env.PORT || 3000;
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
-const NODE_OFFLINE_AFTER_SECONDS = 900;
+const NODE_OFFLINE_AFTER_SECONDS = (() => {
+  const configuredValue = Number(process.env.NODE_OFFLINE_AFTER_SECONDS);
+  return Number.isFinite(configuredValue) && configuredValue > 0
+    ? Math.trunc(configuredValue)
+    : 86400;
+})();
 const AI_SENSOR_MOTION_ONLINE_GRACE_SECONDS = 600;
 const AI_SENSOR_EVENT_ONLINE_GRACE_SECONDS = 3600;
 const AI_INACTIVE_WATCH_MINUTES = 120;
@@ -3556,35 +3561,6 @@ async function upsertNodeFromRegistration({
   return result.rows[0];
 }
 
-async function touchEsp32DeviceContact(nodeId, context = "device_request") {
-  const resolvedNodeId = cleanText(nodeId);
-
-  if (!isEsp32NodeId(resolvedNodeId)) {
-    return false;
-  }
-
-  // Hybrid liveness: any authenticated, valid request from the canonical ESP32
-  // identity proves that the device can currently reach the server. Keep the
-  // existing node_health.checked_in_at clock as the single online/offline source
-  // so all current API consumers remain compatible.
-  await Promise.all([
-    pool.query(
-      `UPDATE node_health
-       SET checked_in_at = NOW(), updated_at = NOW()
-       WHERE node_id = $1`,
-      [resolvedNodeId]
-    ),
-    pool.query(
-      `UPDATE nodes
-       SET last_seen_at = NOW()
-       WHERE node_id = $1`,
-      [resolvedNodeId]
-    )
-  ]);
-
-  return true;
-}
-
 async function touchNodeFromWebhook(nodeId) {
   const resolvedNodeId = cleanText(nodeId);
 
@@ -5033,7 +5009,6 @@ app.get("/", async (req, res) => {
     remoteSupport: {
       enabled: true,
       nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
-      livenessModel: "hybrid_authenticated_device_contact",
       sensorCommandExpirationMinutes: SENSOR_COMMAND_EXPIRATION_MINUTES,
       endpoints: [
         "GET /nodes",
@@ -5484,7 +5459,6 @@ app.post("/nodes/register", async (req, res) => {
     }
 
     const node = await upsertNodeFromRegistration(req.body || {});
-    await touchEsp32DeviceContact(node.nodeId, "registration");
 
     console.log("Node registered/updated:");
     console.log(JSON.stringify(node, null, 2));
@@ -7855,10 +7829,6 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
       });
     }
 
-    // A successful authenticated command poll is proof of device liveness,
-    // including the normal count=0 response.
-    await touchEsp32DeviceContact(nodeId, "sensor_command_poll");
-
     await client.query("BEGIN");
     didBegin = true;
 
@@ -7987,8 +7957,6 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
       didBegin = false;
       return res.status(404).json({ success: false, error: `Command not found: ${commandId}` });
     }
-
-    await touchEsp32DeviceContact(existingCommand.nodeId, "sensor_command_result");
 
     if (isTerminalCommandStatus(existingCommand.status)) {
       await client.query("COMMIT");
@@ -8480,7 +8448,6 @@ app.post("/webhook", async (req, res) => {
 
     if (resolvedNodeId) {
       await touchNodeFromWebhook(resolvedNodeId);
-      await touchEsp32DeviceContact(resolvedNodeId, "webhook_event");
     }
 
     const existingSensor = await getExistingSensorForDeviceIdentity({
