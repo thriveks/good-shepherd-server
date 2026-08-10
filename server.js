@@ -5008,7 +5008,7 @@ async function createSensorCommand({ nodeId, commandType, payload, requestedBy, 
 }
 
 async function failStaleSensorCommands(client, nodeId) {
-  await client.query(
+  const pendingResult = await client.query(
     `
     UPDATE node_commands
     SET
@@ -5019,11 +5019,12 @@ async function failStaleSensorCommands(client, nodeId) {
       AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
       AND status = 'pending'
       AND requested_at < NOW() - ($2::int * INTERVAL '1 minute')
+    RETURNING command_id
     `,
     [nodeId, SENSOR_COMMAND_EXPIRATION_MINUTES]
   );
 
-  await client.query(
+  const runningResult = await client.query(
     `
     UPDATE node_commands
     SET
@@ -5043,6 +5044,7 @@ async function failStaleSensorCommands(client, nodeId) {
         (command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping')
           AND picked_up_at < NOW() - ($4::int * INTERVAL '1 minute'))
       )
+    RETURNING command_id
     `,
     [
       nodeId,
@@ -5051,6 +5053,11 @@ async function failStaleSensorCommands(client, nodeId) {
       SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES
     ]
   );
+
+  return {
+    expiredPendingCount: pendingResult.rowCount || 0,
+    expiredRunningCount: runningResult.rowCount || 0
+  };
 }
 
 app.get("/", async (req, res) => {
@@ -5087,6 +5094,7 @@ app.get("/", async (req, res) => {
         "POST /sensor-bulk-actions",
         "GET /sensor-config/:nodeId",
         "POST /sensor-commands",
+        "POST /sensor-commands/:nodeId/cleanup",
         "GET /sensor-commands/:nodeId/pending",
         "POST /sensor-commands/:commandId/result",
         "GET /sensor-commands/:nodeId",
@@ -7875,6 +7883,101 @@ app.post("/sensor-commands", async (req, res) => {
     }
 
     console.error("Create sensor command failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/sensor-commands/:nodeId/cleanup", async (req, res) => {
+  const client = await pool.connect();
+  let didBegin = false;
+
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+
+    if (!nodeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing nodeId"
+      });
+    }
+
+    if (!isEsp32NodeId(nodeId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Sensor command cleanup requires an esp32-* target"
+      });
+    }
+
+    const existingNode = await getNodeById(nodeId);
+
+    if (!existingNode) {
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    await client.query("BEGIN");
+    didBegin = true;
+
+    const cleanup = await failStaleSensorCommands(client, nodeId);
+
+    const activeResult = await client.query(
+      `
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'pending')::int AS "pendingCount",
+        COUNT(*) FILTER (WHERE status = 'running')::int AS "runningCount"
+      FROM node_commands
+      WHERE node_id = $1
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
+        AND status IN ('pending', 'running')
+      `,
+      [nodeId]
+    );
+
+    await client.query("COMMIT");
+    didBegin = false;
+
+    const active = activeResult.rows[0] || {};
+    const expiredPendingCount = cleanup.expiredPendingCount || 0;
+    const expiredRunningCount = cleanup.expiredRunningCount || 0;
+    const expiredTotal = expiredPendingCount + expiredRunningCount;
+    const pendingCount = active.pendingCount || 0;
+    const runningCount = active.runningCount || 0;
+
+    logStructuredDiagnostic("COMMAND_QUEUE_CLEANUP", "info", {
+      nodeId,
+      rowCount: expiredTotal
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: expiredTotal > 0
+        ? `Cleaned ${expiredTotal} stale sensor command(s).`
+        : "No stale sensor commands needed cleanup.",
+      nodeId,
+      expiredPendingCount,
+      expiredRunningCount,
+      expiredTotal,
+      pendingCount,
+      runningCount,
+      activeCount: pendingCount + runningCount
+    });
+  } catch (error) {
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
+    console.error("Sensor command cleanup failed:", error);
     return res.status(500).json({
       success: false,
       error: error.message
