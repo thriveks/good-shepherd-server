@@ -21,7 +21,12 @@ const PORT = process.env.PORT || 3000;
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
-const NODE_OFFLINE_AFTER_SECONDS = 86400;
+const NODE_OFFLINE_AFTER_SECONDS = (() => {
+  const configuredValue = Number(process.env.NODE_OFFLINE_AFTER_SECONDS);
+  return Number.isFinite(configuredValue) && configuredValue > 0
+    ? Math.trunc(configuredValue)
+    : 86400;
+})();
 const AI_SENSOR_MOTION_ONLINE_GRACE_SECONDS = 600;
 const AI_SENSOR_EVENT_ONLINE_GRACE_SECONDS = 3600;
 const AI_INACTIVE_WATCH_MINUTES = 120;
