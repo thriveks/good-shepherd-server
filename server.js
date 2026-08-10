@@ -8415,17 +8415,17 @@ app.post("/firmware/update-node", async (req, res) => {
       });
     }
 
-    const command = await createCommand({
-      nodeId,
-      commandType: "update_firmware",
-      payload: {
-        firmwareVersion,
-        firmwareUrl,
-        sha256
-      },
-      requestedBy
-    });
-
+    const command = await createSensorCommand({
+  nodeId,
+  commandType: "update_firmware",
+  payload: {
+    firmwareVersion,
+    firmwareUrl,
+    sha256
+  },
+  requestedBy,
+  supersedeExisting: true
+});
     return res.status(201).json({
       success: true,
       message: "Firmware update command queued",
