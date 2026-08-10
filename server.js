@@ -1,8 +1,7 @@
 // server.js
 // Good Shepherd webhook and AI backend
 //
-// Version: v12.0.1 - Canonical nodeId identity stabilization
-// Updated: 2026-08-06
+// s
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
 // Safe cleanup plus AI v2 fields for ESP32 motion and simple human-presence sensors.
@@ -44,6 +43,9 @@ const AI_PRESENCE_ACTIVE_CRITICAL_MINUTES = 480;
 const AI_DASHBOARD_CACHE_MAX_AGE_SECONDS = 30;
 const AI_DASHBOARD_REFRESH_DEBOUNCE_MS = 2000;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
+const SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES = 5;
+const SENSOR_COMMAND_OTA_EXECUTION_TIMEOUT_MINUTES = 30;
+const SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES = 2;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const MONITOR_COMMAND_TYPES = ["ping", "ffmpeg_check", "diagnostic_report", "reload_cameras", "sync_cameras_from_cloud", "restart_monitors", "clear_last_error", "rtsp_test"];
 const WATCHDOG_COMMAND_TYPES = ["watchdog_ping", "watchdog_health", "start_local_monitor", "stop_local_monitor", "restart_local_monitor"];
@@ -4916,16 +4918,37 @@ async function createSensorCommand({ nodeId, commandType, payload, requestedBy, 
     didBegin = true;
 
     if (supersedeExisting) {
+      const runningResult = await client.query(
+        `
+        SELECT command_id
+        FROM node_commands
+        WHERE node_id = $1
+          AND command_type = $2
+          AND status = 'running'
+        ORDER BY picked_up_at DESC NULLS LAST, requested_at DESC
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [nodeId, commandType]
+      );
+
+      if (runningResult.rows[0]) {
+        const error = new Error(`A ${commandType} command is already running for ${nodeId}`);
+        error.statusCode = 409;
+        error.code = "SENSOR_COMMAND_ALREADY_RUNNING";
+        throw error;
+      }
+
       await client.query(
         `
         UPDATE node_commands
         SET
           status = 'failed',
           completed_at = NOW(),
-          error = 'Superseded by newer sensor command'
+          error = 'Superseded by newer pending sensor command'
         WHERE node_id = $1
           AND command_type = $2
-          AND status IN ('pending', 'running')
+          AND status = 'pending'
         `,
         [nodeId, commandType]
       );
@@ -4991,13 +5014,42 @@ async function failStaleSensorCommands(client, nodeId) {
     SET
       status = 'failed',
       completed_at = NOW(),
-      error = 'Expired stale sensor command'
+      error = 'Expired pending sensor command'
     WHERE node_id = $1
       AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
-      AND status IN ('pending', 'running')
+      AND status = 'pending'
       AND requested_at < NOW() - ($2::int * INTERVAL '1 minute')
     `,
     [nodeId, SENSOR_COMMAND_EXPIRATION_MINUTES]
+  );
+
+  await client.query(
+    `
+    UPDATE node_commands
+    SET
+      status = 'failed',
+      completed_at = NOW(),
+      error = 'Expired running sensor command'
+    WHERE node_id = $1
+      AND status = 'running'
+      AND picked_up_at IS NOT NULL
+      AND (
+        (command_type = 'update_firmware'
+          AND picked_up_at < NOW() - ($2::int * INTERVAL '1 minute'))
+        OR
+        (command_type IN ('identify', 'locate')
+          AND picked_up_at < NOW() - ($3::int * INTERVAL '1 minute'))
+        OR
+        (command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping')
+          AND picked_up_at < NOW() - ($4::int * INTERVAL '1 minute'))
+      )
+    `,
+    [
+      nodeId,
+      SENSOR_COMMAND_OTA_EXECUTION_TIMEOUT_MINUTES,
+      SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES,
+      SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES
+    ]
   );
 }
 
@@ -5010,6 +5062,9 @@ app.get("/", async (req, res) => {
       enabled: true,
       nodeOfflineAfterSeconds: NODE_OFFLINE_AFTER_SECONDS,
       sensorCommandExpirationMinutes: SENSOR_COMMAND_EXPIRATION_MINUTES,
+      sensorCommandExecutionTimeoutMinutes: SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES,
+      sensorCommandOtaExecutionTimeoutMinutes: SENSOR_COMMAND_OTA_EXECUTION_TIMEOUT_MINUTES,
+      sensorCommandIdentifyExecutionTimeoutMinutes: SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES,
       endpoints: [
         "GET /nodes",
         "POST /nodes/register",
@@ -7729,16 +7784,41 @@ app.post("/sensor-commands", async (req, res) => {
     await client.query("BEGIN");
     didBegin = true;
 
+    const runningCommandResult = await client.query(
+      `
+      SELECT command_id
+      FROM node_commands
+      WHERE node_id = $1
+        AND command_type = $2
+        AND status = 'running'
+      ORDER BY picked_up_at DESC NULLS LAST, requested_at DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [nodeId, commandType]
+    );
+
+    if (runningCommandResult.rows[0]) {
+      await client.query("ROLLBACK");
+      didBegin = false;
+      return res.status(409).json({
+        success: false,
+        error: `A ${commandType} command is already running for ${nodeId}`,
+        code: "SENSOR_COMMAND_ALREADY_RUNNING",
+        runningCommandId: runningCommandResult.rows[0].command_id
+      });
+    }
+
     await client.query(
       `
       UPDATE node_commands
       SET
         status = 'failed',
         completed_at = NOW(),
-        error = 'Superseded by newer sensor command of same type'
+        error = 'Superseded by newer pending sensor command of same type'
       WHERE node_id = $1
         AND command_type = $2
-        AND status IN ('pending', 'running')
+        AND status = 'pending'
       `,
       [nodeId, commandType]
     );
@@ -7959,8 +8039,42 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
     }
 
     if (isTerminalCommandStatus(existingCommand.status)) {
-      await client.query("COMMIT");
-      didBegin = false;
+      const sameTerminalStatus = existingCommand.status === status;
+      const wasAutoExpiredRunning =
+        existingCommand.status === "failed" &&
+        cleanText(existingCommand.error) === "Expired running sensor command" &&
+        Boolean(existingCommand.pickedUpAt);
+
+      if (sameTerminalStatus) {
+        await client.query("COMMIT");
+        didBegin = false;
+        return res.status(200).json({
+          success: true,
+          message: "Sensor command result already recorded",
+          command: existingCommand
+        });
+      }
+
+      if (!wasAutoExpiredRunning || status !== "success") {
+        await client.query("COMMIT");
+        didBegin = false;
+        logStructuredDiagnostic("COMMAND_LATE_RESULT", "warning", {
+          commandId,
+          nodeId: existingCommand.nodeId,
+          commandType: existingCommand.commandType,
+          oldStatus: existingCommand.status,
+          submittedStatus: status,
+          route: "sensor-command-result",
+          accepted: false,
+          late: true
+        });
+        return res.status(200).json({
+          success: true,
+          message: "Late sensor command result ignored",
+          command: existingCommand
+        });
+      }
+
       logStructuredDiagnostic("COMMAND_LATE_RESULT", "warning", {
         commandId,
         nodeId: existingCommand.nodeId,
@@ -7968,13 +8082,8 @@ app.post("/sensor-commands/:commandId/result", async (req, res) => {
         oldStatus: existingCommand.status,
         submittedStatus: status,
         route: "sensor-command-result",
-        accepted: false,
+        accepted: true,
         late: true
-      });
-      return res.status(200).json({
-        success: true,
-        message: "Late sensor command result ignored",
-        command: existingCommand
       });
     }
 
