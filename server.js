@@ -1447,62 +1447,48 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
       sourceName.includes("presence");
   });
 
-  const latestBySourceKey = new Map();
-
-  for (const event of residentPresenceEvents) {
-    const sourceKey = cleanText(event.sourceKey);
-
-    if (!sourceKey) {
-      continue;
-    }
-
-    const eventDate = new Date(event.timestamp);
-
-    if (Number.isNaN(eventDate.getTime())) {
-      continue;
-    }
-
-    const current = latestBySourceKey.get(sourceKey);
-    const currentDate = current?.timestamp ? new Date(current.timestamp) : null;
-
-    if (!current || !currentDate || Number.isNaN(currentDate.getTime()) || eventDate.getTime() > currentDate.getTime()) {
-      latestBySourceKey.set(sourceKey, event);
-    }
-  }
+  // Presence state and device health are intentionally separate concepts.
+  //
+  // Authoritative presence state:
+  //   presence_detected -> active
+  //   presence_cleared  -> clear
+  //
+  // Heartbeats/node_health are connectivity diagnostics only. A missing,
+  // stale, or absent diagnostics.presenceState must never invalidate or
+  // overwrite the latest retained GPIO21 presence edge.
+  //
+  // Keep nodeHealthByNodeId in the function signature for call-site
+  // compatibility, but do not use it to determine presence state.
+  void nodeHealthByNodeId;
 
   const latestPresenceEvent = residentPresenceEvents
     .slice()
     .sort((first, second) => new Date(second.timestamp).getTime() - new Date(first.timestamp).getTime())[0] || null;
+
   const lastKnownPresenceAt = latestPresenceEvent?.timestamp || null;
   const lastKnownPresenceState = latestPresenceEvent ? presenceEventIsActive(latestPresenceEvent) : null;
-  const latestSensor = latestPresenceEvent
-    ? presenceSensors.find((sensor) => sensorMatchesMotionEvent(sensor, latestPresenceEvent))
-    : presenceSensors[0] || null;
-  const health = latestSensor?.nodeId ? nodeHealthByNodeId.get(cleanText(latestSensor.nodeId)) : null;
-  const healthDate = health?.checkedInAt ? new Date(health.checkedInAt) : null;
-  const healthIsFresh = Boolean(
-    healthDate &&
-    !Number.isNaN(healthDate.getTime()) &&
-    healthDate.getTime() >= Date.now() - (NODE_OFFLINE_AFTER_SECONDS * 1000)
-  );
-  const diagnosticState = readPayloadBoolean(normalizeJsonObject(health?.diagnostics), "presenceState");
-  const presenceIsFresh = Boolean(
-    latestPresenceEvent &&
-    healthIsFresh &&
-    diagnosticState !== null &&
-    diagnosticState === lastKnownPresenceState
-  );
-  let presenceFreshnessReason = "no_presence_sensor";
-  if (presenceSensors.length > 0 && !latestPresenceEvent) presenceFreshnessReason = "no_retained_presence_edge";
-  else if (presenceSensors.length > 0 && !health) presenceFreshnessReason = "missing_heartbeat";
-  else if (presenceSensors.length > 0 && !healthIsFresh) presenceFreshnessReason = "stale_heartbeat";
-  else if (presenceSensors.length > 0 && diagnosticState === null) presenceFreshnessReason = "missing_presence_diagnostic";
-  else if (presenceSensors.length > 0 && diagnosticState !== lastKnownPresenceState) presenceFreshnessReason = "heartbeat_event_disagreement";
-  else if (presenceIsFresh) presenceFreshnessReason = "fresh_heartbeat_corroborates_last_edge";
 
   const latestPresenceAt = lastKnownPresenceAt;
-  const latestPresenceState = presenceIsFresh ? lastKnownPresenceState : null;
-  const activePresenceEvents = presenceIsFresh && latestPresenceState === true
+  const latestPresenceState = lastKnownPresenceState;
+
+  // "presenceIsFresh" is retained for API compatibility. It now means that
+  // the server has a usable authoritative presence edge, not that a heartbeat
+  // corroborated that edge.
+  const presenceIsFresh = Boolean(
+    latestPresenceEvent &&
+    (lastKnownPresenceState === true || lastKnownPresenceState === false)
+  );
+
+  let presenceFreshnessReason = "no_presence_sensor";
+  if (presenceSensors.length > 0 && !latestPresenceEvent) {
+    presenceFreshnessReason = "no_retained_presence_edge";
+  } else if (presenceSensors.length > 0 && latestPresenceEvent && lastKnownPresenceState === null) {
+    presenceFreshnessReason = "unrecognized_presence_edge";
+  } else if (presenceIsFresh) {
+    presenceFreshnessReason = "authoritative_presence_edge";
+  }
+
+  const activePresenceEvents = latestPresenceState === true && latestPresenceEvent
     ? [latestPresenceEvent]
     : [];
 
@@ -1523,22 +1509,12 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
   let presenceStatus = "No Presence Sensor";
   let presenceExplanation = "No human-presence sensor is assigned to this resident.";
 
-  if (presenceSensors.length > 0 && !presenceIsFresh) {
+  if (presenceSensors.length > 0 && !latestPresenceEvent) {
     presenceStatus = "Presence Unknown";
-    presenceExplanation = latestPresenceEvent
-      ? `Last-known presence is retained, but current presence is unknown because ${presenceFreshnessReason.replaceAll("_", " ")}.`
-      : "Current presence is unknown because no retained presence edge is available.";
-    logStructuredDiagnostic("PRESENCE_STALE_OR_DISAGREED", "warning", {
-      nodeId: latestSensor?.nodeId || null,
-      sensorId: latestSensor?.id || null,
-      reason: presenceFreshnessReason,
-      healthAgeSeconds: healthDate && !Number.isNaN(healthDate.getTime())
-        ? Math.max(0, Math.floor((Date.now() - healthDate.getTime()) / 1000))
-        : null,
-      lastKnownPresenceState,
-      lastKnownPresenceAt,
-      diagnosticState
-    });
+    presenceExplanation = "Current presence is unknown because no retained presence edge is available.";
+  } else if (presenceSensors.length > 0 && latestPresenceState === null) {
+    presenceStatus = "Presence Unknown";
+    presenceExplanation = "A presence event exists, but its occupied/clear state could not be determined.";
   } else if (presenceSensors.length > 0 && latestPresenceState === false) {
     presenceStatus = "Presence Clear";
     presenceExplanation = "Latest human-presence event says the monitored room is clear.";
