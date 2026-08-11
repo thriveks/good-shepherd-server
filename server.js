@@ -71,7 +71,7 @@ app.use((req, res, next) => {
     if (allowedOrigins.includes(origin)) {
         res.header("Access-Control-Allow-Origin", origin);
         res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, x-webhook-secret");
-        res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS");
+        res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
     }
 
     if (req.method === "OPTIONS") {
@@ -5074,6 +5074,7 @@ app.get("/", async (req, res) => {
       sensorCommandIdentifyExecutionTimeoutMinutes: SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES,
       endpoints: [
         "GET /nodes",
+        "DELETE /nodes/:nodeId",
         "POST /nodes/register",
         "GET /node-health",
         "GET /node-health/:nodeId",
@@ -6249,6 +6250,9 @@ app.patch("/nodes/:nodeId/restore", async (req, res) => {
 });
 
 app.delete("/nodes/:nodeId", async (req, res) => {
+  const client = await pool.connect();
+  let didBegin = false;
+
   try {
     if (!isAuthorizedWebhook(req)) {
       return res.status(401).json({
@@ -6266,7 +6270,104 @@ app.delete("/nodes/:nodeId", async (req, res) => {
       });
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+    didBegin = true;
+
+    const nodeResult = await client.query(
+      `
+      SELECT
+        node_id AS "nodeId",
+        node_name AS "nodeName",
+        location_name AS "locationName",
+        status,
+        is_archived AS "isArchived",
+        archived_at AS "archivedAt",
+        archived_reason AS "archivedReason"
+      FROM nodes
+      WHERE node_id = $1
+      FOR UPDATE
+      `,
+      [nodeId]
+    );
+
+    const node = nodeResult.rows[0] || null;
+
+    if (!node) {
+      await client.query("ROLLBACK");
+      didBegin = false;
+      return res.status(404).json({
+        success: false,
+        error: `Node not found: ${nodeId}`
+      });
+    }
+
+    // Permanent deletion is intentionally restricted to archived nodes.
+    // This server-side check protects active devices even if the endpoint is
+    // called directly instead of through the Command Center UI.
+    if (node.isArchived !== true) {
+      await client.query("ROLLBACK");
+      didBegin = false;
+      return res.status(409).json({
+        success: false,
+        error: "Active devices cannot be permanently deleted. Archive the device first.",
+        code: "NODE_MUST_BE_ARCHIVED"
+      });
+    }
+
+    const sensorResult = await client.query(
+      `
+      SELECT id, source_key AS "sourceKey"
+      FROM sensors
+      WHERE node_id = $1
+      FOR UPDATE
+      `,
+      [nodeId]
+    );
+
+    const sensorIds = sensorResult.rows.map((row) => row.id);
+    const sourceKeys = sensorResult.rows.map((row) => row.sourceKey).filter(Boolean);
+
+    // Preserve historical motion/event rows, but detach them from sensor rows
+    // before deleting the inventory identity.
+    if (sensorIds.length > 0) {
+      await client.query(
+        `UPDATE motion_events SET sensor_id = NULL WHERE sensor_id = ANY($1::uuid[])`,
+        [sensorIds]
+      );
+    }
+
+    // Cameras are separate assets. If a camera happened to reference this
+    // node, keep the camera and only clear the node assignment.
+    await client.query(
+      `UPDATE cameras SET assigned_node_id = NULL, updated_at = NOW() WHERE assigned_node_id = $1`,
+      [nodeId]
+    );
+
+    const deletedCommands = await client.query(
+      `DELETE FROM node_commands WHERE node_id = $1 RETURNING command_id`,
+      [nodeId]
+    );
+
+    const deletedHealth = await client.query(
+      `DELETE FROM node_health WHERE node_id = $1 RETURNING node_id`,
+      [nodeId]
+    );
+
+    const deletedSensors = await client.query(
+      `DELETE FROM sensors WHERE node_id = $1 RETURNING id, source_key AS "sourceKey"`,
+      [nodeId]
+    );
+
+    // Remove mappings only for source keys owned by the deleted sensor rows.
+    // Historical webhook_events remain intact for audit/history purposes.
+    if (sourceKeys.length > 0) {
+      await client.query(
+        `DELETE FROM device_mappings WHERE source_key = ANY($1::text[])`,
+        [sourceKeys]
+      );
+    }
+
+    const deletedNode = await client.query(
       `
       DELETE FROM nodes
       WHERE node_id = $1
@@ -6282,24 +6383,34 @@ app.delete("/nodes/:nodeId", async (req, res) => {
       [nodeId]
     );
 
-    if (!result.rows[0]) {
-      return res.status(404).json({
-        success: false,
-        error: `Node not found: ${nodeId}`
-      });
-    }
+    await client.query("COMMIT");
+    didBegin = false;
+
+    scheduleAIDashboardRefresh();
 
     return res.status(200).json({
       success: true,
-      message: "Node deleted",
-      node: result.rows[0]
+      message: "Archived device permanently deleted",
+      node: deletedNode.rows[0],
+      cleanup: {
+        sensorsDeleted: deletedSensors.rowCount || 0,
+        healthRowsDeleted: deletedHealth.rowCount || 0,
+        commandRowsDeleted: deletedCommands.rowCount || 0,
+        historicalEventsPreserved: true
+      }
     });
   } catch (error) {
-    console.error("Node delete failed:", error);
+    if (didBegin) {
+      await client.query("ROLLBACK");
+    }
+
+    console.error("Permanent archived node delete failed:", error);
     return res.status(500).json({
       success: false,
       error: error.message
     });
+  } finally {
+    client.release();
   }
 });
 
