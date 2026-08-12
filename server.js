@@ -24,6 +24,7 @@ const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
 const MQTT_USERNAME = process.env.MQTT_USERNAME || "good-shepherd-pilot";
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD || "Goodshepherd1!";
 let mqttBridgeClient = null;
+const MQTT_BRIDGE_VERSION = "v2.1-pilot";
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
@@ -5493,6 +5494,7 @@ app.get("/nodes", async (req, res) => {
         h.checked_in_at AS "healthCheckedInAt",
         EXTRACT(EPOCH FROM (NOW() - h.checked_in_at))::int AS "secondsSinceHealthCheckIn",
         CASE
+          WHEN LOWER(COALESCE(h.monitor_status, '')) = 'offline' THEN FALSE
           WHEN h.checked_in_at >= NOW() - ($2::int * INTERVAL '1 second') THEN TRUE
           ELSE FALSE
         END AS "isOnline"
@@ -8956,14 +8958,185 @@ app.post("/webhook", async (req, res) => {
 async function postLocalV2Route(pathname, payload) {
   const response = await fetch(`http://127.0.0.1:${PORT}${pathname}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-webhook-secret": WEBHOOK_SECRET || "" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-webhook-secret": WEBHOOK_SECRET || ""
+    },
     body: JSON.stringify(payload || {})
   });
-  if (!response.ok) throw new Error(`Local V2 bridge ${pathname} HTTP ${response.status}`);
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(
+      `Local V2 bridge ${pathname} HTTP ${response.status}` +
+      (body ? ` | ${body.slice(0, 300)}` : "")
+    );
+  }
+
+  return response;
+}
+
+async function markMqttNodeOffline(nodeId, payload = {}) {
+  // Explicit MQTT offline must take effect immediately. Do NOT route this
+  // through /node-health because /node-health intentionally refreshes
+  // checked_in_at. Instead, preserve the last real check-in and set only
+  // monitor_status/diagnostics.
+  await pool.query(
+    `
+    UPDATE node_health
+    SET
+      monitor_status = 'Offline',
+      diagnostics = COALESCE(diagnostics, '{}'::jsonb) ||
+        jsonb_build_object(
+          'mqttOffline', true,
+          'mqttOfflineAt', NOW(),
+          'mqttProtocolVersion', $2::text
+        ),
+      updated_at = NOW()
+    WHERE node_id = $1
+    `,
+    [
+      nodeId,
+      cleanText(payload?.protocolVersion) || "2.0"
+    ]
+  );
+
+  console.log("MQTT V2 node marked offline:", nodeId);
+}
+
+function normalizeMqttCommandResultStatus(value) {
+  const normalized = cleanText(value).toLowerCase();
+
+  if (["running", "success", "failed"].includes(normalized)) {
+    return normalized;
+  }
+
+  return "";
+}
+
+async function ingestMqttV2Status(nodeId, payload) {
+  await postLocalV2Route("/nodes/register", {
+    nodeId,
+    nodeName: payload.nodeName,
+    locationName: payload.locationName,
+    localIp: payload.localIp,
+    localConfigPort: 80,
+    cameraCount: 0,
+    cameraSummary: [],
+    setupId: payload.setupId,
+    assignmentState: payload.assignmentState,
+    softwareVersion: payload.softwareVersion,
+    sensorMode: payload.sensorMode,
+    sourceKey: payload.sourceKey,
+    presenceInput: "GPIO21"
+  });
+
+  if (payload.online === true) {
+    await postLocalV2Route("/node-health", {
+      nodeId,
+      nodeName: payload.nodeName,
+      locationName: payload.locationName,
+      monitorStatus: "Online",
+      ffmpegStatus: "Not Applicable",
+      cameraCount: 0,
+      activeMonitorCount: 1,
+      softwareVersion: payload.softwareVersion,
+      localIp: payload.localIp,
+      sensorMode: payload.sensorMode,
+      sourceKey: payload.sourceKey,
+      setupId: payload.setupId,
+      assignmentState: payload.assignmentState,
+      wifiSsid: payload.wifiSsid,
+      wifiRssi: payload.wifiRssi,
+      uptimeSeconds: payload.uptimeSeconds,
+      diagnostics: {
+        transport: "mqtt",
+        mqttProtocolVersion: payload.protocolVersion || "2.0"
+      }
+    });
+
+    console.log("MQTT V2 status ingested:", nodeId, "online");
+    return;
+  }
+
+  if (payload.online === false) {
+    await markMqttNodeOffline(nodeId, payload);
+    console.log("MQTT V2 status ingested:", nodeId, "offline");
+    return;
+  }
+
+  console.log("MQTT V2 status ingested:", nodeId, "status-without-online-flag");
+}
+
+async function ingestMqttV2Event(nodeId, payload) {
+  await postLocalV2Route("/webhook", {
+    ...payload,
+    nodeId
+  });
+
+  console.log(
+    "MQTT V2 event ingested:",
+    nodeId,
+    payload.eventType || "event"
+  );
+}
+
+async function ingestMqttV2Result(nodeId, payload) {
+  const commandId = cleanText(payload?.commandId);
+  const status = normalizeMqttCommandResultStatus(payload?.status);
+
+  if (!commandId) {
+    console.warn("MQTT V2 result ignored: missing commandId", { nodeId });
+    return;
+  }
+
+  // Phase 1 firmware may deliberately answer unsupported_phase1. Keep that
+  // visible in logs, but do not corrupt the existing command queue with a
+  // status the legacy route does not support.
+  if (!status) {
+    console.warn("MQTT V2 nonterminal/unsupported result:", {
+      nodeId,
+      commandId,
+      commandType: cleanText(payload?.commandType) || null,
+      status: cleanText(payload?.status) || null,
+      message: cleanText(payload?.message) || null
+    });
+    return;
+  }
+
+  const resultPayload = {
+    transport: "mqtt",
+    nodeId,
+    commandType: cleanText(payload?.commandType) || null,
+    message: cleanText(payload?.message) || null,
+    raw: payload
+  };
+
+  await postLocalV2Route(
+    `/node-commands/${encodeURIComponent(commandId)}/result`,
+    {
+      status,
+      result: resultPayload,
+      error: status === "failed"
+        ? (cleanText(payload?.message) || "MQTT command failed")
+        : null
+    }
+  );
+
+  console.log("MQTT V2 command result ingested:", nodeId, commandId, status);
 }
 
 function startMqttV2Bridge() {
-  if (!MQTT_BRIDGE_ENABLED || !WEBHOOK_SECRET) return;
+  if (!MQTT_BRIDGE_ENABLED) {
+    console.log("Good Shepherd V2 MQTT bridge disabled by MQTT_BRIDGE_ENABLED.");
+    return;
+  }
+
+  if (!WEBHOOK_SECRET) {
+    console.warn("Good Shepherd V2 MQTT bridge not started: WEBHOOK_SECRET is missing.");
+    return;
+  }
+
   mqttBridgeClient = mqtt.connect(`mqtts://${MQTT_HOST}:${MQTT_PORT}`, {
     username: MQTT_USERNAME,
     password: MQTT_PASSWORD,
@@ -8975,64 +9148,90 @@ function startMqttV2Bridge() {
   });
 
   mqttBridgeClient.on("connect", () => {
-    console.log(`Good Shepherd V2 MQTT bridge connected to ${MQTT_HOST}:${MQTT_PORT}`);
-    mqttBridgeClient.subscribe([
-      "good-shepherd/v2/nodes/+/status",
-      "good-shepherd/v2/nodes/+/events"
-    ], { qos: 1 });
+    console.log(
+      `Good Shepherd V2 MQTT bridge ${MQTT_BRIDGE_VERSION} connected to ` +
+      `${MQTT_HOST}:${MQTT_PORT}`
+    );
+
+    mqttBridgeClient.subscribe(
+      [
+        "good-shepherd/v2/nodes/+/status",
+        "good-shepherd/v2/nodes/+/events",
+        "good-shepherd/v2/nodes/+/results"
+      ],
+      { qos: 1 },
+      (error, granted) => {
+        if (error) {
+          console.error("Good Shepherd V2 MQTT subscribe failed:", error.message);
+          return;
+        }
+
+        console.log(
+          "Good Shepherd V2 MQTT subscriptions active:",
+          (granted || []).map(item => item.topic).join(", ")
+        );
+      }
+    );
+  });
+
+  mqttBridgeClient.on("reconnect", () => {
+    console.log("Good Shepherd V2 MQTT bridge reconnecting...");
+  });
+
+  mqttBridgeClient.on("offline", () => {
+    console.warn("Good Shepherd V2 MQTT bridge client is offline.");
   });
 
   mqttBridgeClient.on("message", (topic, raw) => {
     let payload;
-    try { payload = JSON.parse(raw.toString("utf8")); }
-    catch (error) { console.error("MQTT V2 parse failed:", error.message); return; }
+
+    try {
+      payload = JSON.parse(raw.toString("utf8"));
+    } catch (error) {
+      console.error("MQTT V2 parse failed:", topic, error.message);
+      return;
+    }
 
     const parts = topic.split("/");
-    const nodeId = String(payload.nodeId || parts[3] || "").trim();
-    const channel = String(parts[4] || "").trim();
-    if (!nodeId) return;
+    const nodeId = cleanText(payload?.nodeId || parts[3]);
+    const channel = cleanText(parts[4]).toLowerCase();
 
-    Promise.resolve().then(async () => {
-      if (channel === "status") {
-        await postLocalV2Route("/nodes/register", {
-          nodeId,
-          nodeName: payload.nodeName,
-          locationName: payload.locationName,
-          localIp: payload.localIp,
-          localConfigPort: 80,
-          cameraCount: 0,
-          cameraSummary: [],
-          setupId: payload.setupId,
-          assignmentState: payload.assignmentState,
-          softwareVersion: payload.softwareVersion,
-          sensorMode: payload.sensorMode,
-          sourceKey: payload.sourceKey,
-          presenceInput: "GPIO21"
-        });
-        if (payload.online === true) {
-          await postLocalV2Route("/node-health", {
-            nodeId,
-            locationName: payload.locationName,
-            monitorStatus: "Online",
-            ffmpegStatus: "Not Applicable",
-            cameraCount: 0,
-            activeMonitorCount: 1,
-            softwareVersion: payload.softwareVersion,
-            localIp: payload.localIp,
-            sensorMode: payload.sensorMode,
-            sourceKey: payload.sourceKey,
-            setupId: payload.setupId
-          });
+    if (!nodeId) {
+      console.warn("MQTT V2 message ignored: no nodeId", topic);
+      return;
+    }
+
+    Promise.resolve()
+      .then(async () => {
+        if (channel === "status") {
+          await ingestMqttV2Status(nodeId, payload);
+          return;
         }
-        console.log("MQTT V2 status ingested:", nodeId, payload.online === true ? "online" : "offline");
-      } else if (channel === "events") {
-        await postLocalV2Route("/webhook", { ...payload, nodeId });
-        console.log("MQTT V2 event ingested:", nodeId, payload.eventType || "event");
-      }
-    }).catch(error => console.error("MQTT V2 bridge handling failed:", error.message));
+
+        if (channel === "events") {
+          await ingestMqttV2Event(nodeId, payload);
+          return;
+        }
+
+        if (channel === "results") {
+          await ingestMqttV2Result(nodeId, payload);
+          return;
+        }
+
+        console.warn("MQTT V2 unknown channel ignored:", topic);
+      })
+      .catch(error => {
+        console.error(
+          "MQTT V2 bridge handling failed:",
+          topic,
+          error.message
+        );
+      });
   });
 
-  mqttBridgeClient.on("error", error => console.error("Good Shepherd V2 MQTT bridge error:", error.message));
+  mqttBridgeClient.on("error", error => {
+    console.error("Good Shepherd V2 MQTT bridge error:", error.message);
+  });
 }
 
 initializeDatabase()
