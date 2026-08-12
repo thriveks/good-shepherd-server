@@ -24,7 +24,7 @@ const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
 const MQTT_USERNAME = process.env.MQTT_USERNAME || "good-shepherd-pilot";
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD || "Goodshepherd1!";
 let mqttBridgeClient = null;
-const MQTT_BRIDGE_VERSION = "v2.1-pilot";
+const MQTT_BRIDGE_VERSION = "v2.1.1-pilot-unified-online-status";
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
@@ -3109,6 +3109,7 @@ function nodeHealthSelectSQL() {
       updated_at AS "updatedAt",
       EXTRACT(EPOCH FROM (NOW() - checked_in_at))::int AS "secondsSinceCheckIn",
       CASE
+        WHEN LOWER(COALESCE(monitor_status, '')) = 'offline' THEN FALSE
         WHEN checked_in_at >= NOW() - (${NODE_OFFLINE_AFTER_SECONDS} * INTERVAL '1 second') THEN TRUE
         ELSE FALSE
       END AS "isOnline"
@@ -3892,6 +3893,7 @@ async function upsertNodeHealth(payload) {
       updated_at AS "updatedAt",
       EXTRACT(EPOCH FROM (NOW() - checked_in_at))::int AS "secondsSinceCheckIn",
       CASE
+        WHEN LOWER(COALESCE(monitor_status, '')) = 'offline' THEN FALSE
         WHEN checked_in_at >= NOW() - ($22::int * INTERVAL '1 second') THEN TRUE
         ELSE FALSE
       END AS "isOnline"
@@ -7318,6 +7320,7 @@ app.get("/sensor-inventory", async (req, res) => {
         h.checked_in_at AS "healthCheckedInAt",
         EXTRACT(EPOCH FROM (NOW() - h.checked_in_at))::int AS "secondsSinceHealthCheckIn",
         CASE
+          WHEN LOWER(COALESCE(h.monitor_status, '')) = 'offline' THEN FALSE
           WHEN h.checked_in_at >= NOW() - ($3::int * INTERVAL '1 second') THEN TRUE
           ELSE FALSE
         END AS "isOnline",
