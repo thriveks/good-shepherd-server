@@ -14,9 +14,16 @@ const { Pool } = require("pg");
 const { randomUUID } = require("crypto");
 const https = require("https");
 const http = require("http");
+const mqtt = require("mqtt");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MQTT_BRIDGE_ENABLED = String(process.env.MQTT_BRIDGE_ENABLED || "true").toLowerCase() !== "false";
+const MQTT_HOST = process.env.MQTT_HOST || "c3f9bcc09adc4e7db6a3d29b63a24819.s1.eu.hivemq.cloud";
+const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
+const MQTT_USERNAME = process.env.MQTT_USERNAME || "good-shepherd-pilot";
+const MQTT_PASSWORD = process.env.MQTT_PASSWORD || "Goodshepherd1!";
+let mqttBridgeClient = null;
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
@@ -1447,48 +1454,62 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
       sourceName.includes("presence");
   });
 
-  // Presence state and device health are intentionally separate concepts.
-  //
-  // Authoritative presence state:
-  //   presence_detected -> active
-  //   presence_cleared  -> clear
-  //
-  // Heartbeats/node_health are connectivity diagnostics only. A missing,
-  // stale, or absent diagnostics.presenceState must never invalidate or
-  // overwrite the latest retained GPIO21 presence edge.
-  //
-  // Keep nodeHealthByNodeId in the function signature for call-site
-  // compatibility, but do not use it to determine presence state.
-  void nodeHealthByNodeId;
+  const latestBySourceKey = new Map();
+
+  for (const event of residentPresenceEvents) {
+    const sourceKey = cleanText(event.sourceKey);
+
+    if (!sourceKey) {
+      continue;
+    }
+
+    const eventDate = new Date(event.timestamp);
+
+    if (Number.isNaN(eventDate.getTime())) {
+      continue;
+    }
+
+    const current = latestBySourceKey.get(sourceKey);
+    const currentDate = current?.timestamp ? new Date(current.timestamp) : null;
+
+    if (!current || !currentDate || Number.isNaN(currentDate.getTime()) || eventDate.getTime() > currentDate.getTime()) {
+      latestBySourceKey.set(sourceKey, event);
+    }
+  }
 
   const latestPresenceEvent = residentPresenceEvents
     .slice()
     .sort((first, second) => new Date(second.timestamp).getTime() - new Date(first.timestamp).getTime())[0] || null;
-
   const lastKnownPresenceAt = latestPresenceEvent?.timestamp || null;
   const lastKnownPresenceState = latestPresenceEvent ? presenceEventIsActive(latestPresenceEvent) : null;
-
-  const latestPresenceAt = lastKnownPresenceAt;
-  const latestPresenceState = lastKnownPresenceState;
-
-  // "presenceIsFresh" is retained for API compatibility. It now means that
-  // the server has a usable authoritative presence edge, not that a heartbeat
-  // corroborated that edge.
+  const latestSensor = latestPresenceEvent
+    ? presenceSensors.find((sensor) => sensorMatchesMotionEvent(sensor, latestPresenceEvent))
+    : presenceSensors[0] || null;
+  const health = latestSensor?.nodeId ? nodeHealthByNodeId.get(cleanText(latestSensor.nodeId)) : null;
+  const healthDate = health?.checkedInAt ? new Date(health.checkedInAt) : null;
+  const healthIsFresh = Boolean(
+    healthDate &&
+    !Number.isNaN(healthDate.getTime()) &&
+    healthDate.getTime() >= Date.now() - (NODE_OFFLINE_AFTER_SECONDS * 1000)
+  );
+  const diagnosticState = readPayloadBoolean(normalizeJsonObject(health?.diagnostics), "presenceState");
   const presenceIsFresh = Boolean(
     latestPresenceEvent &&
-    (lastKnownPresenceState === true || lastKnownPresenceState === false)
+    healthIsFresh &&
+    diagnosticState !== null &&
+    diagnosticState === lastKnownPresenceState
   );
-
   let presenceFreshnessReason = "no_presence_sensor";
-  if (presenceSensors.length > 0 && !latestPresenceEvent) {
-    presenceFreshnessReason = "no_retained_presence_edge";
-  } else if (presenceSensors.length > 0 && latestPresenceEvent && lastKnownPresenceState === null) {
-    presenceFreshnessReason = "unrecognized_presence_edge";
-  } else if (presenceIsFresh) {
-    presenceFreshnessReason = "authoritative_presence_edge";
-  }
+  if (presenceSensors.length > 0 && !latestPresenceEvent) presenceFreshnessReason = "no_retained_presence_edge";
+  else if (presenceSensors.length > 0 && !health) presenceFreshnessReason = "missing_heartbeat";
+  else if (presenceSensors.length > 0 && !healthIsFresh) presenceFreshnessReason = "stale_heartbeat";
+  else if (presenceSensors.length > 0 && diagnosticState === null) presenceFreshnessReason = "missing_presence_diagnostic";
+  else if (presenceSensors.length > 0 && diagnosticState !== lastKnownPresenceState) presenceFreshnessReason = "heartbeat_event_disagreement";
+  else if (presenceIsFresh) presenceFreshnessReason = "fresh_heartbeat_corroborates_last_edge";
 
-  const activePresenceEvents = latestPresenceState === true && latestPresenceEvent
+  const latestPresenceAt = lastKnownPresenceAt;
+  const latestPresenceState = presenceIsFresh ? lastKnownPresenceState : null;
+  const activePresenceEvents = presenceIsFresh && latestPresenceState === true
     ? [latestPresenceEvent]
     : [];
 
@@ -1509,12 +1530,22 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
   let presenceStatus = "No Presence Sensor";
   let presenceExplanation = "No human-presence sensor is assigned to this resident.";
 
-  if (presenceSensors.length > 0 && !latestPresenceEvent) {
+  if (presenceSensors.length > 0 && !presenceIsFresh) {
     presenceStatus = "Presence Unknown";
-    presenceExplanation = "Current presence is unknown because no retained presence edge is available.";
-  } else if (presenceSensors.length > 0 && latestPresenceState === null) {
-    presenceStatus = "Presence Unknown";
-    presenceExplanation = "A presence event exists, but its occupied/clear state could not be determined.";
+    presenceExplanation = latestPresenceEvent
+      ? `Last-known presence is retained, but current presence is unknown because ${presenceFreshnessReason.replaceAll("_", " ")}.`
+      : "Current presence is unknown because no retained presence edge is available.";
+    logStructuredDiagnostic("PRESENCE_STALE_OR_DISAGREED", "warning", {
+      nodeId: latestSensor?.nodeId || null,
+      sensorId: latestSensor?.id || null,
+      reason: presenceFreshnessReason,
+      healthAgeSeconds: healthDate && !Number.isNaN(healthDate.getTime())
+        ? Math.max(0, Math.floor((Date.now() - healthDate.getTime()) / 1000))
+        : null,
+      lastKnownPresenceState,
+      lastKnownPresenceAt,
+      diagnosticState
+    });
   } else if (presenceSensors.length > 0 && latestPresenceState === false) {
     presenceStatus = "Presence Clear";
     presenceExplanation = "Latest human-presence event says the monitored room is clear.";
@@ -8920,10 +8951,95 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+
+// MARK: - Good Shepherd V2 MQTT Bridge
+async function postLocalV2Route(pathname, payload) {
+  const response = await fetch(`http://127.0.0.1:${PORT}${pathname}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-webhook-secret": WEBHOOK_SECRET || "" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!response.ok) throw new Error(`Local V2 bridge ${pathname} HTTP ${response.status}`);
+}
+
+function startMqttV2Bridge() {
+  if (!MQTT_BRIDGE_ENABLED || !WEBHOOK_SECRET) return;
+  mqttBridgeClient = mqtt.connect(`mqtts://${MQTT_HOST}:${MQTT_PORT}`, {
+    username: MQTT_USERNAME,
+    password: MQTT_PASSWORD,
+    protocolVersion: 4,
+    reconnectPeriod: 5000,
+    connectTimeout: 10000,
+    clean: true,
+    clientId: `good-shepherd-server-${randomUUID().slice(0,8)}`
+  });
+
+  mqttBridgeClient.on("connect", () => {
+    console.log(`Good Shepherd V2 MQTT bridge connected to ${MQTT_HOST}:${MQTT_PORT}`);
+    mqttBridgeClient.subscribe([
+      "good-shepherd/v2/nodes/+/status",
+      "good-shepherd/v2/nodes/+/events"
+    ], { qos: 1 });
+  });
+
+  mqttBridgeClient.on("message", (topic, raw) => {
+    let payload;
+    try { payload = JSON.parse(raw.toString("utf8")); }
+    catch (error) { console.error("MQTT V2 parse failed:", error.message); return; }
+
+    const parts = topic.split("/");
+    const nodeId = String(payload.nodeId || parts[3] || "").trim();
+    const channel = String(parts[4] || "").trim();
+    if (!nodeId) return;
+
+    Promise.resolve().then(async () => {
+      if (channel === "status") {
+        await postLocalV2Route("/nodes/register", {
+          nodeId,
+          nodeName: payload.nodeName,
+          locationName: payload.locationName,
+          localIp: payload.localIp,
+          localConfigPort: 80,
+          cameraCount: 0,
+          cameraSummary: [],
+          setupId: payload.setupId,
+          assignmentState: payload.assignmentState,
+          softwareVersion: payload.softwareVersion,
+          sensorMode: payload.sensorMode,
+          sourceKey: payload.sourceKey,
+          presenceInput: "GPIO21"
+        });
+        if (payload.online === true) {
+          await postLocalV2Route("/node-health", {
+            nodeId,
+            locationName: payload.locationName,
+            monitorStatus: "Online",
+            ffmpegStatus: "Not Applicable",
+            cameraCount: 0,
+            activeMonitorCount: 1,
+            softwareVersion: payload.softwareVersion,
+            localIp: payload.localIp,
+            sensorMode: payload.sensorMode,
+            sourceKey: payload.sourceKey,
+            setupId: payload.setupId
+          });
+        }
+        console.log("MQTT V2 status ingested:", nodeId, payload.online === true ? "online" : "offline");
+      } else if (channel === "events") {
+        await postLocalV2Route("/webhook", { ...payload, nodeId });
+        console.log("MQTT V2 event ingested:", nodeId, payload.eventType || "event");
+      }
+    }).catch(error => console.error("MQTT V2 bridge handling failed:", error.message));
+  });
+
+  mqttBridgeClient.on("error", error => console.error("Good Shepherd V2 MQTT bridge error:", error.message));
+}
+
 initializeDatabase()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Good Shepherd webhook server running on port ${PORT}`);
+      startMqttV2Bridge();
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
       console.log("Remote node command queue enabled.");
