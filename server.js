@@ -24,7 +24,7 @@ const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
 const MQTT_USERNAME = process.env.MQTT_USERNAME || "good-shepherd-pilot";
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD || "Goodshepherd1!";
 let mqttBridgeClient = null;
-const MQTT_BRIDGE_VERSION = "v2.1.1-pilot-unified-online-status";
+const MQTT_BRIDGE_VERSION = "v2.2-mqtt-phase2-commands";
 const MAX_EVENTS = 50;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const MIN_IOS_APP_BUILD = 1;
@@ -5005,7 +5005,9 @@ async function createSensorCommand({ nodeId, commandType, payload, requestedBy, 
     await client.query("COMMIT");
     didBegin = false;
 
-    return result.rows[0];
+    const command = result.rows[0];
+    await publishMqttV2SensorCommand(command);
+    return command;
   } catch (error) {
     if (didBegin) {
       await client.query("ROLLBACK");
@@ -7995,10 +7997,19 @@ app.post("/sensor-commands", async (req, res) => {
     await client.query("COMMIT");
     didBegin = false;
 
+    const command = result.rows[0];
+    const mqttDispatch = await publishMqttV2SensorCommand(command);
+
     return res.status(201).json({
       success: true,
-      message: `Sensor ${commandType} command created`,
-      command: result.rows[0]
+      message: mqttDispatch.published
+        ? `Sensor ${commandType} command published over MQTT`
+        : `Sensor ${commandType} command queued; MQTT delivery pending`,
+      command,
+      mqttDispatch: {
+        published: mqttDispatch.published,
+        reason: mqttDispatch.reason || null
+      }
     });
   } catch (error) {
     if (didBegin) {
@@ -9007,6 +9018,172 @@ async function markMqttNodeOffline(nodeId, payload = {}) {
   console.log("MQTT V2 node marked offline:", nodeId);
 }
 
+function mqttV2CommandTopic(nodeId) {
+  return `good-shepherd/v2/nodes/${cleanText(nodeId)}/commands`;
+}
+
+function mqttV2CommandEnvelope(command) {
+  return {
+    protocolVersion: "2.0",
+    nodeId: cleanText(command?.nodeId),
+    commandId: cleanText(command?.commandId),
+    commandType: cleanText(command?.commandType),
+    payload: normalizeJsonObject(command?.payload),
+    requestedBy: cleanText(command?.requestedBy) || null,
+    requestedAt: command?.requestedAt || null
+  };
+}
+
+function mqttBridgeIsConnected() {
+  return Boolean(mqttBridgeClient && mqttBridgeClient.connected);
+}
+
+async function publishMqttV2SensorCommand(command) {
+  const commandId = cleanText(command?.commandId);
+  const nodeId = cleanText(command?.nodeId);
+  const commandType = normalizeEsp32SensorCommandType(command?.commandType);
+
+  if (!commandId || !nodeId || !commandType || !isEsp32NodeId(nodeId)) {
+    return { published: false, reason: "invalid_command" };
+  }
+
+  if (!mqttBridgeIsConnected()) {
+    console.warn("MQTT V2 sensor command left pending: bridge not connected", {
+      commandId,
+      nodeId,
+      commandType
+    });
+    return { published: false, reason: "bridge_not_connected" };
+  }
+
+  // Mark the command running BEFORE publishing. This prevents a fast ESP32
+  // result from racing the database transition from pending -> running.
+  const claimResult = await pool.query(
+    `
+    UPDATE node_commands
+    SET
+      status = 'running',
+      picked_up_at = COALESCE(picked_up_at, NOW()),
+      completed_at = NULL,
+      error = NULL
+    WHERE command_id = $1
+      AND node_id = $2
+      AND status = 'pending'
+    RETURNING
+      command_id AS "commandId",
+      node_id AS "nodeId",
+      command_type AS "commandType",
+      payload,
+      status,
+      requested_by AS "requestedBy",
+      requested_at AS "requestedAt",
+      picked_up_at AS "pickedUpAt",
+      completed_at AS "completedAt",
+      result,
+      error
+    `,
+    [commandId, nodeId]
+  );
+
+  const claimedCommand = claimResult.rows[0] || null;
+  if (!claimedCommand) {
+    return { published: false, reason: "not_pending" };
+  }
+
+  const topic = mqttV2CommandTopic(nodeId);
+  const envelope = mqttV2CommandEnvelope(claimedCommand);
+  const body = JSON.stringify(envelope);
+
+  try {
+    await new Promise((resolve, reject) => {
+      mqttBridgeClient.publish(topic, body, { qos: 1, retain: false }, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+
+    logStructuredDiagnostic("COMMAND_CLAIM", "info", {
+      commandId,
+      nodeId,
+      commandType,
+      runner: "mqtt",
+      route: "mqtt-v2-command-publish",
+      newStatus: "running",
+      requestedAt: claimedCommand.requestedAt,
+      pickedUpAt: claimedCommand.pickedUpAt
+    });
+
+    console.log("MQTT V2 command published:", nodeId, commandId, commandType);
+    return { published: true, topic, command: claimedCommand };
+  } catch (error) {
+    // If the broker publish fails, put the command back into pending so the
+    // reconnect path can retry it instead of leaving a false running command.
+    await pool.query(
+      `
+      UPDATE node_commands
+      SET
+        status = 'pending',
+        picked_up_at = NULL,
+        error = NULL
+      WHERE command_id = $1
+        AND status = 'running'
+        AND completed_at IS NULL
+      `,
+      [commandId]
+    );
+
+    console.error("MQTT V2 command publish failed; command returned to pending:", {
+      nodeId,
+      commandId,
+      commandType,
+      error: error?.message || String(error)
+    });
+
+    return { published: false, reason: "publish_failed", error: error?.message || String(error) };
+  }
+}
+
+async function dispatchPendingMqttV2SensorCommands(limit = 100) {
+  if (!mqttBridgeIsConnected()) return 0;
+
+  const result = await pool.query(
+    `
+    SELECT
+      command_id AS "commandId",
+      node_id AS "nodeId",
+      command_type AS "commandType",
+      payload,
+      status,
+      requested_by AS "requestedBy",
+      requested_at AS "requestedAt",
+      picked_up_at AS "pickedUpAt",
+      completed_at AS "completedAt",
+      result,
+      error
+    FROM node_commands
+    WHERE status = 'pending'
+      AND node_id LIKE 'esp32-%'
+      AND command_type = ANY($1::text[])
+      AND requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
+    ORDER BY requested_at ASC
+    LIMIT $3
+    `,
+    [ESP32_SENSOR_COMMAND_TYPES, SENSOR_COMMAND_EXPIRATION_MINUTES, limit]
+  );
+
+  let publishedCount = 0;
+  for (const command of result.rows) {
+    const dispatch = await publishMqttV2SensorCommand(command);
+    if (dispatch.published) publishedCount += 1;
+  }
+
+  if (publishedCount > 0) {
+    console.log(`MQTT V2 pending command dispatch complete: ${publishedCount} command(s) published.`);
+  }
+
+  return publishedCount;
+}
+
 function normalizeMqttCommandResultStatus(value) {
   const normalized = cleanText(value).toLowerCase();
 
@@ -9093,9 +9270,7 @@ async function ingestMqttV2Result(nodeId, payload) {
     return;
   }
 
-  // Phase 1 firmware may deliberately answer unsupported_phase1. Keep that
-  // visible in logs, but do not corrupt the existing command queue with a
-  // status the legacy route does not support.
+  // Ignore malformed/unsupported statuses without corrupting the durable command queue.
   if (!status) {
     console.warn("MQTT V2 nonterminal/unsupported result:", {
       nodeId,
@@ -9116,7 +9291,7 @@ async function ingestMqttV2Result(nodeId, payload) {
   };
 
   await postLocalV2Route(
-    `/node-commands/${encodeURIComponent(commandId)}/result`,
+    `/sensor-commands/${encodeURIComponent(commandId)}/result`,
     {
       status,
       result: resultPayload,
@@ -9175,6 +9350,12 @@ function startMqttV2Bridge() {
         );
       }
     );
+
+    // Commands created while Render or the broker was reconnecting remain
+    // durable in Postgres as pending. Publish them as soon as the bridge is live.
+    dispatchPendingMqttV2SensorCommands().catch((error) => {
+      console.error("MQTT V2 pending command dispatch failed:", error.message);
+    });
   });
 
   mqttBridgeClient.on("reconnect", () => {
