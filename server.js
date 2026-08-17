@@ -5803,12 +5803,19 @@ app.post("/node-commands", async (req, res) => {
       });
     }
 
-    const command = await createCommand({
-      nodeId,
-      commandType,
-      payload,
-      requestedBy
-    });
+    const command = isEsp32NodeId(nodeId)
+      ? await createSensorCommand({
+          nodeId,
+          commandType,
+          payload,
+          requestedBy
+        })
+      : await createCommand({
+          nodeId,
+          commandType,
+          payload,
+          requestedBy
+        });
 
     console.log("Node command created:");
     console.log(JSON.stringify(command, null, 2));
