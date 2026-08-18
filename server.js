@@ -3693,8 +3693,13 @@ async function syncNodeHealthMetadataBestEffort({
     const existingAuthority = existingSensor
       ? normalizeAssignmentAuthority(existingSensor.assignmentAuthority)
       : "never_assigned";
-    const canBootstrap = existingAuthority === "never_assigned" &&
-      isCompleteFirmwareAssignment(assignmentPayload || { diagnostics: resolvedDiagnostics });
+
+    // Resident/location/room assignment is server-authoritative.
+    // Firmware-reported assignment metadata remains available for diagnostics,
+    // but a device heartbeat/registration may never create or change ownership.
+    // The authorized PATCH /sensors/:nodeId/assignment workflow is responsible
+    // for committing the assignment selected during BLE setup.
+    const canBootstrap = false;
 
     let resident = existingSensor?.residentId
       ? await getResidentForExistingDeviceIdentity({
@@ -3731,7 +3736,7 @@ async function syncNodeHealthMetadataBestEffort({
         ? "Unassigned location"
         : (resident?.location || heartbeatLocationName),
       forceUnassigned: preserveNodeUnassignedState,
-      allowDeviceBootstrap: true,
+      allowDeviceBootstrap: false,
       assignmentPayload: assignmentPayload || { diagnostics: resolvedDiagnostics }
     });
   }
