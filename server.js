@@ -1262,7 +1262,7 @@ function displayAverage(value) {
   return Math.round(value * 10) / 10;
 }
 
-function buildResidentMotionBaseline(residentMotionEvents) {
+function buildResidentMotionBaseline(residentMotionEvents, residentMotionDailyStats = null) {
   const now = new Date();
   const todayKey = localDateKey(now);
   const currentLocalHour = localHourFromDate(now) ?? 0;
@@ -1362,30 +1362,40 @@ function buildResidentMotionBaseline(residentMotionEvents) {
   }
 
   const todayEvents = eventsByDate.get(todayKey) || [];
-  const baselineDateKeys = [...eventsByDate.keys()].filter((dateKey) => dateKey !== todayKey);
-  const baselineDayStats = baselineDateKeys.map((dateKey) => {
-    const dayEvents = eventsByDate.get(dateKey) || [];
-    const validDates = dayEvents
-      .map((event) => new Date(event.timestamp))
-      .filter((date) => !Number.isNaN(date.getTime()))
-      .sort((first, second) => first.getTime() - second.getTime());
-    const firstDate = validDates[0] || null;
-    const lastDate = validDates[validDates.length - 1] || null;
-    const coverageHours = firstDate && lastDate
-      ? Math.max(0, (lastDate.getTime() - firstDate.getTime()) / (60 * 60 * 1000))
-      : 0;
-    const sameTimeCount = dayEvents.reduce((count, event) => {
-      const minuteOfDay = localMinuteOfDay(event.timestamp);
-      return minuteOfDay !== null && minuteOfDay <= currentMinuteOfDay ? count + 1 : count;
-    }, 0);
+  const baselineDayStats = Array.isArray(residentMotionDailyStats)
+    ? residentMotionDailyStats
+        .filter((day) => cleanText(day?.dateKey) && day.dateKey !== todayKey)
+        .map((day) => ({
+          dateKey: cleanText(day.dateKey),
+          motionCount: normalizeInteger(day.motionCount, 0),
+          sameTimeCount: normalizeInteger(day.sameTimeCount, 0),
+          coverageHours: Number.isFinite(Number(day.coverageHours)) ? Number(day.coverageHours) : 0
+        }))
+    : [...eventsByDate.keys()]
+        .filter((dateKey) => dateKey !== todayKey)
+        .map((dateKey) => {
+          const dayEvents = eventsByDate.get(dateKey) || [];
+          const validDates = dayEvents
+            .map((event) => new Date(event.timestamp))
+            .filter((date) => !Number.isNaN(date.getTime()))
+            .sort((first, second) => first.getTime() - second.getTime());
+          const firstDate = validDates[0] || null;
+          const lastDate = validDates[validDates.length - 1] || null;
+          const coverageHours = firstDate && lastDate
+            ? Math.max(0, (lastDate.getTime() - firstDate.getTime()) / (60 * 60 * 1000))
+            : 0;
+          const sameTimeCount = dayEvents.reduce((count, event) => {
+            const minuteOfDay = localMinuteOfDay(event.timestamp);
+            return minuteOfDay !== null && minuteOfDay <= currentMinuteOfDay ? count + 1 : count;
+          }, 0);
 
-    return {
-      dateKey,
-      motionCount: dayEvents.length,
-      sameTimeCount,
-      coverageHours
-    };
-  });
+          return {
+            dateKey,
+            motionCount: dayEvents.length,
+            sameTimeCount,
+            coverageHours
+          };
+        });
 
   // A baseline day should represent a meaningful portion of a normal monitored day.
   // Very short or tiny data fragments are retained in raw history but are not allowed
@@ -1674,7 +1684,7 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
   };
 }
 
-function buildResidentAIConfidence({ motionBaseline, activeSensorCount, onlineSensorCount, offlineSensorCount, residentMotionEvents, presenceIntelligence }) {
+function buildResidentAIConfidence({ motionBaseline, activeSensorCount, onlineSensorCount, offlineSensorCount, residentMotionEvents, motionEventHistoryCount = null, presenceIntelligence }) {
   let score = 25;
   const reasons = [];
 
@@ -1706,7 +1716,11 @@ function buildResidentAIConfidence({ motionBaseline, activeSensorCount, onlineSe
     reasons.push(`${offlineSensorCount} offline sensor(s)`);
   }
 
-  if (Array.isArray(residentMotionEvents) && residentMotionEvents.length >= 20) {
+  const effectiveMotionHistoryCount = Number.isFinite(Number(motionEventHistoryCount))
+    ? Number(motionEventHistoryCount)
+    : (Array.isArray(residentMotionEvents) ? residentMotionEvents.length : 0);
+
+  if (effectiveMotionHistoryCount >= 20) {
     score += 10;
     reasons.push("enough recent motion events");
   }
@@ -2109,7 +2123,19 @@ function buildAIStatusForResident({
 }
 
 async function buildAIMotionSummary() {
-  const [residentResult, sensorResult, eventResult, presenceEventResult, motionEventResult, nodeHealthResult, nodeResult, actionLogResult, excludedResult] = await Promise.all([
+  const now = new Date();
+  const currentLocalHour = localHourFromDate(now) ?? 0;
+  const currentLocalMinute = (() => {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: AI_TIME_ZONE,
+      minute: "2-digit"
+    }).formatToParts(now);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value);
+    return Number.isFinite(minute) ? minute : 0;
+  })();
+  const currentMinuteOfDay = (currentLocalHour * 60) + currentLocalMinute;
+
+  const [residentResult, sensorResult, eventResult, presenceEventResult, motionDailyResult, todayMotionResult, latestSensorMotionResult, nodeHealthResult, nodeResult, actionLogResult, excludedResult] = await Promise.all([
     pool.query(`
       ${residentSelectSQL()}
       WHERE is_deleted = FALSE
@@ -2151,7 +2177,19 @@ async function buildAIMotionSummary() {
     `, [AI_MOTION_HISTORY_EVENT_LIMIT]),
     pool.query(
       `
-      ${motionEventSelectSQL()}
+      SELECT
+        resident_id AS "residentId",
+        MAX(resident_name) AS "residentName",
+        (event_timestamp AT TIME ZONE $2)::date::text AS "dateKey",
+        COUNT(*)::int AS "motionCount",
+        COUNT(*) FILTER (
+          WHERE (
+            EXTRACT(HOUR FROM event_timestamp AT TIME ZONE $2)::int * 60 +
+            EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
+          ) <= $3::int
+        )::int AS "sameTimeCount",
+        EXTRACT(EPOCH FROM (MAX(event_timestamp) - MIN(event_timestamp))) / 3600.0 AS "coverageHours"
+      FROM motion_events
       WHERE event_timestamp >= NOW() - ($1::int * INTERVAL '1 day')
         AND EXISTS (
           SELECT 1 FROM sensors s
@@ -2161,7 +2199,61 @@ async function buildAIMotionSummary() {
             AND s.is_deleted = FALSE
             AND n.is_archived = FALSE
         )
+      GROUP BY
+        resident_id,
+        CASE WHEN resident_id IS NULL THEN LOWER(TRIM(resident_name)) ELSE NULL END,
+        (event_timestamp AT TIME ZONE $2)::date
+      ORDER BY (event_timestamp AT TIME ZONE $2)::date DESC
+      `,
+      [AI_MOTION_HISTORY_DAYS, AI_TIME_ZONE, currentMinuteOfDay]
+    ),
+    pool.query(
+      `
+      ${motionEventSelectSQL()}
+      WHERE event_timestamp >= ((NOW() AT TIME ZONE $1)::date AT TIME ZONE $1)
+        AND event_timestamp < (((NOW() AT TIME ZONE $1)::date + 1) AT TIME ZONE $1)
+        AND EXISTS (
+          SELECT 1 FROM sensors s
+          JOIN nodes n ON n.node_id = s.node_id
+          WHERE s.id = motion_events.sensor_id
+            AND s.is_active = TRUE
+            AND s.is_deleted = FALSE
+            AND n.is_archived = FALSE
+        )
       ORDER BY event_timestamp DESC
+      `,
+      [AI_TIME_ZONE]
+    ),
+    pool.query(
+      `
+      SELECT DISTINCT ON (sensor_id)
+        id,
+        webhook_event_id AS "webhookEventId",
+        resident_id AS "residentId",
+        resident_name AS "residentName",
+        location_name AS "locationName",
+        sensor_id AS "sensorId",
+        node_id AS "nodeId",
+        source_key AS "sourceKey",
+        source_name AS "sourceName",
+        room_name AS "roomName",
+        message,
+        alert_level AS "alertLevel",
+        time_text AS "timeText",
+        event_timestamp AS "timestamp",
+        created_at AS "createdAt"
+      FROM motion_events
+      WHERE sensor_id IS NOT NULL
+        AND event_timestamp >= NOW() - ($1::int * INTERVAL '1 day')
+        AND EXISTS (
+          SELECT 1 FROM sensors s
+          JOIN nodes n ON n.node_id = s.node_id
+          WHERE s.id = motion_events.sensor_id
+            AND s.is_active = TRUE
+            AND s.is_deleted = FALSE
+            AND n.is_archived = FALSE
+        )
+      ORDER BY sensor_id, event_timestamp DESC
       `,
       [AI_MOTION_HISTORY_DAYS]
     ),
@@ -2201,7 +2293,9 @@ async function buildAIMotionSummary() {
   const sensors = sensorResult.rows;
   const events = eventResult.rows;
   const presenceEvents = presenceEventResult.rows.filter(isPresenceEventRow);
-  const motionHistoryEvents = motionEventResult.rows;
+  const motionDailyStats = motionDailyResult.rows;
+  const todayMotionEvents = todayMotionResult.rows;
+  const latestSensorMotionEvents = latestSensorMotionResult.rows;
   const actionLogs = actionLogResult.rows;
   const nodeHealthByNodeId = new Map(
     nodeHealthResult.rows.map((health) => [cleanText(health.nodeId), health])
@@ -2224,7 +2318,9 @@ async function buildAIMotionSummary() {
   const sensorGroups = groupByResident(sensors);
   const eventGroups = groupByResident(events, 'residentId', 'residentName');
   const presenceGroups = groupByResident(presenceEvents, 'residentId', 'residentName');
-  const motionGroups = groupByResident(motionHistoryEvents);
+  const motionDailyGroups = groupByResident(motionDailyStats);
+  const todayMotionGroups = groupByResident(todayMotionEvents);
+  const latestSensorMotionGroups = groupByResident(latestSensorMotionEvents);
   const actionGroups = groupByResident(actionLogs);
   const rowsForResident = (groups, resident) => {
     const byIdRows = groups.byId.get(cleanText(resident.id)) || [];
@@ -2245,11 +2341,22 @@ async function buildAIMotionSummary() {
 
     const motionEvents = residentEvents.filter(isMotionEventRow);
     const physicalWebhookMotionEvents = motionEvents.filter(isPhysicalMotionEventRow);
-    const residentMotionHistoryEvents = rowsForResident(motionGroups, resident);
-    const residentMotionEvents = residentMotionHistoryEvents.length > 0
-      ? residentMotionHistoryEvents
+    const residentMotionDailyStats = rowsForResident(motionDailyGroups, resident);
+    const residentTodayMotionEvents = rowsForResident(todayMotionGroups, resident);
+    const residentLatestSensorMotionEvents = rowsForResident(latestSensorMotionGroups, resident);
+    const residentPersistentMotionEventCount = residentMotionDailyStats.reduce((total, day) => {
+      return total + normalizeInteger(day.motionCount, 0);
+    }, 0);
+    const residentMotionEvents = [...new Map(
+      [...residentTodayMotionEvents, ...residentLatestSensorMotionEvents]
+        .map((row) => [row.id || JSON.stringify(row), row])
+    ).values()].sort((first, second) => {
+      return new Date(second.timestamp).getTime() - new Date(first.timestamp).getTime();
+    });
+    const effectiveResidentMotionEvents = residentMotionEvents.length > 0
+      ? residentMotionEvents
       : physicalWebhookMotionEvents;
-    const latestMotionEvent = residentMotionEvents[0] || null;
+    const latestMotionEvent = effectiveResidentMotionEvents[0] || null;
     const latestMotionSensor = latestMotionEvent
       ? residentSensors.find((sensor) => {
           return normalizeForMatch(sensor.sourceKey) === normalizeForMatch(latestMotionEvent.sourceKey) ||
@@ -2257,18 +2364,18 @@ async function buildAIMotionSummary() {
         })
       : null;
 
-    const motionBaseline = buildResidentMotionBaseline(residentMotionEvents);
+    const motionBaseline = buildResidentMotionBaseline(residentTodayMotionEvents, residentMotionDailyStats);
     // Use one canonical AI-time-zone calculation for every "today" count.
     // This keeps the displayed total, room totals, hourly totals, briefing totals,
     // and pattern comparison aligned even when the server process runs in UTC.
     const motionCountToday = motionBaseline.todayMotionCount;
 
-    const motionCountLastHour = residentMotionEvents.filter((event) => {
+    const motionCountLastHour = effectiveResidentMotionEvents.filter((event) => {
       const eventDate = new Date(event.timestamp);
       return !Number.isNaN(eventDate.getTime()) &&
         eventDate.getTime() >= Date.now() - (60 * 60 * 1000);
     }).length;
-    const roomIntelligence = buildResidentRoomIntelligence(residentSensors, residentMotionEvents);
+    const roomIntelligence = buildResidentRoomIntelligence(residentSensors, residentTodayMotionEvents);
     const presenceIntelligence = buildResidentPresenceIntelligence(
       residentSensors,
       residentPresenceEvents,
@@ -2278,7 +2385,7 @@ async function buildAIMotionSummary() {
       residentSensors.map((sensor) => {
         return [
           sensor.id,
-          buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNodeId, residentMotionEvents)
+          buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNodeId, effectiveResidentMotionEvents)
         ];
       })
     );
@@ -2326,7 +2433,8 @@ async function buildAIMotionSummary() {
       activeSensorCount: activeSensors.length,
       onlineSensorCount,
       offlineSensorCount: offlineSensors.length,
-      residentMotionEvents,
+      residentMotionEvents: effectiveResidentMotionEvents,
+      motionEventHistoryCount: residentPersistentMotionEventCount,
       presenceIntelligence
     });
     const actionGuidance = buildResidentActionGuidance({
@@ -2363,9 +2471,9 @@ async function buildAIMotionSummary() {
       activeSensorCount: activeSensors.length,
       offlineSensorCount: offlineSensors.length,
       onlineSensorCount,
-      motionEventCount: residentMotionEvents.length,
+      motionEventCount: residentPersistentMotionEventCount,
       presenceEventCount: residentPresenceEvents.length,
-      persistentMotionEventCount: residentMotionHistoryEvents.length,
+      persistentMotionEventCount: residentPersistentMotionEventCount,
       retainedMotionEventFallbackCount: physicalWebhookMotionEvents.length,
       motionCountToday,
       motionCountLastHour,
@@ -2433,7 +2541,7 @@ async function buildAIMotionSummary() {
       followUpDueAt: followUpStatus.followUpDueAt,
       minutesUntilFollowUpDue: followUpStatus.minutesUntilFollowUpDue,
       sensors: residentSensors.map((sensor) => {
-        const status = sensorStatusById.get(sensor.id) || buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNodeId, residentMotionEvents);
+        const status = sensorStatusById.get(sensor.id) || buildEffectiveSensorStatus(sensor, nodeHealthByNodeId, nodeLastSeenByNodeId, effectiveResidentMotionEvents);
 
         return {
           id: sensor.id,
