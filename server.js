@@ -2072,9 +2072,8 @@ async function buildAIMotionSummary() {
             AND n.is_archived = FALSE
         )
       ORDER BY event_timestamp DESC
-      LIMIT $2
       `,
-      [AI_MOTION_HISTORY_DAYS, AI_MOTION_HISTORY_EVENT_LIMIT]
+      [AI_MOTION_HISTORY_DAYS]
     ),
     pool.query(`
       ${nodeHealthSelectSQL()}
