@@ -1263,7 +1263,18 @@ function displayAverage(value) {
 }
 
 function buildResidentMotionBaseline(residentMotionEvents) {
-  const todayKey = localDateKey(new Date());
+  const now = new Date();
+  const todayKey = localDateKey(now);
+  const currentLocalHour = localHourFromDate(now) ?? 0;
+  const currentLocalMinute = (() => {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: AI_TIME_ZONE,
+      minute: "2-digit"
+    }).formatToParts(now);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value);
+    return Number.isFinite(minute) ? minute : 0;
+  })();
+  const currentMinuteOfDay = (currentLocalHour * 60) + currentLocalMinute;
   const hourlyCounts = Array.from({ length: 24 }, (_, hour) => ({
     hour,
     count: 0
@@ -1272,6 +1283,44 @@ function buildResidentMotionBaseline(residentMotionEvents) {
   const roomCountsToday = new Map();
   let firstMotionToday = null;
   let lastMotionToday = null;
+
+  const localMinuteOfDay = (dateValue) => {
+    const date = dateValue instanceof Date ? dateValue : new Date(dateValue);
+
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: AI_TIME_ZONE,
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(date);
+    const hour = Number(parts.find((part) => part.type === "hour")?.value);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value);
+
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+      return null;
+    }
+
+    return (hour * 60) + minute;
+  };
+
+  const median = (values) => {
+    const sorted = values
+      .filter((value) => Number.isFinite(value))
+      .sort((first, second) => first - second);
+
+    if (sorted.length === 0) {
+      return 0;
+    }
+
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0
+      ? (sorted[middle - 1] + sorted[middle]) / 2
+      : sorted[middle];
+  };
 
   for (const event of residentMotionEvents) {
     const eventDate = new Date(event.timestamp);
@@ -1314,32 +1363,67 @@ function buildResidentMotionBaseline(residentMotionEvents) {
 
   const todayEvents = eventsByDate.get(todayKey) || [];
   const baselineDateKeys = [...eventsByDate.keys()].filter((dateKey) => dateKey !== todayKey);
-  const baselineMotionCounts = baselineDateKeys.map((dateKey) => eventsByDate.get(dateKey)?.length || 0);
-  const baselineDayCount = baselineMotionCounts.length;
-  const baselineMotionAverage = baselineDayCount > 0
-    ? baselineMotionCounts.reduce((sum, count) => sum + count, 0) / baselineDayCount
-    : 0;
+  const baselineDayStats = baselineDateKeys.map((dateKey) => {
+    const dayEvents = eventsByDate.get(dateKey) || [];
+    const validDates = dayEvents
+      .map((event) => new Date(event.timestamp))
+      .filter((date) => !Number.isNaN(date.getTime()))
+      .sort((first, second) => first.getTime() - second.getTime());
+    const firstDate = validDates[0] || null;
+    const lastDate = validDates[validDates.length - 1] || null;
+    const coverageHours = firstDate && lastDate
+      ? Math.max(0, (lastDate.getTime() - firstDate.getTime()) / (60 * 60 * 1000))
+      : 0;
+    const sameTimeCount = dayEvents.reduce((count, event) => {
+      const minuteOfDay = localMinuteOfDay(event.timestamp);
+      return minuteOfDay !== null && minuteOfDay <= currentMinuteOfDay ? count + 1 : count;
+    }, 0);
+
+    return {
+      dateKey,
+      motionCount: dayEvents.length,
+      sameTimeCount,
+      coverageHours
+    };
+  });
+
+  // A baseline day should represent a meaningful portion of a normal monitored day.
+  // Very short or tiny data fragments are retained in raw history but are not allowed
+  // to train the resident's normal behavior model.
+  const completeBaselineDays = baselineDayStats.filter((day) => {
+    return day.motionCount >= 10 && day.coverageHours >= 8;
+  });
+  const usableBaselineDays = completeBaselineDays.length >= AI_BASELINE_MIN_DAYS
+    ? completeBaselineDays
+    : baselineDayStats;
+  const baselineDayCount = usableBaselineDays.length;
+  const baselineExcludedDayCount = Math.max(0, baselineDayStats.length - completeBaselineDays.length);
+  const baselineMotionCounts = usableBaselineDays.map((day) => day.motionCount);
+  const baselineSameTimeCounts = usableBaselineDays.map((day) => day.sameTimeCount);
+  const baselineMotionMedian = median(baselineMotionCounts);
+  const baselineSameTimeMedian = median(baselineSameTimeCounts);
+  const baselineMotionAverage = baselineMotionMedian;
   const todayMotionCount = todayEvents.length;
   const expectedMotionCountLow = baselineDayCount >= AI_BASELINE_MIN_DAYS
-    ? Math.max(1, Math.floor(baselineMotionAverage * AI_BASELINE_QUIET_RATIO))
+    ? Math.max(1, Math.floor(baselineSameTimeMedian * AI_BASELINE_QUIET_RATIO))
     : null;
   const expectedMotionCountHigh = baselineDayCount >= AI_BASELINE_MIN_DAYS
-    ? Math.ceil(baselineMotionAverage * AI_BASELINE_ACTIVE_RATIO)
+    ? Math.ceil(baselineSameTimeMedian * AI_BASELINE_ACTIVE_RATIO)
     : null;
 
   let patternStatus = "Insufficient Baseline";
-  let patternExplanation = `Need at least ${AI_BASELINE_MIN_DAYS} prior motion days before comparing this resident to their own routine.`;
+  let patternExplanation = `Need at least ${AI_BASELINE_MIN_DAYS} usable prior motion days before comparing this resident to their own routine.`;
 
   if (baselineDayCount >= AI_BASELINE_MIN_DAYS) {
     if (todayMotionCount < expectedMotionCountLow) {
       patternStatus = "Too Quiet";
-      patternExplanation = `Today has ${todayMotionCount} motion event(s), below the expected low range of ${expectedMotionCountLow}.`;
+      patternExplanation = `Today has ${todayMotionCount} motion event(s) so far, below the expected range through this time of day (${expectedMotionCountLow}-${expectedMotionCountHigh}).`;
     } else if (todayMotionCount > expectedMotionCountHigh) {
       patternStatus = "More Active Than Usual";
-      patternExplanation = `Today has ${todayMotionCount} motion event(s), above the expected high range of ${expectedMotionCountHigh}.`;
+      patternExplanation = `Today has ${todayMotionCount} motion event(s) so far, above the expected range through this time of day (${expectedMotionCountLow}-${expectedMotionCountHigh}).`;
     } else {
       patternStatus = "Normal Pattern";
-      patternExplanation = `Today is within this resident's recent motion baseline.`;
+      patternExplanation = `Today is within this resident's recent motion baseline for this time of day (${expectedMotionCountLow}-${expectedMotionCountHigh}).`;
     }
   }
 
@@ -1354,7 +1438,13 @@ function buildResidentMotionBaseline(residentMotionEvents) {
 
   return {
     baselineDayCount,
+    baselineExcludedDayCount,
     baselineMotionAverage: displayAverage(baselineMotionAverage),
+    baselineMotionMedian: displayAverage(baselineMotionMedian),
+    baselineSameTimeMedian: displayAverage(baselineSameTimeMedian),
+    baselineMethod: completeBaselineDays.length >= AI_BASELINE_MIN_DAYS
+      ? "median_of_complete_days_same_time_comparison"
+      : "median_of_available_days_same_time_comparison",
     todayMotionCount,
     expectedMotionCountLow,
     expectedMotionCountHigh,
@@ -2280,7 +2370,11 @@ async function buildAIMotionSummary() {
       motionCountToday,
       motionCountLastHour,
       baselineDayCount: motionBaseline.baselineDayCount,
+      baselineExcludedDayCount: motionBaseline.baselineExcludedDayCount,
       baselineMotionAverage: motionBaseline.baselineMotionAverage,
+      baselineMotionMedian: motionBaseline.baselineMotionMedian,
+      baselineSameTimeMedian: motionBaseline.baselineSameTimeMedian,
+      baselineMethod: motionBaseline.baselineMethod,
       expectedMotionCountLow: motionBaseline.expectedMotionCountLow,
       expectedMotionCountHigh: motionBaseline.expectedMotionCountHigh,
       patternStatus: motionBaseline.patternStatus,
