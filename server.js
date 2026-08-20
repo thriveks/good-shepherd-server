@@ -1748,19 +1748,11 @@ function buildResidentAIConfidence({ motionBaseline, activeSensorCount, onlineSe
 }
 
 
-function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionBaseline) {
+function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionBaseline, residentTodayMotionEvents = []) {
   const todayKey = localDateKey(new Date());
-  const cleanDays = (Array.isArray(residentMotionDailyStats) ? residentMotionDailyStats : [])
-    .filter((day) => cleanText(day?.dateKey) && day.dateKey !== todayKey)
-    .map((day) => ({
-      dateKey: cleanText(day.dateKey),
-      motionCount: normalizeInteger(day.motionCount, 0),
-      coverageHours: Number.isFinite(Number(day.coverageHours)) ? Number(day.coverageHours) : 0,
-      firstMinuteOfDay: Number.isFinite(Number(day.firstMinuteOfDay)) ? Number(day.firstMinuteOfDay) : null,
-      lastMinuteOfDay: Number.isFinite(Number(day.lastMinuteOfDay)) ? Number(day.lastMinuteOfDay) : null
-    }))
-    .filter((day) => day.motionCount >= 10 && day.coverageHours >= 8)
-    .sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+  const DAYTIME_START_MINUTE = 5 * 60;
+  const OVERNIGHT_END_MINUTE = DAYTIME_START_MINUTE;
+  const OVERNIGHT_EPISODE_GAP_MINUTES = 15;
 
   const median = (values) => {
     const sorted = values.filter(Number.isFinite).slice().sort((a, b) => a - b);
@@ -1773,6 +1765,33 @@ function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionB
     return valid.length ? valid.reduce((sum, value) => sum + value, 0) / valid.length : null;
   };
   const displayNumber = (value) => Number.isFinite(value) ? Math.round(value * 10) / 10 : null;
+  const relativeDifference = (first, second) => {
+    if (!Number.isFinite(first) || !Number.isFinite(second) || first <= 0 || second <= 0) return null;
+    return Math.abs(first - second) / Math.max(first, second);
+  };
+
+  const cleanDays = (Array.isArray(residentMotionDailyStats) ? residentMotionDailyStats : [])
+    .filter((day) => cleanText(day?.dateKey) && day.dateKey !== todayKey)
+    .map((day) => {
+      const reportingSensorCount = Math.max(0, normalizeInteger(day.reportingSensorCount, 0));
+      const reportingRoomCount = Math.max(0, normalizeInteger(day.reportingRoomCount, 0));
+      const motionCount = normalizeInteger(day.motionCount, 0);
+      return {
+        dateKey: cleanText(day.dateKey),
+        motionCount,
+        coverageHours: Number.isFinite(Number(day.coverageHours)) ? Number(day.coverageHours) : 0,
+        firstDaytimeMinute: Number.isFinite(Number(day.firstDaytimeMinute)) ? Number(day.firstDaytimeMinute) : null,
+        lastMinuteOfDay: Number.isFinite(Number(day.lastMinuteOfDay)) ? Number(day.lastMinuteOfDay) : null,
+        overnightMotionCount: Math.max(0, normalizeInteger(day.overnightMotionCount, 0)),
+        overnightEpisodeCount: Math.max(0, normalizeInteger(day.overnightEpisodeCount, 0)),
+        reportingSensorCount,
+        reportingRoomCount,
+        normalizedMotionCount: reportingSensorCount > 0 ? motionCount / reportingSensorCount : null
+      };
+    })
+    .filter((day) => day.motionCount >= 10 && day.coverageHours >= 8)
+    .sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+
   const windowStats = (size) => {
     const days = cleanDays.slice(0, size);
     const counts = days.map((day) => day.motionCount);
@@ -1786,35 +1805,57 @@ function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionB
   const seven = windowStats(7);
   const fourteen = windowStats(14);
   const thirty = windowStats(30);
-  const latestSeven = cleanDays.slice(0, 7).map((day) => day.motionCount);
-  const priorSeven = cleanDays.slice(7, 14).map((day) => day.motionCount);
-  const latestSevenAverage = average(latestSeven);
-  const priorSevenAverage = average(priorSeven);
-  const sevenDayChangePercent = latestSeven.length >= 3 && priorSeven.length >= 3 && priorSevenAverage > 0
-    ? displayNumber(((latestSevenAverage - priorSevenAverage) / priorSevenAverage) * 100)
+  const latestSevenDays = cleanDays.slice(0, 7);
+  const priorSevenDays = cleanDays.slice(7, 14);
+
+  const latestSensorMedian = median(latestSevenDays.map((day) => day.reportingSensorCount).filter((value) => value > 0));
+  const priorSensorMedian = median(priorSevenDays.map((day) => day.reportingSensorCount).filter((value) => value > 0));
+  const latestRoomMedian = median(latestSevenDays.map((day) => day.reportingRoomCount).filter((value) => value > 0));
+  const priorRoomMedian = median(priorSevenDays.map((day) => day.reportingRoomCount).filter((value) => value > 0));
+  const sensorCoverageDifference = relativeDifference(latestSensorMedian, priorSensorMedian);
+  const roomCoverageDifference = relativeDifference(latestRoomMedian, priorRoomMedian);
+  const hasComparisonWindows = latestSevenDays.length >= 3 && priorSevenDays.length >= 3;
+  const hasCoverageData = Number.isFinite(latestSensorMedian) && Number.isFinite(priorSensorMedian);
+  const monitoringCoverageComparable = hasComparisonWindows && hasCoverageData &&
+    (sensorCoverageDifference === null || sensorCoverageDifference <= 0.25) &&
+    (roomCoverageDifference === null || roomCoverageDifference <= 0.25);
+
+  const latestNormalizedAverage = average(latestSevenDays.map((day) => day.normalizedMotionCount));
+  const priorNormalizedAverage = average(priorSevenDays.map((day) => day.normalizedMotionCount));
+  const sevenDayChangePercent = monitoringCoverageComparable && Number.isFinite(priorNormalizedAverage) && priorNormalizedAverage > 0
+    ? displayNumber(((latestNormalizedAverage - priorNormalizedAverage) / priorNormalizedAverage) * 100)
     : null;
 
   let trendDirection = "Learning";
-  if (sevenDayChangePercent !== null) {
+  let trendCoverageStatus = "Learning";
+  if (hasComparisonWindows && !monitoringCoverageComparable) {
+    trendDirection = "Trend Learning";
+    trendCoverageStatus = "Monitoring Coverage Changed";
+  } else if (sevenDayChangePercent !== null) {
+    trendCoverageStatus = "Comparable Coverage";
     if (sevenDayChangePercent <= -15) trendDirection = "Declining Activity";
     else if (sevenDayChangePercent >= 15) trendDirection = "Increasing Activity";
     else trendDirection = "Stable Activity";
   }
 
-  const fullMedian = median(cleanDays.map((day) => day.motionCount));
-  const motionMAD = fullMedian && fullMedian > 0
-    ? median(cleanDays.map((day) => Math.abs(day.motionCount - fullMedian)))
+  const normalizedCounts = cleanDays.map((day) => day.normalizedMotionCount).filter(Number.isFinite);
+  const normalizedMedian = median(normalizedCounts);
+  const normalizedMAD = normalizedMedian && normalizedMedian > 0
+    ? median(normalizedCounts.map((value) => Math.abs(value - normalizedMedian)))
     : null;
-  const firstMinutes = cleanDays.map((day) => day.firstMinuteOfDay).filter(Number.isFinite);
-  const firstMedian = median(firstMinutes);
-  const firstMAD = firstMedian !== null ? median(firstMinutes.map((value) => Math.abs(value - firstMedian))) : null;
+  const firstDaytimeMinutes = cleanDays.map((day) => day.firstDaytimeMinute).filter(Number.isFinite);
+  const firstDaytimeMedian = median(firstDaytimeMinutes);
+  const firstDaytimeMAD = firstDaytimeMedian !== null
+    ? median(firstDaytimeMinutes.map((value) => Math.abs(value - firstDaytimeMedian)))
+    : null;
   const lastMinutes = cleanDays.map((day) => day.lastMinuteOfDay).filter(Number.isFinite);
   const lastMedian = median(lastMinutes);
+  const overnightEpisodeMedian = median(cleanDays.map((day) => day.overnightEpisodeCount).filter(Number.isFinite));
 
   let routineConsistencyScore = null;
-  if (cleanDays.length >= AI_BASELINE_MIN_DAYS && fullMedian && fullMedian > 0) {
-    const activityDispersion = motionMAD !== null ? Math.min(1, motionMAD / fullMedian) : 0.5;
-    const timingDispersion = firstMAD !== null ? Math.min(1, firstMAD / 120) : 0.5;
+  if (cleanDays.length >= AI_BASELINE_MIN_DAYS && normalizedMedian && normalizedMedian > 0) {
+    const activityDispersion = normalizedMAD !== null ? Math.min(1, normalizedMAD / normalizedMedian) : 0.5;
+    const timingDispersion = firstDaytimeMAD !== null ? Math.min(1, firstDaytimeMAD / 120) : 0.5;
     routineConsistencyScore = Math.max(0, Math.min(100, Math.round(100 - (activityDispersion * 55 + timingDispersion * 45))));
   }
   let routineConsistencyLabel = "Learning";
@@ -1855,20 +1896,64 @@ function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionB
     if (delta <= -threshold) return "Earlier Than Usual";
     return "Within Usual Window";
   };
+  const episodeLabel = (value) => {
+    if (!Number.isFinite(value)) return null;
+    const rounded = Math.max(0, Math.round(value));
+    return `${rounded} episode${rounded === 1 ? "" : "s"}`;
+  };
 
-  const todayFirstMinute = localMinuteFromTimestamp(motionBaseline?.firstMotionTodayAt);
+  const todayEventsWithMinute = (Array.isArray(residentTodayMotionEvents) ? residentTodayMotionEvents : [])
+    .map((event) => ({ event, minute: localMinuteFromTimestamp(event?.timestamp) }))
+    .filter((item) => Number.isFinite(item.minute));
+  const todayFirstDaytimeMinute = todayEventsWithMinute
+    .filter((item) => item.minute >= DAYTIME_START_MINUTE)
+    .reduce((minimum, item) => minimum === null || item.minute < minimum ? item.minute : minimum, null);
   const todayLastMinute = localMinuteFromTimestamp(motionBaseline?.lastMotionTodayAt);
+  const overnightEvents = todayEventsWithMinute
+    .filter((item) => item.minute < OVERNIGHT_END_MINUTE)
+    .map((item) => new Date(item.event.timestamp))
+    .filter((date) => !Number.isNaN(date.getTime()))
+    .sort((a, b) => a.getTime() - b.getTime());
+  let overnightEpisodesToday = 0;
+  let previousOvernightEvent = null;
+  for (const eventDate of overnightEvents) {
+    if (!previousOvernightEvent || (eventDate.getTime() - previousOvernightEvent.getTime()) > (OVERNIGHT_EPISODE_GAP_MINUTES * 60 * 1000)) {
+      overnightEpisodesToday += 1;
+    }
+    previousOvernightEvent = eventDate;
+  }
+
+  let overnightStatus = "Learning";
+  if (Number.isFinite(overnightEpisodeMedian)) {
+    if (overnightEpisodesToday >= overnightEpisodeMedian + 2) overnightStatus = "Above Usual";
+    else if (overnightEpisodesToday <= Math.max(0, overnightEpisodeMedian - 2)) overnightStatus = "Below Usual";
+    else overnightStatus = "Within Usual Range";
+  }
+
   const milestones = [
     {
-      key: "first_activity",
-      title: "First Activity",
-      typicalTime: minuteLabel(firstMedian),
-      todayTime: minuteLabel(todayFirstMinute),
-      deviationMinutes: Number.isFinite(todayFirstMinute) && Number.isFinite(firstMedian) ? Math.round(todayFirstMinute - firstMedian) : null,
-      status: timingStatus(todayFirstMinute, firstMedian),
-      detail: Number.isFinite(firstMedian)
-        ? `Typical first monitored activity is around ${minuteLabel(firstMedian)}.`
-        : "Learning the resident's typical first activity time."
+      key: "first_daytime_activity",
+      title: "First Daytime Activity",
+      typicalTime: minuteLabel(firstDaytimeMedian),
+      todayTime: minuteLabel(todayFirstDaytimeMinute),
+      deviationMinutes: Number.isFinite(todayFirstDaytimeMinute) && Number.isFinite(firstDaytimeMedian)
+        ? Math.round(todayFirstDaytimeMinute - firstDaytimeMedian)
+        : null,
+      status: todayFirstDaytimeMinute === null ? "No Daytime Activity Yet" : timingStatus(todayFirstDaytimeMinute, firstDaytimeMedian),
+      detail: Number.isFinite(firstDaytimeMedian)
+        ? `Typical first daytime activity after 5:00 AM is around ${minuteLabel(firstDaytimeMedian)}.`
+        : "Learning the resident's typical first daytime activity time."
+    },
+    {
+      key: "overnight_activity",
+      title: "Overnight Activity",
+      typicalTime: episodeLabel(overnightEpisodeMedian),
+      todayTime: episodeLabel(overnightEpisodesToday),
+      deviationMinutes: null,
+      status: overnightStatus,
+      detail: Number.isFinite(overnightEpisodeMedian)
+        ? `Typical overnight activity before 5:00 AM is about ${episodeLabel(overnightEpisodeMedian)}; episodes are separated by at least ${OVERNIGHT_EPISODE_GAP_MINUTES} minutes.`
+        : "Learning the resident's overnight activity pattern."
     },
     {
       key: "latest_activity",
@@ -1884,12 +1969,18 @@ function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionB
   ];
 
   let trendNarrative = `Using ${cleanDays.length} complete historical day(s).`;
-  if (sevenDayChangePercent !== null) {
+  if (hasComparisonWindows && !monitoringCoverageComparable) {
+    trendNarrative += ` A week-over-week percentage is intentionally withheld because monitoring coverage changed between the comparison windows`;
+    if (Number.isFinite(latestSensorMedian) && Number.isFinite(priorSensorMedian)) {
+      trendNarrative += ` (typical reporting sensors ${priorSensorMedian} → ${latestSensorMedian})`;
+    }
+    trendNarrative += ".";
+  } else if (sevenDayChangePercent !== null) {
     const directionText = sevenDayChangePercent > 0 ? "higher" : sevenDayChangePercent < 0 ? "lower" : "unchanged";
-    trendNarrative += ` Recent 7-day activity is ${Math.abs(sevenDayChangePercent)}% ${directionText} than the preceding comparison week.`;
+    trendNarrative += ` Coverage-normalized recent 7-day activity is ${Math.abs(sevenDayChangePercent)}% ${directionText} than the preceding comparison week.`;
   }
   if (routineConsistencyScore !== null) {
-    trendNarrative += ` Routine consistency is ${routineConsistencyLabel.toLowerCase()} (${routineConsistencyScore}/100).`;
+    trendNarrative += ` Routine consistency is ${routineConsistencyLabel.toLowerCase()} (${routineConsistencyScore}/100), based on coverage-normalized activity and first daytime activity timing.`;
   }
 
   return {
@@ -1908,8 +1999,16 @@ function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionB
     sevenDayChangePercent,
     trendDirection,
     trendNarrative,
-    typicalFirstActivityTime: minuteLabel(firstMedian),
-    typicalLastActivityTime: minuteLabel(lastMedian)
+    trendCoverageStatus,
+    monitoringCoverageComparable,
+    latestReportingSensorMedian: displayNumber(latestSensorMedian),
+    priorReportingSensorMedian: displayNumber(priorSensorMedian),
+    latestReportingRoomMedian: displayNumber(latestRoomMedian),
+    priorReportingRoomMedian: displayNumber(priorRoomMedian),
+    typicalFirstActivityTime: minuteLabel(firstDaytimeMedian),
+    typicalLastActivityTime: minuteLabel(lastMedian),
+    typicalOvernightEpisodes: displayNumber(overnightEpisodeMedian),
+    overnightEpisodesToday
   };
 }
 
@@ -2343,41 +2442,54 @@ async function buildAIMotionSummary() {
     `, [AI_MOTION_HISTORY_EVENT_LIMIT]),
     pool.query(
       `
+      WITH eligible_motion AS (
+        SELECT
+          motion_events.*,
+          (event_timestamp AT TIME ZONE $2)::date AS local_date,
+          (
+            EXTRACT(HOUR FROM event_timestamp AT TIME ZONE $2)::int * 60 +
+            EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
+          ) AS minute_of_day,
+          LAG(event_timestamp) OVER (
+            PARTITION BY COALESCE(resident_id::text, LOWER(TRIM(resident_name))), (event_timestamp AT TIME ZONE $2)::date
+            ORDER BY event_timestamp
+          ) AS previous_event_timestamp
+        FROM motion_events
+        WHERE event_timestamp >= NOW() - ($1::int * INTERVAL '1 day')
+          AND EXISTS (
+            SELECT 1 FROM sensors s
+            JOIN nodes n ON n.node_id = s.node_id
+            WHERE s.id = motion_events.sensor_id
+              AND s.is_active = TRUE
+              AND s.is_deleted = FALSE
+              AND n.is_archived = FALSE
+          )
+      )
       SELECT
         resident_id AS "residentId",
         MAX(resident_name) AS "residentName",
-        (event_timestamp AT TIME ZONE $2)::date::text AS "dateKey",
+        local_date::text AS "dateKey",
         COUNT(*)::int AS "motionCount",
-        COUNT(*) FILTER (
-          WHERE (
-            EXTRACT(HOUR FROM event_timestamp AT TIME ZONE $2)::int * 60 +
-            EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
-          ) <= $3::int
-        )::int AS "sameTimeCount",
+        COUNT(*) FILTER (WHERE minute_of_day <= $3::int)::int AS "sameTimeCount",
         EXTRACT(EPOCH FROM (MAX(event_timestamp) - MIN(event_timestamp))) / 3600.0 AS "coverageHours",
-        MIN(
-          EXTRACT(HOUR FROM event_timestamp AT TIME ZONE $2)::int * 60 +
-          EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
-        )::int AS "firstMinuteOfDay",
-        MAX(
-          EXTRACT(HOUR FROM event_timestamp AT TIME ZONE $2)::int * 60 +
-          EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
-        )::int AS "lastMinuteOfDay"
-      FROM motion_events
-      WHERE event_timestamp >= NOW() - ($1::int * INTERVAL '1 day')
-        AND EXISTS (
-          SELECT 1 FROM sensors s
-          JOIN nodes n ON n.node_id = s.node_id
-          WHERE s.id = motion_events.sensor_id
-            AND s.is_active = TRUE
-            AND s.is_deleted = FALSE
-            AND n.is_archived = FALSE
-        )
+        MIN(minute_of_day) FILTER (WHERE minute_of_day >= 300)::int AS "firstDaytimeMinute",
+        MAX(minute_of_day)::int AS "lastMinuteOfDay",
+        COUNT(*) FILTER (WHERE minute_of_day < 300)::int AS "overnightMotionCount",
+        COUNT(*) FILTER (
+          WHERE minute_of_day < 300
+            AND (
+              previous_event_timestamp IS NULL
+              OR event_timestamp - previous_event_timestamp > INTERVAL '15 minutes'
+            )
+        )::int AS "overnightEpisodeCount",
+        COUNT(DISTINCT sensor_id)::int AS "reportingSensorCount",
+        COUNT(DISTINCT COALESCE(NULLIF(TRIM(room_name), ''), NULLIF(TRIM(source_name), ''), sensor_id::text))::int AS "reportingRoomCount"
+      FROM eligible_motion
       GROUP BY
         resident_id,
         CASE WHEN resident_id IS NULL THEN LOWER(TRIM(resident_name)) ELSE NULL END,
-        (event_timestamp AT TIME ZONE $2)::date
-      ORDER BY (event_timestamp AT TIME ZONE $2)::date DESC
+        local_date
+      ORDER BY local_date DESC
       `,
       [AI_MOTION_HISTORY_DAYS, AI_TIME_ZONE, currentMinuteOfDay]
     ),
@@ -2628,7 +2740,8 @@ async function buildAIMotionSummary() {
     });
     const longitudinalIntelligence = buildResidentLongitudinalIntelligence(
       residentMotionDailyStats,
-      motionBaseline
+      motionBaseline,
+      residentTodayMotionEvents
     );
     const behaviorInsights = buildResidentBehaviorInsights({
       motionBaseline,
@@ -2691,6 +2804,14 @@ async function buildAIMotionSummary() {
       sevenDayChangePercent: longitudinalIntelligence.sevenDayChangePercent,
       trendDirection: longitudinalIntelligence.trendDirection,
       trendNarrative: longitudinalIntelligence.trendNarrative,
+      trendCoverageStatus: longitudinalIntelligence.trendCoverageStatus,
+      monitoringCoverageComparable: longitudinalIntelligence.monitoringCoverageComparable,
+      latestReportingSensorMedian: longitudinalIntelligence.latestReportingSensorMedian,
+      priorReportingSensorMedian: longitudinalIntelligence.priorReportingSensorMedian,
+      latestReportingRoomMedian: longitudinalIntelligence.latestReportingRoomMedian,
+      priorReportingRoomMedian: longitudinalIntelligence.priorReportingRoomMedian,
+      typicalOvernightEpisodes: longitudinalIntelligence.typicalOvernightEpisodes,
+      overnightEpisodesToday: longitudinalIntelligence.overnightEpisodesToday,
       typicalFirstActivityTime: longitudinalIntelligence.typicalFirstActivityTime,
       typicalLastActivityTime: longitudinalIntelligence.typicalLastActivityTime,
       expectedMotionCountLow: motionBaseline.expectedMotionCountLow,
