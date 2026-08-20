@@ -381,6 +381,34 @@ async function initializeDatabase() {
   `);
 
   await pool.query(`
+    INSERT INTO device_mappings (
+      source_key,
+      source_name,
+      resident_name,
+      default_alert_level,
+      default_time_text
+    )
+    VALUES (
+      'thrive-office-wyze',
+      'Office Wyze Camera',
+      'Mary Thompson',
+      'Caution',
+      'Office Motion Event'
+    )
+    ON CONFLICT (source_key) DO NOTHING
+  `);
+}
+
+let residentActivityBackfillPromise = null;
+
+function runResidentActivityBackfill() {
+  if (residentActivityBackfillPromise) {
+    return residentActivityBackfillPromise;
+  }
+
+  console.log(`Resident activity backfill starting for the last ${AI_MOTION_HISTORY_DAYS} day(s).`);
+
+  residentActivityBackfillPromise = pool.query(`
     INSERT INTO resident_activity_daily (
       resident_id, activity_date, motion_count, first_motion_at, last_motion_at, room_counts, hourly_counts, updated_at
     )
@@ -405,27 +433,20 @@ async function initializeDatabase() {
     ) source_rows
     GROUP BY resident_id, (event_timestamp AT TIME ZONE '${AI_TIME_ZONE}')::date
     ON CONFLICT (resident_id, activity_date) DO NOTHING
-  `).catch((error) => {
-    console.warn('Resident activity backfill skipped:', error.message);
-  });
+  `)
+    .then((result) => {
+      console.log(`Resident activity backfill finished. ${result.rowCount || 0} daily row(s) inserted.`);
+      return result;
+    })
+    .catch((error) => {
+      console.warn('Resident activity backfill failed:', error.message);
+      return null;
+    })
+    .finally(() => {
+      residentActivityBackfillPromise = null;
+    });
 
-  await pool.query(`
-    INSERT INTO device_mappings (
-      source_key,
-      source_name,
-      resident_name,
-      default_alert_level,
-      default_time_text
-    )
-    VALUES (
-      'thrive-office-wyze',
-      'Office Wyze Camera',
-      'Mary Thompson',
-      'Caution',
-      'Office Motion Event'
-    )
-    ON CONFLICT (source_key) DO NOTHING
-  `);
+  return residentActivityBackfillPromise;
 }
 
 function cleanText(value) {
@@ -10084,6 +10105,9 @@ initializeDatabase()
       console.log("Remote node command queue enabled.");
       console.log("ESP32 OTA firmware update command support enabled.");
       console.log("Scalable persisted AI dashboard cache enabled.");
+      setImmediate(() => {
+        runResidentActivityBackfill().catch(() => {});
+      });
       scheduleAIDashboardRefresh();
     });
   })
