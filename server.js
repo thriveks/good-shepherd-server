@@ -1747,6 +1747,172 @@ function buildResidentAIConfidence({ motionBaseline, activeSensorCount, onlineSe
   };
 }
 
+
+function buildResidentLongitudinalIntelligence(residentMotionDailyStats, motionBaseline) {
+  const todayKey = localDateKey(new Date());
+  const cleanDays = (Array.isArray(residentMotionDailyStats) ? residentMotionDailyStats : [])
+    .filter((day) => cleanText(day?.dateKey) && day.dateKey !== todayKey)
+    .map((day) => ({
+      dateKey: cleanText(day.dateKey),
+      motionCount: normalizeInteger(day.motionCount, 0),
+      coverageHours: Number.isFinite(Number(day.coverageHours)) ? Number(day.coverageHours) : 0,
+      firstMinuteOfDay: Number.isFinite(Number(day.firstMinuteOfDay)) ? Number(day.firstMinuteOfDay) : null,
+      lastMinuteOfDay: Number.isFinite(Number(day.lastMinuteOfDay)) ? Number(day.lastMinuteOfDay) : null
+    }))
+    .filter((day) => day.motionCount >= 10 && day.coverageHours >= 8)
+    .sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+
+  const median = (values) => {
+    const sorted = values.filter(Number.isFinite).slice().sort((a, b) => a - b);
+    if (sorted.length === 0) return null;
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+  };
+  const average = (values) => {
+    const valid = values.filter(Number.isFinite);
+    return valid.length ? valid.reduce((sum, value) => sum + value, 0) / valid.length : null;
+  };
+  const displayNumber = (value) => Number.isFinite(value) ? Math.round(value * 10) / 10 : null;
+  const windowStats = (size) => {
+    const days = cleanDays.slice(0, size);
+    const counts = days.map((day) => day.motionCount);
+    return {
+      days: days.length,
+      average: displayNumber(average(counts)),
+      median: displayNumber(median(counts))
+    };
+  };
+
+  const seven = windowStats(7);
+  const fourteen = windowStats(14);
+  const thirty = windowStats(30);
+  const latestSeven = cleanDays.slice(0, 7).map((day) => day.motionCount);
+  const priorSeven = cleanDays.slice(7, 14).map((day) => day.motionCount);
+  const latestSevenAverage = average(latestSeven);
+  const priorSevenAverage = average(priorSeven);
+  const sevenDayChangePercent = latestSeven.length >= 3 && priorSeven.length >= 3 && priorSevenAverage > 0
+    ? displayNumber(((latestSevenAverage - priorSevenAverage) / priorSevenAverage) * 100)
+    : null;
+
+  let trendDirection = "Learning";
+  if (sevenDayChangePercent !== null) {
+    if (sevenDayChangePercent <= -15) trendDirection = "Declining Activity";
+    else if (sevenDayChangePercent >= 15) trendDirection = "Increasing Activity";
+    else trendDirection = "Stable Activity";
+  }
+
+  const fullMedian = median(cleanDays.map((day) => day.motionCount));
+  const motionMAD = fullMedian && fullMedian > 0
+    ? median(cleanDays.map((day) => Math.abs(day.motionCount - fullMedian)))
+    : null;
+  const firstMinutes = cleanDays.map((day) => day.firstMinuteOfDay).filter(Number.isFinite);
+  const firstMedian = median(firstMinutes);
+  const firstMAD = firstMedian !== null ? median(firstMinutes.map((value) => Math.abs(value - firstMedian))) : null;
+  const lastMinutes = cleanDays.map((day) => day.lastMinuteOfDay).filter(Number.isFinite);
+  const lastMedian = median(lastMinutes);
+
+  let routineConsistencyScore = null;
+  if (cleanDays.length >= AI_BASELINE_MIN_DAYS && fullMedian && fullMedian > 0) {
+    const activityDispersion = motionMAD !== null ? Math.min(1, motionMAD / fullMedian) : 0.5;
+    const timingDispersion = firstMAD !== null ? Math.min(1, firstMAD / 120) : 0.5;
+    routineConsistencyScore = Math.max(0, Math.min(100, Math.round(100 - (activityDispersion * 55 + timingDispersion * 45))));
+  }
+  let routineConsistencyLabel = "Learning";
+  if (routineConsistencyScore !== null) {
+    if (routineConsistencyScore >= 80) routineConsistencyLabel = "Highly Consistent";
+    else if (routineConsistencyScore >= 60) routineConsistencyLabel = "Consistent";
+    else if (routineConsistencyScore >= 40) routineConsistencyLabel = "Variable";
+    else routineConsistencyLabel = "Highly Variable";
+  }
+
+  const localMinuteFromTimestamp = (timestamp) => {
+    if (!timestamp) return null;
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) return null;
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: AI_TIME_ZONE,
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(date);
+    const hour = Number(parts.find((part) => part.type === "hour")?.value);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value);
+    return Number.isFinite(hour) && Number.isFinite(minute) ? (hour * 60) + minute : null;
+  };
+  const minuteLabel = (minuteOfDay) => {
+    if (!Number.isFinite(minuteOfDay)) return null;
+    const normalized = ((Math.round(minuteOfDay) % 1440) + 1440) % 1440;
+    const hour = Math.floor(normalized / 60);
+    const minute = normalized % 60;
+    const suffix = hour >= 12 ? "PM" : "AM";
+    const displayHour = hour % 12 || 12;
+    return `${displayHour}:${String(minute).padStart(2, "0")} ${suffix}`;
+  };
+  const timingStatus = (actual, typical, threshold = 45) => {
+    if (!Number.isFinite(actual) || !Number.isFinite(typical)) return "Learning";
+    const delta = actual - typical;
+    if (delta >= threshold) return "Later Than Usual";
+    if (delta <= -threshold) return "Earlier Than Usual";
+    return "Within Usual Window";
+  };
+
+  const todayFirstMinute = localMinuteFromTimestamp(motionBaseline?.firstMotionTodayAt);
+  const todayLastMinute = localMinuteFromTimestamp(motionBaseline?.lastMotionTodayAt);
+  const milestones = [
+    {
+      key: "first_activity",
+      title: "First Activity",
+      typicalTime: minuteLabel(firstMedian),
+      todayTime: minuteLabel(todayFirstMinute),
+      deviationMinutes: Number.isFinite(todayFirstMinute) && Number.isFinite(firstMedian) ? Math.round(todayFirstMinute - firstMedian) : null,
+      status: timingStatus(todayFirstMinute, firstMedian),
+      detail: Number.isFinite(firstMedian)
+        ? `Typical first monitored activity is around ${minuteLabel(firstMedian)}.`
+        : "Learning the resident's typical first activity time."
+    },
+    {
+      key: "latest_activity",
+      title: "Latest Activity So Far",
+      typicalTime: minuteLabel(lastMedian),
+      todayTime: minuteLabel(todayLastMinute),
+      deviationMinutes: null,
+      status: todayLastMinute !== null ? "Tracking" : "No Activity Yet",
+      detail: Number.isFinite(lastMedian)
+        ? `Typical final monitored activity is around ${minuteLabel(lastMedian)}; today's value remains provisional until the day is complete.`
+        : "Learning the resident's typical evening activity endpoint."
+    }
+  ];
+
+  let trendNarrative = `Using ${cleanDays.length} complete historical day(s).`;
+  if (sevenDayChangePercent !== null) {
+    const directionText = sevenDayChangePercent > 0 ? "higher" : sevenDayChangePercent < 0 ? "lower" : "unchanged";
+    trendNarrative += ` Recent 7-day activity is ${Math.abs(sevenDayChangePercent)}% ${directionText} than the preceding comparison week.`;
+  }
+  if (routineConsistencyScore !== null) {
+    trendNarrative += ` Routine consistency is ${routineConsistencyLabel.toLowerCase()} (${routineConsistencyScore}/100).`;
+  }
+
+  return {
+    routineMilestones: milestones,
+    routineConsistencyScore,
+    routineConsistencyLabel,
+    sevenDayAverage: seven.average,
+    fourteenDayAverage: fourteen.average,
+    thirtyDayAverage: thirty.average,
+    sevenDayMedian: seven.median,
+    fourteenDayMedian: fourteen.median,
+    thirtyDayMedian: thirty.median,
+    sevenDayDaysUsed: seven.days,
+    fourteenDayDaysUsed: fourteen.days,
+    thirtyDayDaysUsed: thirty.days,
+    sevenDayChangePercent,
+    trendDirection,
+    trendNarrative,
+    typicalFirstActivityTime: minuteLabel(firstMedian),
+    typicalLastActivityTime: minuteLabel(lastMedian)
+  };
+}
+
 function buildResidentBehaviorInsights({ motionBaseline, roomIntelligence, presenceIntelligence, aiStatus }) {
   const insights = [];
 
@@ -2188,7 +2354,15 @@ async function buildAIMotionSummary() {
             EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
           ) <= $3::int
         )::int AS "sameTimeCount",
-        EXTRACT(EPOCH FROM (MAX(event_timestamp) - MIN(event_timestamp))) / 3600.0 AS "coverageHours"
+        EXTRACT(EPOCH FROM (MAX(event_timestamp) - MIN(event_timestamp))) / 3600.0 AS "coverageHours",
+        MIN(
+          EXTRACT(HOUR FROM event_timestamp AT TIME ZONE $2)::int * 60 +
+          EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
+        )::int AS "firstMinuteOfDay",
+        MAX(
+          EXTRACT(HOUR FROM event_timestamp AT TIME ZONE $2)::int * 60 +
+          EXTRACT(MINUTE FROM event_timestamp AT TIME ZONE $2)::int
+        )::int AS "lastMinuteOfDay"
       FROM motion_events
       WHERE event_timestamp >= NOW() - ($1::int * INTERVAL '1 day')
         AND EXISTS (
@@ -2452,12 +2626,31 @@ async function buildAIMotionSummary() {
       actionGuidance,
       latestActionLog
     });
+    const longitudinalIntelligence = buildResidentLongitudinalIntelligence(
+      residentMotionDailyStats,
+      motionBaseline
+    );
     const behaviorInsights = buildResidentBehaviorInsights({
       motionBaseline,
       roomIntelligence,
       presenceIntelligence,
       aiStatus
     });
+
+    if (longitudinalIntelligence.sevenDayChangePercent !== null) {
+      behaviorInsights.push({
+        type: "longitudinal_trend",
+        title: longitudinalIntelligence.trendDirection,
+        detail: longitudinalIntelligence.trendNarrative
+      });
+    }
+    if (longitudinalIntelligence.routineConsistencyScore !== null) {
+      behaviorInsights.push({
+        type: "routine_consistency",
+        title: `Routine ${longitudinalIntelligence.routineConsistencyLabel}`,
+        detail: `Consistency score ${longitudinalIntelligence.routineConsistencyScore}/100 based on day-to-day activity volume and first-activity timing.`
+      });
+    }
 
     return {
       residentId: resident.id,
@@ -2483,6 +2676,23 @@ async function buildAIMotionSummary() {
       baselineMotionMedian: motionBaseline.baselineMotionMedian,
       baselineSameTimeMedian: motionBaseline.baselineSameTimeMedian,
       baselineMethod: motionBaseline.baselineMethod,
+      routineMilestones: longitudinalIntelligence.routineMilestones,
+      routineConsistencyScore: longitudinalIntelligence.routineConsistencyScore,
+      routineConsistencyLabel: longitudinalIntelligence.routineConsistencyLabel,
+      sevenDayAverage: longitudinalIntelligence.sevenDayAverage,
+      fourteenDayAverage: longitudinalIntelligence.fourteenDayAverage,
+      thirtyDayAverage: longitudinalIntelligence.thirtyDayAverage,
+      sevenDayMedian: longitudinalIntelligence.sevenDayMedian,
+      fourteenDayMedian: longitudinalIntelligence.fourteenDayMedian,
+      thirtyDayMedian: longitudinalIntelligence.thirtyDayMedian,
+      sevenDayDaysUsed: longitudinalIntelligence.sevenDayDaysUsed,
+      fourteenDayDaysUsed: longitudinalIntelligence.fourteenDayDaysUsed,
+      thirtyDayDaysUsed: longitudinalIntelligence.thirtyDayDaysUsed,
+      sevenDayChangePercent: longitudinalIntelligence.sevenDayChangePercent,
+      trendDirection: longitudinalIntelligence.trendDirection,
+      trendNarrative: longitudinalIntelligence.trendNarrative,
+      typicalFirstActivityTime: longitudinalIntelligence.typicalFirstActivityTime,
+      typicalLastActivityTime: longitudinalIntelligence.typicalLastActivityTime,
       expectedMotionCountLow: motionBaseline.expectedMotionCountLow,
       expectedMotionCountHigh: motionBaseline.expectedMotionCountHigh,
       patternStatus: motionBaseline.patternStatus,
