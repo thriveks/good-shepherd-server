@@ -11,7 +11,7 @@
 
 const express = require("express");
 const { Pool } = require("pg");
-const { randomUUID } = require("crypto");
+const { randomUUID, randomBytes, randomInt, createHash } = require("crypto");
 const https = require("https");
 const http = require("http");
 const mqtt = require("mqtt");
@@ -80,7 +80,7 @@ app.use((req, res, next) => {
         res.header("Access-Control-Allow-Origin", origin);
         res.header(
   "Access-Control-Allow-Headers",
-  "Origin, X-Requested-With, Content-Type, Accept, x-webhook-secret, x-app-build, x-app-version, x-app-client"
+  "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-webhook-secret, x-app-build, x-app-version, x-app-client"
 );
         res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
     }
@@ -379,6 +379,24 @@ async function initializeDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  // Customer access is resident-based: every resident receives one unique 4-digit code.
+  await pool.query(`ALTER TABLE residents ADD COLUMN IF NOT EXISTS access_code TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS residents_access_code_unique_idx ON residents (access_code) WHERE access_code IS NOT NULL`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_sessions (
+      token_hash TEXT PRIMARY KEY,
+      resident_id UUID NOT NULL REFERENCES residents(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS customer_sessions_resident_id_idx ON customer_sessions (resident_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS customer_sessions_expires_at_idx ON customer_sessions (expires_at)`);
+
+  await ensureResidentAccessCodes();
 
   await pool.query(`
     INSERT INTO device_mappings (
@@ -3339,6 +3357,119 @@ async function incrementResidentDailyActivity({ resident, event, sensor }) {
 }
 
 
+const CUSTOMER_SESSION_DAYS = 180;
+const CUSTOMER_CODE_WINDOW_MS = 15 * 60 * 1000;
+const CUSTOMER_CODE_MAX_ATTEMPTS = 5;
+const customerCodeAttempts = new Map();
+
+function hashSessionToken(token) {
+  return createHash("sha256").update(String(token)).digest("hex");
+}
+
+function bearerToken(req) {
+  const authorization = cleanText(req.header("authorization"));
+  if (!authorization || !authorization.toLowerCase().startsWith("bearer ")) return null;
+  return authorization.slice(7).trim() || null;
+}
+
+function normalizeAccessCode(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return digits.length === 4 ? digits : null;
+}
+
+async function generateUniqueResidentAccessCode() {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const candidate = String(randomInt(0, 10000)).padStart(4, "0");
+    const existing = await pool.query(`SELECT 1 FROM residents WHERE access_code = $1 LIMIT 1`, [candidate]);
+    if (existing.rowCount === 0) return candidate;
+  }
+  throw new Error("Unable to allocate a unique 4-digit resident access code");
+}
+
+async function ensureResidentAccessCodes() {
+  const missing = await pool.query(`SELECT id FROM residents WHERE access_code IS NULL OR access_code !~ '^[0-9]{4}$' ORDER BY created_at ASC`);
+  for (const row of missing.rows) {
+    let assigned = false;
+    while (!assigned) {
+      const code = await generateUniqueResidentAccessCode();
+      try {
+        await pool.query(`UPDATE residents SET access_code = $1 WHERE id = $2`, [code, row.id]);
+        assigned = true;
+      } catch (error) {
+        if (error?.code !== "23505") throw error;
+      }
+    }
+  }
+}
+
+async function authenticatedCustomerSession(req) {
+  const token = bearerToken(req);
+  if (!token) return null;
+
+  const tokenHash = hashSessionToken(token);
+  const result = await pool.query(
+    `
+    SELECT
+      s.resident_id AS "residentId",
+      s.expires_at AS "expiresAt",
+      r.name AS "residentName"
+    FROM customer_sessions s
+    JOIN residents r ON r.id = s.resident_id
+    WHERE s.token_hash = $1
+      AND s.expires_at > NOW()
+      AND r.is_deleted = FALSE
+    LIMIT 1
+    `,
+    [tokenHash]
+  );
+
+  const session = result.rows[0] || null;
+  if (session) {
+    pool.query(`UPDATE customer_sessions SET last_used_at = NOW() WHERE token_hash = $1`, [tokenHash]).catch(() => {});
+  }
+  return session;
+}
+
+async function requireCustomerSession(req, res) {
+  const session = await authenticatedCustomerSession(req);
+  if (!session) {
+    res.status(401).json({ success: false, error: "Access code required" });
+    return null;
+  }
+  return session;
+}
+
+function customerAttemptKey(req) {
+  return cleanText(req.ip || req.socket?.remoteAddress || "unknown") || "unknown";
+}
+
+function customerCodeRateLimited(req) {
+  const key = customerAttemptKey(req);
+  const now = Date.now();
+  const prior = customerCodeAttempts.get(key);
+  if (!prior || now - prior.startedAt >= CUSTOMER_CODE_WINDOW_MS) {
+    customerCodeAttempts.set(key, { startedAt: now, attempts: 0 });
+    return false;
+  }
+  return prior.attempts >= CUSTOMER_CODE_MAX_ATTEMPTS;
+}
+
+function recordCustomerCodeFailure(req) {
+  const key = customerAttemptKey(req);
+  const now = Date.now();
+  const prior = customerCodeAttempts.get(key);
+  if (!prior || now - prior.startedAt >= CUSTOMER_CODE_WINDOW_MS) {
+    customerCodeAttempts.set(key, { startedAt: now, attempts: 1 });
+  } else {
+    prior.attempts += 1;
+    customerCodeAttempts.set(key, prior);
+  }
+}
+
+function clearCustomerCodeFailures(req) {
+  customerCodeAttempts.delete(customerAttemptKey(req));
+}
+
 function isAuthorizedWebhook(req) {
   if (!WEBHOOK_SECRET) {
     return true;
@@ -3748,6 +3879,7 @@ function residentSelectSQL() {
       last_activity AS "lastActivity",
       active_warnings AS "activeWarnings",
       status_text AS "statusText",
+      access_code AS "accessCode",
       is_deleted AS "isDeleted",
       deleted_at AS "deletedAt",
       created_at AS "createdAt",
@@ -4697,6 +4829,7 @@ async function findOrCreateResidentFromEvent({ residentName, locationName, alert
       last_activity AS "lastActivity",
       active_warnings AS "activeWarnings",
       status_text AS "statusText",
+      access_code AS "accessCode",
       is_deleted AS "isDeleted",
       deleted_at AS "deletedAt",
       created_at AS "createdAt",
@@ -5197,6 +5330,7 @@ async function findResidentForSensorAssignment(client, { residentId, residentNam
       last_activity AS "lastActivity",
       active_warnings AS "activeWarnings",
       status_text AS "statusText",
+      access_code AS "accessCode",
       is_deleted AS "isDeleted",
       deleted_at AS "deletedAt",
       created_at AS "createdAt",
@@ -5777,6 +5911,135 @@ async function failStaleSensorCommands(client, nodeId) {
     expiredRunningCount: runningResult.rowCount || 0
   };
 }
+
+app.post("/customer/access", async (req, res) => {
+  try {
+    await ensureResidentAccessCodes();
+    if (customerCodeRateLimited(req)) {
+      return res.status(429).json({
+        success: false,
+        error: "Too many incorrect codes. Please wait a few minutes and try again."
+      });
+    }
+
+    const accessCode = normalizeAccessCode(req.body?.code);
+    if (!accessCode) {
+      recordCustomerCodeFailure(req);
+      return res.status(400).json({ success: false, error: "Enter the 4-digit access code." });
+    }
+
+    const residentResult = await pool.query(
+      `${residentSelectSQL()} WHERE access_code = $1 AND is_deleted = FALSE LIMIT 1`,
+      [accessCode]
+    );
+    const resident = residentResult.rows[0];
+    if (!resident) {
+      recordCustomerCodeFailure(req);
+      return res.status(401).json({ success: false, error: "That access code was not recognized." });
+    }
+
+    clearCustomerCodeFailures(req);
+    const token = randomBytes(32).toString("base64url");
+    const tokenHash = hashSessionToken(token);
+    const expiresAt = new Date(Date.now() + CUSTOMER_SESSION_DAYS * 24 * 60 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO customer_sessions (token_hash, resident_id, expires_at) VALUES ($1, $2, $3)`,
+      [tokenHash, resident.id, expiresAt.toISOString()]
+    );
+
+    return res.status(200).json({
+      success: true,
+      token,
+      expiresAt: expiresAt.toISOString(),
+      residentId: resident.id,
+      residentName: resident.name
+    });
+  } catch (error) {
+    console.error("Customer access failed:", error);
+    return res.status(500).json({ success: false, error: "Unable to connect this home right now." });
+  }
+});
+
+app.get("/customer/session", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res);
+    if (!session) return;
+    return res.status(200).json({
+      success: true,
+      residentId: session.residentId,
+      residentName: session.residentName
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: "Session check failed" });
+  }
+});
+
+app.post("/customer/logout", async (req, res) => {
+  try {
+    const token = bearerToken(req);
+    if (token) await pool.query(`DELETE FROM customer_sessions WHERE token_hash = $1`, [hashSessionToken(token)]);
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(200).json({ success: true });
+  }
+});
+
+app.get("/customer/bootstrap", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res);
+    if (!session) return;
+    const residentId = session.residentId;
+
+    const residentResult = await pool.query(
+      `${residentSelectSQL()} WHERE id = $1 AND is_deleted = FALSE LIMIT 1`,
+      [residentId]
+    );
+    const resident = residentResult.rows[0];
+    if (!resident) return res.status(404).json({ success: false, error: "Assigned resident not found" });
+
+    const camerasResult = await pool.query(
+      `${cameraSelectSQL()} WHERE resident_id = $1 AND is_deleted = FALSE ORDER BY source_name ASC`,
+      [residentId]
+    );
+    const eventsResult = await pool.query(
+      `${eventSelectSQL()} WHERE LOWER(TRIM(resident_name)) = LOWER(TRIM($1)) ORDER BY timestamp DESC LIMIT 50`,
+      [resident.name]
+    );
+
+    const { accessCode: _privateAccessCode, ...customerResident } = resident;
+    return res.status(200).json({
+      success: true,
+      resident: customerResident,
+      cameras: camerasResult.rows.map((camera) => ({ ...camera, rtspUrl: "" })),
+      events: eventsResult.rows
+    });
+  } catch (error) {
+    console.error("Customer bootstrap failed:", error);
+    return res.status(500).json({ success: false, error: "Customer dashboard load failed" });
+  }
+});
+
+app.get("/customer/ai/dashboard", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res);
+    if (!session) return;
+    const residentId = session.residentId;
+
+    const fullSummary = await buildAIMotionSummary();
+    const residents = (fullSummary.residents || []).filter((resident) => String(resident.residentId) === String(residentId));
+    const summary = { ...fullSummary, residentCount: residents.length, residents };
+    const briefing = buildAIBriefingFromSummary(summary);
+    return res.status(200).json({
+      success: true,
+      generatedAt: new Date().toISOString(),
+      summary,
+      briefing
+    });
+  } catch (error) {
+    console.error("Customer AI dashboard failed:", error);
+    return res.status(500).json({ success: false, error: "Customer AI dashboard load failed" });
+  }
+});
 
 app.get("/", async (req, res) => {
   res.json({
@@ -7142,6 +7405,7 @@ app.delete("/nodes/:nodeId", async (req, res) => {
 
 app.get("/residents", async (req, res) => {
   try {
+    await ensureResidentAccessCodes();
     if (!requireAuthorizedRequest(req, res)) {
       return;
     }
@@ -7256,10 +7520,16 @@ app.post("/residents", async (req, res) => {
       });
     }
 
+    await ensureResidentAccessCodes();
+    const savedResidentResult = await pool.query(
+      `${residentSelectSQL()} WHERE id = $1 LIMIT 1`,
+      [residentId]
+    );
+
     return res.status(200).json({
       success: true,
       message: "Resident saved",
-      resident: result.rows[0]
+      resident: savedResidentResult.rows[0] || result.rows[0]
     });
   } catch (error) {
     console.error("Resident save failed:", error);
