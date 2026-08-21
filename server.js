@@ -3360,6 +3360,7 @@ async function incrementResidentDailyActivity({ resident, event, sensor }) {
 const CUSTOMER_SESSION_DAYS = 180;
 const CUSTOMER_CODE_WINDOW_MS = 15 * 60 * 1000;
 const CUSTOMER_CODE_MAX_ATTEMPTS = 5;
+const STAFF_ACCESS_CODE = normalizeAccessCode(process.env.STAFF_ACCESS_CODE) || "2468";
 const customerCodeAttempts = new Map();
 
 function hashSessionToken(token) {
@@ -3380,6 +3381,7 @@ function normalizeAccessCode(value) {
 async function generateUniqueResidentAccessCode() {
   for (let attempt = 0; attempt < 1000; attempt += 1) {
     const candidate = String(randomInt(0, 10000)).padStart(4, "0");
+    if (candidate === STAFF_ACCESS_CODE) continue;
     const existing = await pool.query(`SELECT 1 FROM residents WHERE access_code = $1 LIMIT 1`, [candidate]);
     if (existing.rowCount === 0) return candidate;
   }
@@ -5928,6 +5930,14 @@ app.post("/customer/access", async (req, res) => {
       return res.status(400).json({ success: false, error: "Enter the 4-digit access code." });
     }
 
+    if (accessCode === STAFF_ACCESS_CODE) {
+      clearCustomerCodeFailures(req);
+      return res.status(200).json({
+        success: true,
+        mode: "staff"
+      });
+    }
+
     const residentResult = await pool.query(
       `${residentSelectSQL()} WHERE access_code = $1 AND is_deleted = FALSE LIMIT 1`,
       [accessCode]
@@ -5949,6 +5959,7 @@ app.post("/customer/access", async (req, res) => {
 
     return res.status(200).json({
       success: true,
+      mode: "customer",
       token,
       expiresAt: expiresAt.toISOString(),
       residentId: resident.id,
@@ -7520,16 +7531,10 @@ app.post("/residents", async (req, res) => {
       });
     }
 
-    await ensureResidentAccessCodes();
-    const savedResidentResult = await pool.query(
-      `${residentSelectSQL()} WHERE id = $1 LIMIT 1`,
-      [residentId]
-    );
-
     return res.status(200).json({
       success: true,
       message: "Resident saved",
-      resident: savedResidentResult.rows[0] || result.rows[0]
+      resident: result.rows[0]
     });
   } catch (error) {
     console.error("Resident save failed:", error);
