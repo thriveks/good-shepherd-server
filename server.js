@@ -2157,6 +2157,24 @@ function buildResidentActionGuidance({
     };
   }
 
+  if (aiLevel === "Learning" || (
+    patternStatus === "Insufficient Baseline" &&
+    activeSensorCount > 0 &&
+    offlineSensorCount === 0 &&
+    recentCriticalOpenAlertCount === 0 &&
+    recentCautionOpenAlertCount === 0
+  )) {
+    return {
+      actionLevel: "Learning",
+      actionTitle: "Learning resident routine",
+      actionSummary: "The system is collecting baseline history and no staff follow-up is currently required.",
+      actionItems: [
+        "Continue normal monitoring while baseline history is collected."
+      ],
+      nextCheckMinutes: null
+    };
+  }
+
   if (aiLevel === "Watch" || recentCautionOpenAlertCount > 0 || coverageStatus === "No Motion Today") {
     return {
       actionLevel: "Watch",
@@ -2233,10 +2251,16 @@ function buildResidentFollowUpStatus({
     ? actionGuidance.nextCheckMinutes
     : null;
 
-  if (actionLevel === "Normal") {
+  if (actionLevel === "Normal" || actionLevel === "Observe" || actionLevel === "Learning") {
+    const followUpExplanation = actionLevel === "Observe"
+      ? "Observation only. No staff follow-up is required unless the resident's status escalates."
+      : actionLevel === "Learning"
+        ? "Baseline learning is in progress. No staff follow-up is required unless another warning signal appears."
+        : "Current action recommendation is normal monitoring.";
+
     return {
       followUpStatus: "No Action Needed",
-      followUpExplanation: "Current action recommendation is normal monitoring.",
+      followUpExplanation,
       followUpDueAt: null,
       minutesUntilFollowUpDue: null
     };
@@ -2313,6 +2337,7 @@ function buildAIStatusForResident({
   residentSensors,
   latestMotionEvent,
   latestMotionSensor,
+  motionBaseline,
   inactiveMinutes,
   openAlertCount,
   recentOpenAlertCount,
@@ -2323,6 +2348,7 @@ function buildAIStatusForResident({
   offlineSensorCount
 }) {
   const hasInactiveMinutes = Number.isFinite(inactiveMinutes);
+  const baselineDayCount = normalizeInteger(motionBaseline?.baselineDayCount, 0);
   const motionCountLastHour = residentEvents.filter((event) => {
     const eventDate = new Date(event.timestamp);
     return isMotionEventRow(event) &&
@@ -2386,6 +2412,16 @@ function buildAIStatusForResident({
       aiExplanation: hasInactiveMinutes && inactiveMinutes >= AI_INACTIVE_WATCH_MINUTES
         ? `No routine ESP32 motion has been seen for ${inactiveMinutes} minutes. Continue watching for a missed routine.`
         : "One unresolved event is open. Keep watching for another missed activity or sensor issue."
+    };
+  }
+
+  // Healthy residents without enough usable baseline history are still learning.
+  // Do not promote "No Motion Today" to Watch unless another real warning signal exists.
+  if (baselineDayCount < AI_BASELINE_MIN_DAYS && offlineSensorCount === 0) {
+    return {
+      aiStatus: "Learning",
+      aiLevel: "Learning",
+      aiExplanation: `Learning this resident's routine from ${baselineDayCount} usable baseline day(s). Sensors are online and no current warning signal requires follow-up.`
     };
   }
 
@@ -2726,6 +2762,7 @@ async function buildAIMotionSummary() {
       residentSensors,
       latestMotionEvent,
       latestMotionSensor,
+      motionBaseline,
       inactiveMinutes,
       openAlertCount: openAlerts.length,
       recentOpenAlertCount: recentOpenAlerts.length,
@@ -2948,7 +2985,10 @@ function aiBriefingResidentPriorityScore(resident) {
     score += 120;
   } else if (followUpStatus === "due again") {
     score += 110;
-  } else if (followUpStatus === "not logged" && actionLevel !== "normal") {
+  } else if (
+    followUpStatus === "not logged" &&
+    !["normal", "observe", "learning"].includes(actionLevel)
+  ) {
     score += 85;
   } else if (followUpStatus === "logged") {
     score += 20;
@@ -3027,6 +3067,10 @@ function aiBriefingPriorityLevel(resident) {
     return "Setup";
   }
 
+  if (actionLevel === "learning" || aiLevel === "learning") {
+    return "Learning";
+  }
+
   return "Normal";
 }
 
@@ -3069,7 +3113,8 @@ function aiBriefingPriorityItem(resident) {
 function buildAIBriefingFromSummary(summary) {
   const residents = Array.isArray(summary?.residents) ? summary.residents : [];
   const nonNormalActionResidents = residents.filter((resident) => {
-    return cleanText(resident.actionLevel).toLowerCase() !== "normal";
+    const actionLevel = cleanText(resident.actionLevel).toLowerCase();
+    return !["normal", "observe", "learning"].includes(actionLevel);
   });
   const followUpDueResidents = residents.filter((resident) => {
     const status = cleanText(resident.followUpStatus).toLowerCase();
@@ -3078,7 +3123,8 @@ function buildAIBriefingFromSummary(summary) {
   const unloggedFollowUpResidents = residents.filter((resident) => {
     const status = cleanText(resident.followUpStatus).toLowerCase();
     const actionLevel = cleanText(resident.actionLevel).toLowerCase();
-    return status === "not logged" && actionLevel !== "normal";
+    return status === "not logged" &&
+      !["normal", "observe", "learning"].includes(actionLevel);
   });
   const technicalResidents = residents.filter((resident) => {
     return cleanText(resident.actionLevel).toLowerCase() === "technical" ||
@@ -3093,7 +3139,8 @@ function buildAIBriefingFromSummary(summary) {
     return aiLevel === "watch" || aiLevel === "warning" || aiLevel === "critical";
   });
   const normalResidents = residents.filter((resident) => {
-    return cleanText(resident.actionLevel).toLowerCase() === "normal";
+    const actionLevel = cleanText(resident.actionLevel).toLowerCase();
+    return ["normal", "observe", "learning"].includes(actionLevel);
   });
 
   const sortedPriorities = nonNormalActionResidents
