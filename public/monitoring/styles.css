@@ -29,3 +29,7 @@
 
 /* Monitoring Center v3.5: resident access code visibility */
 .access-code-inline{display:inline-flex;align-items:center;gap:4px;margin-top:5px;padding:3px 7px;border-radius:7px;background:rgba(118,199,255,.08);border:1px solid rgba(118,199,255,.18);color:#b9dff8;font-size:10px}.access-code-inline strong{font-size:11px;letter-spacing:.08em;color:#e8f6ff}.access-code-pill{border-color:rgba(118,199,255,.30)!important;background:rgba(118,199,255,.10)!important;color:#c8e9ff!important}.access-code-pill b{color:#f0f9ff!important}.access-code-fact{border-color:rgba(118,199,255,.22)}.access-code-fact strong{font-size:18px;letter-spacing:.12em;color:#dff2ff}
+
+/* v3.6 resolved-state semantics */
+.resolved-priority{background:rgba(128,216,167,.18);color:#9fe3bc;width:48px}.metric .v.resolved{color:#9fe3bc}.queue-row:has(.resolved-priority){opacity:.82}.case-badge-resolved{background:rgba(128,216,167,.13)!important;color:#9fe3bc!important;border-color:rgba(128,216,167,.28)!important}
+@media(min-width:1101px){.metrics{grid-template-columns:repeat(7,minmax(110px,1fr))}}

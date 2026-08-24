@@ -477,6 +477,7 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_cases_resident_idx ON monitoring_cases (resident_id, opened_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_cases_status_idx ON monitoring_cases (status, opened_at DESC)`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS monitoring_cases_one_active_per_resident_idx ON monitoring_cases (resident_id) WHERE status IN ('open','accepted','escalated')`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS signal_cleared_at TIMESTAMPTZ`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS monitoring_case_events (
       id UUID PRIMARY KEY,
@@ -6876,7 +6877,7 @@ async function monitoringLatestCasesByResident() {
            id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
            assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
            opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
-           resolved_by_operator_name AS "resolvedByOperatorName", resolution, updated_at AS "updatedAt"
+           resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     ORDER BY resident_id, opened_at DESC
   `);
@@ -6888,7 +6889,7 @@ async function monitoringCasePayloadForResident(residentId) {
     SELECT id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
            assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
            opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
-           resolved_by_operator_name AS "resolvedByOperatorName", resolution, updated_at AS "updatedAt"
+           resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     WHERE resident_id=$1
     ORDER BY CASE WHEN status IN ('open','accepted','escalated') THEN 0 ELSE 1 END, opened_at DESC
@@ -6917,25 +6918,60 @@ const MONITORING_CASE_ACTIONS = new Map([
   ['note', 'Operator note']
 ]);
 
+
+function monitoringPriorityRank(priority) {
+  return ({ P1:1, P2:2, P3:3, P4:4, P5:5 })[cleanText(priority).toUpperCase()] || 5;
+}
+
+function monitoringOperationalCaseState(resident, activeCase, latestCase) {
+  const underlyingPriority = cleanText(resident?.priority || 'P5').toUpperCase() || 'P5';
+  if (activeCase) {
+    return { underlyingPriority, queuePriority:underlyingPriority, operationalStatus:'active', operationalResolved:false };
+  }
+  if (!latestCase || latestCase.status !== 'resolved') {
+    return { underlyingPriority, queuePriority:underlyingPriority, operationalStatus:'monitoring', operationalResolved:false };
+  }
+
+  // A resolved case suppresses the same still-present signal from the active response counts.
+  // It stops suppressing once the signal actually clears to P5, or if the live priority worsens.
+  const signalPreviouslyCleared = Boolean(latestCase.signalClearedAt);
+  const worsenedSinceResolution = monitoringPriorityRank(underlyingPriority) < monitoringPriorityRank(latestCase.priority);
+  if (underlyingPriority === 'P5' || signalPreviouslyCleared || worsenedSinceResolution) {
+    return { underlyingPriority, queuePriority:underlyingPriority, operationalStatus:'monitoring', operationalResolved:false };
+  }
+  return { underlyingPriority, queuePriority:'RESOLVED', operationalStatus:'resolved', operationalResolved:true };
+}
+
 app.get("/monitoring/api/dashboard", async (req, res) => {
   try {
     const operator = await requireMonitoringOperator(req, res); if (!operator) return;
     const summary = await loadMonitoringSummaryFast();
     const residents = (summary.residents || []).map(monitoringResidentPayload);
-    const order = { P1:1, P2:2, P3:3, P4:4, P5:5 };
-    residents.sort((a,b) => (order[a.priority]-order[b.priority]) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
     const [activeCases, latestCases, accessCodesResult] = await Promise.all([
       monitoringActiveCasesByResident(),
       monitoringLatestCasesByResident(),
       pool.query(`SELECT id, access_code AS "accessCode" FROM residents WHERE is_deleted = FALSE`)
     ]);
     const accessCodes = new Map(accessCodesResult.rows.map(row => [String(row.id), row.accessCode || null]));
+    const resolvedCasesToMarkCleared = [];
     for (const resident of residents) {
       resident.activeCase = activeCases.get(String(resident.residentId)) || null;
       resident.latestCase = latestCases.get(String(resident.residentId)) || null;
       resident.accessCode = accessCodes.get(String(resident.residentId)) || null;
+
+      if (!resident.activeCase && resident.latestCase?.status === 'resolved' && resident.priority === 'P5' && !resident.latestCase.signalClearedAt) {
+        resolvedCasesToMarkCleared.push(resident.latestCase.id);
+        resident.latestCase.signalClearedAt = new Date().toISOString();
+      }
+      const operational = monitoringOperationalCaseState(resident, resident.activeCase, resident.latestCase);
+      Object.assign(resident, operational);
     }
-    const counts = residents.reduce((acc,row)=>{ acc[row.priority]=(acc[row.priority]||0)+1; return acc; }, {P1:0,P2:0,P3:0,P4:0,P5:0});
+    if (resolvedCasesToMarkCleared.length) {
+      await pool.query(`UPDATE monitoring_cases SET signal_cleared_at=COALESCE(signal_cleared_at,NOW()),updated_at=NOW() WHERE id = ANY($1::uuid[])`, [resolvedCasesToMarkCleared]);
+    }
+    const order = { P1:1, P2:2, P3:3, P4:4, RESOLVED:5, P5:6 };
+    residents.sort((a,b) => ((order[a.queuePriority] || 99)-(order[b.queuePriority] || 99)) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
+    const counts = residents.reduce((acc,row)=>{ const key=row.queuePriority || row.priority || 'P5'; acc[key]=(acc[key]||0)+1; return acc; }, {P1:0,P2:0,P3:0,P4:0,P5:0,RESOLVED:0});
     return res.json({ success:true, generatedAt:summary.generatedAt, operator:{id:operator.id,displayName:operator.displayName,role:operator.role}, counts, residents });
   } catch (error) {
     console.error("Monitoring dashboard failed:", error);
@@ -6954,7 +6990,16 @@ app.get("/monitoring/api/residents/:residentId", async (req, res) => {
       monitoringCasePayloadForResident(resident.residentId),
       pool.query(`SELECT access_code AS "accessCode" FROM residents WHERE id=$1 AND is_deleted=FALSE LIMIT 1`, [resident.residentId])
     ]);
-    return res.json({ success:true, generatedAt:summary.generatedAt, resident:{ ...monitoringResidentPayload(resident), accessCode:accessCodeResult.rows[0]?.accessCode || null, incident } });
+    const payload = monitoringResidentPayload(resident);
+    const activeCase = incident && ['open','accepted','escalated'].includes(incident.status) ? incident : null;
+    if (!activeCase && incident?.status === 'resolved' && payload.priority === 'P5' && !incident.signalClearedAt) {
+      await pool.query(`UPDATE monitoring_cases SET signal_cleared_at=COALESCE(signal_cleared_at,NOW()),updated_at=NOW() WHERE id=$1`, [incident.id]);
+      incident.signalClearedAt = new Date().toISOString();
+    }
+    const operational = monitoringOperationalCaseState(payload, activeCase, incident);
+    Object.assign(payload, operational);
+    const currentIncident = incident?.status === 'resolved' && !operational.operationalResolved ? null : incident;
+    return res.json({ success:true, generatedAt:summary.generatedAt, resident:{ ...payload, accessCode:accessCodeResult.rows[0]?.accessCode || null, incident:currentIncident, latestResolvedCase:incident?.status === 'resolved' ? incident : null } });
   } catch (error) {
     console.error("Monitoring resident view failed:", error);
     return res.status(500).json({ success:false, error:"Failed to load resident operational view" });

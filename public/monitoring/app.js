@@ -119,6 +119,13 @@ $('#priorityFilter').addEventListener('change', (e) => {
   renderQueue();
 });
 
+if ($('#priorityFilter') && !Array.from($('#priorityFilter').options).some(o => o.value === 'RESOLVED')) {
+  const option = document.createElement('option');
+  option.value = 'RESOLVED';
+  option.textContent = 'Resolved';
+  $('#priorityFilter').appendChild(option);
+}
+
 
 
 function draftKey(residentId, fieldId) {
@@ -209,6 +216,7 @@ function renderMetrics() {
     ['P2 Urgent', c.P2 || 0, 'p2'],
     ['P3 Technical', c.P3 || 0, 'p3'],
     ['P4 Observe', c.P4 || 0, 'p4'],
+    ['Resolved', c.RESOLVED || 0, 'resolved'],
     ['P5 Normal / Info', c.P5 || 0, 'p5'],
     ['Residents', total, ''],
   ];
@@ -219,7 +227,7 @@ function renderMetrics() {
 
 function renderQueue() {
   if (!state.dashboard) return;
-  const rows = (state.dashboard.residents || []).filter((r) => state.filter === 'ALL' || r.priority === state.filter);
+  const rows = (state.dashboard.residents || []).filter((r) => state.filter === 'ALL' || (r.queuePriority || r.priority) === state.filter);
   if (!rows.length) {
     $('#queue').innerHTML = '<div class="empty-state">No residents in this priority.</div>';
     return;
@@ -227,9 +235,9 @@ function renderQueue() {
 
   $('#queue').innerHTML = rows.map((r) => `
     <div class="queue-row ${r.residentId === state.selectedId ? 'active' : ''}" data-id="${escapeHtml(r.residentId)}">
-      <div><span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span></div>
-      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div>${r.accessCode ? `<div class="access-code-inline">Access code <strong>${escapeHtml(r.accessCode)}</strong></div>` : ''}${r.activeCase ? `<div class="case-badge">${escapeHtml(r.activeCase.assignedOperatorName ? `Assigned: ${r.activeCase.assignedOperatorName}` : 'Open case')}</div>` : (r.latestCase?.status === 'resolved' ? `<div class="case-badge case-badge-resolved">${escapeHtml(r.latestCase.resolvedByOperatorName ? `Resolved: ${r.latestCase.resolvedByOperatorName}` : 'Resolved')}</div>` : '')}</div>
-      <div><div class="status-title">${escapeHtml(r.actionTitle || r.aiStatus || 'Monitoring')}</div><div class="status-summary">${escapeHtml(r.actionSummary || r.aiExplanation || r.patternExplanation || 'No additional explanation')}</div></div>
+      <div>${r.operationalResolved ? `<span class="priority resolved-priority">RES</span>` : `<span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span>`}</div>
+      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div>${r.accessCode ? `<div class="access-code-inline">Access code <strong>${escapeHtml(r.accessCode)}</strong></div>` : ''}${r.activeCase ? `<div class="case-badge">${escapeHtml(r.activeCase.assignedOperatorName ? `Assigned: ${r.activeCase.assignedOperatorName}` : 'Open case')}</div>` : (r.operationalResolved ? `<div class="case-badge case-badge-resolved">${escapeHtml(r.latestCase?.resolvedByOperatorName ? `Resolved: ${r.latestCase.resolvedByOperatorName}` : 'Resolved')}</div>` : '')}</div>
+      <div><div class="status-title">${escapeHtml(r.operationalResolved ? 'Resolved' : (r.actionTitle || r.aiStatus || 'Monitoring'))}</div><div class="status-summary">${escapeHtml(r.operationalResolved ? `Operator case closed. Underlying ${r.underlyingPriority || r.priority || 'monitoring'} signal remains visible for reference.` : (r.actionSummary || r.aiExplanation || r.patternExplanation || 'No additional explanation'))}</div></div>
       <div class="sensor-pill">${r.onlineSensorCount || 0}/${r.sensorCount || 0} online<div class="small">${escapeHtml(r.coverageStatus || '')}</div></div>
       <div class="last-col small">${r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity'}</div>
     </div>`).join('');
@@ -370,13 +378,13 @@ function renderResident(r) {
   const activeCase = incident && ['open','accepted','escalated'].includes(incident.status);
   const mine = activeCase && incident.assignedOperatorId && String(incident.assignedOperatorId) === String(state.operator?.id);
   const sensorSummary = `${r.onlineSensorCount ?? sensors.filter(s => s.isOnline).length}/${r.sensorCount ?? sensors.length} online`;
-  const resolvedCase = incident && incident.status === 'resolved';
+  const resolvedCase = Boolean(r.operationalResolved && incident && incident.status === 'resolved');
   const caseState = activeCase ? String(incident.status || 'open').toUpperCase() : (resolvedCase ? 'RESOLVED' : 'NO ACTIVE CASE');
 
   panel.innerHTML = `
     <div class="resident-sticky-header">
       <div class="resident-head compact-head">
-        <div class="resident-title-line"><span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span><div><h2>${escapeHtml(r.residentName)}</h2><div class="location">${escapeHtml(r.location || 'Location not set')}</div></div></div>
+        <div class="resident-title-line">${resolvedCase ? `<span class="priority resolved-priority">RES</span>` : `<span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span>`}<div><h2>${escapeHtml(r.residentName)}</h2><div class="location">${escapeHtml(r.location || 'Location not set')}${resolvedCase ? ` · Underlying ${escapeHtml(r.underlyingPriority || r.priority || '')}` : ''}</div></div></div>
         <div class="sticky-facts"><span><b>${escapeHtml(caseState)}</b>${activeCase && incident.assignedOperatorName ? ` · ${escapeHtml(incident.assignedOperatorName)}` : (resolvedCase && incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : '')}</span>${r.accessCode ? `<span class="access-code-pill"><b>Access code</b> ${escapeHtml(r.accessCode)}</span>` : ''}<span>${activeCase ? `Open ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}` : (resolvedCase ? `Closed ${escapeHtml(fmtDate(incident.resolvedAt))}` : '—')}</span><span>${escapeHtml(sensorSummary)}</span><span>Last ${escapeHtml(r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity')}</span></div>
       </div>
     </div>
@@ -398,7 +406,7 @@ function renderResident(r) {
     </div>
     <div class="section case-section">
       <h3>Operator case</h3>
-      ${!activeCase ? `<div class="case-empty ${resolvedCase ? 'case-resolved-summary' : ''}">${resolvedCase ? `<div><strong>Resolved</strong><div class="small">Closed ${escapeHtml(fmtDate(incident.resolvedAt))}${incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : ''}</div>${incident.resolution ? `<div class="resolution-summary">${escapeHtml(incident.resolution)}</div>` : ''}<div class="notice">The case is closed. The resident's P-level above still reflects the live monitoring signal and is not hidden by case resolution.</div></div>` : `<div>No active case is assigned for this resident.</div>`}<button id="acceptCaseBtn" class="primary case-primary" type="button">${resolvedCase ? 'Accept New Case' : 'Accept Case'}</button></div>` : `
+      ${!activeCase ? `<div class="case-empty ${resolvedCase ? 'case-resolved-summary' : ''}">${resolvedCase ? `<div><strong>Resolved</strong><div class="small">Closed ${escapeHtml(fmtDate(incident.resolvedAt))}${incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : ''}</div>${incident.resolution ? `<div class="resolution-summary">${escapeHtml(incident.resolution)}</div>` : ''}<div class="notice">The operator case is closed. The underlying live signal is retained for reference but is removed from active P1-P4 response counts until it clears/re-triggers or a new case is accepted.</div></div>` : `<div>No active case is assigned for this resident.</div>`}<button id="acceptCaseBtn" class="primary case-primary" type="button">${resolvedCase ? 'Accept New Case' : 'Accept Case'}</button></div>` : `
         <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)} · ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
         ${mine ? `<div class="action-groups">
           <div class="action-group"><div class="action-group-title">Contact</div><div class="action-grid compact-actions">
