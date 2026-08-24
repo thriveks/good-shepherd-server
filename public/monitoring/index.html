@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Good Shepherd Monitoring Center</title>
+  <link rel="stylesheet" href="/monitoring/styles.css">
+</head>
+<body>
+  <div id="loginView" class="login-shell">
+    <form id="loginForm" class="login-card" autocomplete="on">
+      <div class="brand-mark">GS</div>
+      <h1>Monitoring Center</h1>
+      <p class="muted">Good Shepherd Home Monitoring System</p>
+      <label>Username<input id="username" name="username" autocomplete="username" required></label>
+      <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+      <label>Authenticator code<input id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+      <button class="primary" type="submit">Sign in</button>
+      <div id="loginError" class="error" role="alert"></div>
+    </form>
+  </div>
+
+  <div id="appView" class="app-shell hidden">
+    <header class="topbar">
+      <div><strong>GOOD SHEPHERD</strong><span>Monitoring Center</span></div>
+      <div class="top-actions"><span id="generatedAt" class="muted"></span><span id="operatorName"></span><button id="refreshBtn" class="ghost">Refresh</button><button id="logoutBtn" class="ghost">Sign out</button></div>
+    </header>
+
+    <main>
+      <section class="metrics" id="metrics"></section>
+      <section class="workspace">
+        <div class="queue-panel">
+          <div class="panel-head"><div><h2>Live Response Queue</h2><p>Real resident, AI, and sensor status from the Good Shepherd server</p></div><select id="priorityFilter"><option value="ALL">All priorities</option><option>P1</option><option>P2</option><option>P3</option><option>P4</option><option>P5</option></select></div>
+          <div id="queue" class="queue"></div>
+        </div>
+        <aside class="resident-panel" id="residentPanel">
+          <div class="empty-state">Select a resident to open the operational view.</div>
+        </aside>
+      </section>
+    </main>
+  </div>
+<script src="/monitoring/app.js" defer></script>
+</body>
+</html>

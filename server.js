@@ -11,7 +11,8 @@
 
 const express = require("express");
 const { Pool } = require("pg");
-const { randomUUID, randomBytes, randomInt, createHash } = require("crypto");
+const { randomUUID, randomBytes, randomInt, createHash, pbkdf2Sync, timingSafeEqual, createHmac, createCipheriv, createDecipheriv } = require("crypto");
+const path = require("path");
 const https = require("https");
 const http = require("http");
 const mqtt = require("mqtt");
@@ -66,6 +67,14 @@ const MAX_FIRMWARE_DOWNLOAD_REDIRECTS = 8;
 const FIRMWARE_DOWNLOAD_TIMEOUT_MS = 120000;
 
 app.use(express.json({ limit: "25mb" }));
+
+// Monitoring Center frontend is served by this same trusted application origin.
+// No server secrets are ever placed in browser JavaScript.
+app.use("/monitoring", express.static(path.join(__dirname, "public", "monitoring"), {
+  index: "index.html",
+  fallthrough: true,
+  maxAge: process.env.NODE_ENV === "production" ? "5m" : 0
+}));
 
 app.use((req, res, next) => {
     const origin = req.headers.origin;
@@ -395,6 +404,55 @@ async function initializeDatabase() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS customer_sessions_resident_id_idx ON customer_sessions (resident_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS customer_sessions_expires_at_idx ON customer_sessions (expires_at)`);
+
+  // Monitoring Center operator identity, sessions, and audit trail.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS monitoring_operators (
+      id UUID PRIMARY KEY,
+      username TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'operator',
+      password_hash TEXT NOT NULL,
+      totp_secret_encrypted TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_login_at TIMESTAMPTZ
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS monitoring_operators_username_unique_idx ON monitoring_operators (LOWER(username))`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS monitoring_sessions (
+      token_hash TEXT PRIMARY KEY,
+      operator_id UUID NOT NULL REFERENCES monitoring_operators(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ip_address TEXT,
+      user_agent TEXT
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_sessions_operator_id_idx ON monitoring_sessions (operator_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_sessions_expires_at_idx ON monitoring_sessions (expires_at)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS monitoring_audit_log (
+      id UUID PRIMARY KEY,
+      operator_id UUID REFERENCES monitoring_operators(id) ON DELETE SET NULL,
+      operator_name TEXT,
+      action TEXT NOT NULL,
+      target_type TEXT,
+      target_id TEXT,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ip_address TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_audit_log_created_at_idx ON monitoring_audit_log (created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_audit_log_operator_id_idx ON monitoring_audit_log (operator_id, created_at DESC)`);
+
+  await ensureMonitoringBootstrapOperator();
 
   await ensureResidentAccessCodes();
 
@@ -3357,6 +3415,237 @@ async function incrementResidentDailyActivity({ resident, event, sensor }) {
 }
 
 
+const MONITORING_SESSION_HOURS = 12;
+const MONITORING_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const MONITORING_LOGIN_MAX_ATTEMPTS = 8;
+const monitoringLoginAttempts = new Map();
+
+function monitoringEncryptionKey() {
+  const raw = cleanText(process.env.MONITORING_ENCRYPTION_KEY);
+  if (!raw) return null;
+  return createHash("sha256").update(raw).digest();
+}
+
+function encryptMonitoringSecret(plaintext) {
+  const key = monitoringEncryptionKey();
+  if (!key) throw new Error("MONITORING_ENCRYPTION_KEY is required");
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(String(plaintext), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, encrypted].map(part => part.toString("base64url")).join(".");
+}
+
+function decryptMonitoringSecret(value) {
+  const key = monitoringEncryptionKey();
+  if (!key) throw new Error("MONITORING_ENCRYPTION_KEY is required");
+  const [ivText, tagText, encryptedText] = String(value || "").split(".");
+  if (!ivText || !tagText || !encryptedText) throw new Error("Invalid encrypted monitoring secret");
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(ivText, "base64url"));
+  decipher.setAuthTag(Buffer.from(tagText, "base64url"));
+  return Buffer.concat([decipher.update(Buffer.from(encryptedText, "base64url")), decipher.final()]).toString("utf8");
+}
+
+function passwordHash(password, saltText = null) {
+  const salt = saltText ? Buffer.from(saltText, "base64url") : randomBytes(16);
+  const derived = pbkdf2Sync(String(password), salt, 210000, 32, "sha256");
+  return `pbkdf2_sha256$210000$${salt.toString("base64url")}$${derived.toString("base64url")}`;
+}
+
+function passwordMatches(password, stored) {
+  try {
+    const [algorithm, iterationsText, saltText, hashText] = String(stored || "").split("$");
+    if (algorithm !== "pbkdf2_sha256") return false;
+    const iterations = Number(iterationsText);
+    const expected = Buffer.from(hashText, "base64url");
+    const actual = pbkdf2Sync(String(password), Buffer.from(saltText, "base64url"), iterations, expected.length, "sha256");
+    return expected.length === actual.length && timingSafeEqual(expected, actual);
+  } catch (_) {
+    return false;
+  }
+}
+
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function decodeBase32(input) {
+  const clean = String(input || "").toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = "";
+  for (const ch of clean) bits += BASE32_ALPHABET.indexOf(ch).toString(2).padStart(5, "0");
+  const out = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) out.push(parseInt(bits.slice(i, i + 8), 2));
+  return Buffer.from(out);
+}
+
+function monitoringTotp(secret, counter) {
+  const buffer = Buffer.alloc(8);
+  buffer.writeBigUInt64BE(BigInt(counter));
+  const digest = createHmac("sha1", decodeBase32(secret)).update(buffer).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  const code = ((digest.readUInt32BE(offset) & 0x7fffffff) % 1000000);
+  return String(code).padStart(6, "0");
+}
+
+function verifyMonitoringTotp(secret, code) {
+  const normalized = String(code || "").replace(/\D/g, "");
+  if (normalized.length !== 6) return false;
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  for (let drift = -1; drift <= 1; drift += 1) {
+    const expected = monitoringTotp(secret, counter + drift);
+    if (timingSafeEqual(Buffer.from(expected), Buffer.from(normalized))) return true;
+  }
+  return false;
+}
+
+async function ensureMonitoringBootstrapOperator() {
+  const username = cleanText(process.env.MONITORING_ADMIN_USERNAME);
+  const password = String(process.env.MONITORING_ADMIN_PASSWORD || "");
+  const totpSecret = cleanText(process.env.MONITORING_ADMIN_TOTP_SECRET);
+  const displayName = cleanText(process.env.MONITORING_ADMIN_DISPLAY_NAME) || username;
+  if (!username || !password || !totpSecret) {
+    console.warn("Monitoring Center bootstrap operator not created: MONITORING_ADMIN_USERNAME, MONITORING_ADMIN_PASSWORD, and MONITORING_ADMIN_TOTP_SECRET are required.");
+    return;
+  }
+  if (!monitoringEncryptionKey()) {
+    console.warn("Monitoring Center bootstrap operator not created: MONITORING_ENCRYPTION_KEY is required.");
+    return;
+  }
+  const existing = await pool.query(`SELECT id FROM monitoring_operators WHERE LOWER(username)=LOWER($1) LIMIT 1`, [username]);
+  if (existing.rowCount > 0) return;
+  await pool.query(`
+    INSERT INTO monitoring_operators (id, username, display_name, role, password_hash, totp_secret_encrypted)
+    VALUES ($1, $2, $3, 'admin', $4, $5)
+  `, [randomUUID(), username, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
+  console.log(`Monitoring Center bootstrap admin created: ${username}`);
+}
+
+function parseCookies(req) {
+  const raw = String(req.headers.cookie || "");
+  const cookies = {};
+  raw.split(";").forEach(part => {
+    const idx = part.indexOf("=");
+    if (idx < 0) return;
+    cookies[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  });
+  return cookies;
+}
+
+function monitoringAttemptKey(req) {
+  return cleanText(req.ip || req.socket?.remoteAddress || "unknown") || "unknown";
+}
+
+function monitoringRateLimited(req) {
+  const key = monitoringAttemptKey(req);
+  const now = Date.now();
+  const prior = monitoringLoginAttempts.get(key);
+  if (!prior || now - prior.startedAt >= MONITORING_LOGIN_WINDOW_MS) {
+    monitoringLoginAttempts.set(key, { startedAt: now, attempts: 0 });
+    return false;
+  }
+  return prior.attempts >= MONITORING_LOGIN_MAX_ATTEMPTS;
+}
+
+function recordMonitoringFailure(req) {
+  const key = monitoringAttemptKey(req);
+  const now = Date.now();
+  const prior = monitoringLoginAttempts.get(key);
+  if (!prior || now - prior.startedAt >= MONITORING_LOGIN_WINDOW_MS) monitoringLoginAttempts.set(key, { startedAt: now, attempts: 1 });
+  else prior.attempts += 1;
+}
+
+function clearMonitoringFailures(req) { monitoringLoginAttempts.delete(monitoringAttemptKey(req)); }
+
+async function writeMonitoringAudit(operator, req, action, targetType = null, targetId = null, details = {}) {
+  await pool.query(`
+    INSERT INTO monitoring_audit_log (id, operator_id, operator_name, action, target_type, target_id, details, ip_address)
+    VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)
+  `, [randomUUID(), operator?.id || null, operator?.displayName || operator?.username || null, action, targetType, targetId, JSON.stringify(details || {}), monitoringAttemptKey(req)]);
+}
+
+async function authenticatedMonitoringOperator(req) {
+  const token = parseCookies(req).gs_monitor_session;
+  if (!token) return null;
+  const tokenHash = hashSessionToken(token);
+  const result = await pool.query(`
+    SELECT o.id, o.username, o.display_name AS "displayName", o.role, s.expires_at AS "expiresAt"
+    FROM monitoring_sessions s
+    JOIN monitoring_operators o ON o.id=s.operator_id
+    WHERE s.token_hash=$1 AND s.expires_at>NOW() AND o.is_active=TRUE
+    LIMIT 1
+  `, [tokenHash]);
+  const operator = result.rows[0] || null;
+  if (operator) pool.query(`UPDATE monitoring_sessions SET last_used_at=NOW() WHERE token_hash=$1`, [tokenHash]).catch(()=>{});
+  return operator;
+}
+
+async function requireMonitoringOperator(req, res) {
+  const operator = await authenticatedMonitoringOperator(req);
+  if (!operator) {
+    res.status(401).json({ success:false, error:"Monitoring Center sign-in required" });
+    return null;
+  }
+  return operator;
+}
+
+function monitoringPriorityForResident(resident) {
+  const action = cleanText(resident?.actionLevel).toLowerCase();
+  const ai = cleanText(resident?.aiLevel).toLowerCase();
+  const follow = cleanText(resident?.followUpStatus).toLowerCase();
+  if (action === "immediate" || ai === "critical" || follow === "due now" || follow === "due again") return "P1";
+  if (["review","watch"].includes(action) || ["warning","watch"].includes(ai)) return "P2";
+  if (action === "technical" || ai === "sensor issue") return "P3";
+  if (action === "observe") return "P4";
+  return "P5";
+}
+
+function monitoringResidentPayload(resident) {
+  const priority = monitoringPriorityForResident(resident);
+  return {
+    residentId: resident.residentId,
+    residentName: resident.residentName,
+    location: resident.location,
+    priority,
+    actionLevel: resident.actionLevel,
+    actionTitle: resident.actionTitle,
+    actionSummary: resident.actionSummary,
+    actionItems: resident.actionItems,
+    aiLevel: resident.aiLevel,
+    aiStatus: resident.aiStatus,
+    aiExplanation: resident.aiExplanation,
+    aiConfidence: resident.aiConfidence,
+    aiConfidenceScore: resident.aiConfidenceScore,
+    followUpStatus: resident.followUpStatus,
+    followUpExplanation: resident.followUpExplanation,
+    followUpDueAt: resident.followUpDueAt,
+    minutesUntilFollowUpDue: resident.minutesUntilFollowUpDue,
+    sensorCount: resident.sensorCount,
+    onlineSensorCount: resident.onlineSensorCount,
+    offlineSensorCount: resident.offlineSensorCount,
+    coverageStatus: resident.coverageStatus,
+    coverageExplanation: resident.coverageExplanation,
+    motionCountToday: resident.motionCountToday,
+    motionCountLastHour: resident.motionCountLastHour,
+    lastMotionAt: resident.lastMotionAt,
+    lastMotionRoom: resident.lastMotionRoom,
+    inactiveMinutes: resident.inactiveMinutes,
+    typicalFirstActivityTime: resident.typicalFirstActivityTime,
+    typicalLastActivityTime: resident.typicalLastActivityTime,
+    typicalOvernightEpisodes: resident.typicalOvernightEpisodes,
+    overnightEpisodesToday: resident.overnightEpisodesToday,
+    baselineDayCount: resident.baselineDayCount,
+    patternStatus: resident.patternStatus,
+    patternExplanation: resident.patternExplanation,
+    behaviorInsights: resident.behaviorInsights,
+    currentPresenceRooms: resident.currentPresenceRooms,
+    activePresenceDurationMinutes: resident.activePresenceDurationMinutes,
+    presenceStatus: resident.presenceStatus,
+    presenceExplanation: resident.presenceExplanation,
+    sensors: resident.sensors,
+    lastActionAt: resident.lastActionAt,
+    lastActionBy: resident.lastActionBy,
+    lastActionStatus: resident.lastActionStatus,
+    lastActionNote: resident.lastActionNote
+  };
+}
+
 const CUSTOMER_SESSION_DAYS = 180;
 const CUSTOMER_CODE_WINDOW_MS = 15 * 60 * 1000;
 const CUSTOMER_CODE_MAX_ATTEMPTS = 5;
@@ -6172,6 +6461,103 @@ app.get("/presence-telemetry/latest", async (req, res) => {
   }
 });
 
+
+// ---------------- Monitoring Center API ----------------
+app.post("/monitoring/api/login", async (req, res) => {
+  try {
+    if (monitoringRateLimited(req)) return res.status(429).json({ success:false, error:"Too many sign-in attempts. Try again later." });
+    const username = cleanText(req.body?.username);
+    const password = String(req.body?.password || "");
+    const code = String(req.body?.code || "");
+    const result = await pool.query(`SELECT id, username, display_name AS "displayName", role, password_hash AS "passwordHash", totp_secret_encrypted AS "totpSecretEncrypted" FROM monitoring_operators WHERE LOWER(username)=LOWER($1) AND is_active=TRUE LIMIT 1`, [username]);
+    const operator = result.rows[0];
+    let valid = Boolean(operator) && passwordMatches(password, operator.passwordHash);
+    if (valid) {
+      try { valid = verifyMonitoringTotp(decryptMonitoringSecret(operator.totpSecretEncrypted), code); }
+      catch (_) { valid = false; }
+    }
+    if (!valid) {
+      recordMonitoringFailure(req);
+      await writeMonitoringAudit(operator || null, req, "login_failed", "operator", operator?.id || username || null, {});
+      return res.status(401).json({ success:false, error:"Invalid username, password, or authenticator code" });
+    }
+    clearMonitoringFailures(req);
+    const token = randomBytes(32).toString("base64url");
+    const expiresAt = new Date(Date.now() + MONITORING_SESSION_HOURS * 60 * 60 * 1000);
+    await pool.query(`INSERT INTO monitoring_sessions (token_hash, operator_id, expires_at, ip_address, user_agent) VALUES ($1,$2,$3,$4,$5)`, [hashSessionToken(token), operator.id, expiresAt, monitoringAttemptKey(req), cleanText(req.header("user-agent"))]);
+    await pool.query(`UPDATE monitoring_operators SET last_login_at=NOW() WHERE id=$1`, [operator.id]);
+    res.cookie("gs_monitor_session", token, { httpOnly:true, secure: process.env.NODE_ENV === "production", sameSite:"lax", path:"/monitoring", maxAge: MONITORING_SESSION_HOURS * 60 * 60 * 1000 });
+    await writeMonitoringAudit(operator, req, "login_success", "operator", operator.id, {});
+    return res.json({ success:true, operator:{ id:operator.id, username:operator.username, displayName:operator.displayName, role:operator.role }, expiresAt });
+  } catch (error) {
+    console.error("Monitoring login failed:", error);
+    return res.status(500).json({ success:false, error:"Monitoring Center sign-in failed" });
+  }
+});
+
+app.post("/monitoring/api/logout", async (req, res) => {
+  try {
+    const operator = await authenticatedMonitoringOperator(req);
+    const token = parseCookies(req).gs_monitor_session;
+    if (token) await pool.query(`DELETE FROM monitoring_sessions WHERE token_hash=$1`, [hashSessionToken(token)]);
+    if (operator) await writeMonitoringAudit(operator, req, "logout", "operator", operator.id, {});
+    res.clearCookie("gs_monitor_session", { path:"/monitoring" });
+    return res.json({ success:true });
+  } catch (error) { return res.status(500).json({ success:false, error:"Logout failed" }); }
+});
+
+app.get("/monitoring/api/me", async (req, res) => {
+  const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+  return res.json({ success:true, operator });
+});
+
+app.get("/monitoring/api/dashboard", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const summary = await buildAIMotionSummary();
+    const residents = (summary.residents || []).map(monitoringResidentPayload);
+    const order = { P1:1, P2:2, P3:3, P4:4, P5:5 };
+    residents.sort((a,b) => (order[a.priority]-order[b.priority]) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
+    const counts = residents.reduce((acc,row)=>{ acc[row.priority]=(acc[row.priority]||0)+1; return acc; }, {P1:0,P2:0,P3:0,P4:0,P5:0});
+    return res.json({ success:true, generatedAt:summary.generatedAt, operator:{id:operator.id,displayName:operator.displayName,role:operator.role}, counts, residents });
+  } catch (error) {
+    console.error("Monitoring dashboard failed:", error);
+    return res.status(500).json({ success:false, error:"Failed to load Monitoring Center" });
+  }
+});
+
+app.get("/monitoring/api/residents/:residentId", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const summary = await buildAIMotionSummary();
+    const resident = (summary.residents || []).find(row => String(row.residentId) === String(req.params.residentId));
+    if (!resident) return res.status(404).json({ success:false, error:"Resident not found" });
+    await writeMonitoringAudit(operator, req, "resident_viewed", "resident", resident.residentId, { priority: monitoringPriorityForResident(resident) });
+    return res.json({ success:true, generatedAt:summary.generatedAt, resident:monitoringResidentPayload(resident) });
+  } catch (error) {
+    console.error("Monitoring resident view failed:", error);
+    return res.status(500).json({ success:false, error:"Failed to load resident operational view" });
+  }
+});
+
+app.post("/monitoring/api/residents/:residentId/follow-up", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const summary = await buildAIMotionSummary();
+    const resident = (summary.residents || []).find(row => String(row.residentId) === String(req.params.residentId));
+    if (!resident) return res.status(404).json({ success:false, error:"Resident not found" });
+    const note = cleanText(req.body?.note);
+    const status = cleanText(req.body?.status) || "completed";
+    const id = randomUUID();
+    await pool.query(`INSERT INTO ai_action_logs (id,resident_id,resident_name,action_level,action_title,action_status,action_note,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [id, resident.residentId, resident.residentName, resident.actionLevel || "Review", resident.actionTitle || "Monitoring Center follow-up", status, note || null, operator.displayName]);
+    await writeMonitoringAudit(operator, req, "follow_up_logged", "resident", resident.residentId, { actionLogId:id, status, note: note || null });
+    scheduleAIDashboardRefresh();
+    return res.status(201).json({ success:true, id });
+  } catch (error) {
+    console.error("Monitoring follow-up failed:", error);
+    return res.status(500).json({ success:false, error:"Failed to log follow-up" });
+  }
+});
 
 app.get("/ai/dashboard", async (req, res) => {
   try {
