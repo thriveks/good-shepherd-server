@@ -487,6 +487,9 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_cases_status_idx ON monitoring_cases (status, opened_at DESC)`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS monitoring_cases_one_active_per_resident_idx ON monitoring_cases (resident_id) WHERE status IN ('open','accepted','escalated')`);
   await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS signal_cleared_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS resident_response_code TEXT`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS resident_response_label TEXT`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS resident_response_at TIMESTAMPTZ`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS monitoring_case_events (
       id UUID PRIMARY KEY,
@@ -6926,10 +6929,40 @@ app.post("/customer/check-ins/:checkInId/respond", async (req, res) => {
     const checkIn = result.rows[0];
     if (!checkIn) return res.status(404).json({ success:false, error:"This check-in is no longer active" });
     if (checkIn.caseId) {
+      const responseLabel = allowed.get(responseCode);
       await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,NULL,$3,'check_in_response',$4,$5,$6::jsonb)`, [
-        randomUUID(), checkIn.caseId, session.residentName, allowed.get(responseCode), note || null, JSON.stringify({ checkInId:checkIn.id, responseCode })
+        randomUUID(), checkIn.caseId, session.residentName, responseLabel, note || null, JSON.stringify({ checkInId:checkIn.id, responseCode })
       ]);
-      await pool.query(`UPDATE monitoring_cases SET updated_at=NOW() WHERE id=$1`, [checkIn.caseId]);
+
+      // Resident responses are operational signals, not passive timeline notes.
+      // safe closes the current case; call_me elevates it to P2 contact-required;
+      // need_help elevates it immediately to P1. No case is auto-assigned here.
+      if (responseCode === 'safe') {
+        await pool.query(`
+          UPDATE monitoring_cases
+          SET status='resolved', resolved_at=NOW(), resolved_by_operator_id=NULL,
+              resolved_by_operator_name=$2, resolution=$3,
+              resident_response_code=$4, resident_response_label=$5, resident_response_at=NOW(), updated_at=NOW()
+          WHERE id=$1 AND status IN ('open','accepted','escalated')
+        `, [checkIn.caseId, session.residentName, note ? `Resident confirmed safe via check-in: ${note}` : 'Resident confirmed safe via check-in.', responseCode, responseLabel]);
+        await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,NULL,$3,'case_auto_resolved','Case satisfied by resident check-in',$4,$5::jsonb)`, [
+          randomUUID(), checkIn.caseId, session.residentName, note || 'Resident selected “I’m OK.”', JSON.stringify({ checkInId:checkIn.id, responseCode, automatic:true })
+        ]);
+      } else {
+        const priority = responseCode === 'need_help' ? 'P1' : 'P2';
+        await pool.query(`
+          UPDATE monitoring_cases
+          SET status='escalated', priority=$2, resident_response_code=$3, resident_response_label=$4,
+              resident_response_at=NOW(), updated_at=NOW()
+          WHERE id=$1 AND status IN ('open','accepted','escalated')
+        `, [checkIn.caseId, priority, responseCode, responseLabel]);
+        await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,NULL,$3,$4,$5,$6,$7::jsonb)`, [
+          randomUUID(), checkIn.caseId, session.residentName,
+          responseCode === 'need_help' ? 'resident_help_escalation' : 'resident_call_escalation',
+          responseCode === 'need_help' ? 'P1 — Resident requested help' : 'P2 — Resident requested a call',
+          note || null, JSON.stringify({ checkInId:checkIn.id, responseCode, priority, automatic:true })
+        ]);
+      }
     }
     return res.json({ success:true, checkIn:customerCheckInPayload(checkIn) });
   } catch (error) {
@@ -7169,7 +7202,9 @@ async function monitoringActiveCasesByResident() {
   const result = await pool.query(`
     SELECT id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
            assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
-           opened_at AS "openedAt", accepted_at AS "acceptedAt", updated_at AS "updatedAt"
+           opened_at AS "openedAt", accepted_at AS "acceptedAt",
+           resident_response_code AS "residentResponseCode", resident_response_label AS "residentResponseLabel",
+           resident_response_at AS "residentResponseAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     WHERE status IN ('open','accepted','escalated')
   `);
@@ -7182,7 +7217,9 @@ async function monitoringLatestCasesByResident() {
            id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
            assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
            opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
-           resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt", updated_at AS "updatedAt"
+           resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt",
+           resident_response_code AS "residentResponseCode", resident_response_label AS "residentResponseLabel",
+           resident_response_at AS "residentResponseAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     ORDER BY resident_id, opened_at DESC
   `);
@@ -7194,7 +7231,9 @@ async function monitoringCasePayloadForResident(residentId) {
     SELECT id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
            assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
            opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
-           resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt", updated_at AS "updatedAt"
+           resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt",
+           resident_response_code AS "residentResponseCode", resident_response_label AS "residentResponseLabel",
+           resident_response_at AS "residentResponseAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     WHERE resident_id=$1
     ORDER BY CASE WHEN status IN ('open','accepted','escalated') THEN 0 ELSE 1 END, opened_at DESC
@@ -7231,7 +7270,9 @@ function monitoringPriorityRank(priority) {
 function monitoringOperationalCaseState(resident, activeCase, latestCase) {
   const underlyingPriority = cleanText(resident?.priority || 'P5').toUpperCase() || 'P5';
   if (activeCase) {
-    return { underlyingPriority, queuePriority:underlyingPriority, operationalStatus:'active', operationalResolved:false };
+    const casePriority = cleanText(activeCase.priority || '').toUpperCase();
+    const queuePriority = monitoringPriorityRank(casePriority) < monitoringPriorityRank(underlyingPriority) ? casePriority : underlyingPriority;
+    return { underlyingPriority, queuePriority, operationalStatus:'active', operationalResolved:false };
   }
   if (!latestCase || latestCase.status !== 'resolved') {
     return { underlyingPriority, queuePriority:underlyingPriority, operationalStatus:'monitoring', operationalResolved:false };
