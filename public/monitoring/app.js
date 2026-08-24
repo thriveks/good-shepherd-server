@@ -6,6 +6,7 @@ const state = {
   refreshSeq: 0,
   refreshing: false,
   lastSuccessfulRefresh: null,
+  operator: null,
 };
 
 const $ = (s) => document.querySelector(s);
@@ -41,6 +42,7 @@ function showLogin() {
 }
 
 function showApp(operator) {
+  state.operator = operator || null;
   $('#loginView').classList.add('hidden');
   $('#appView').classList.remove('hidden');
   $('#operatorName').textContent = operator?.displayName || operator?.username || '';
@@ -186,7 +188,7 @@ function renderQueue() {
   $('#queue').innerHTML = rows.map((r) => `
     <div class="queue-row ${r.residentId === state.selectedId ? 'active' : ''}" data-id="${escapeHtml(r.residentId)}">
       <div><span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span></div>
-      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div></div>
+      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div>${r.activeCase ? `<div class="case-badge">${escapeHtml(r.activeCase.assignedOperatorName ? `Assigned: ${r.activeCase.assignedOperatorName}` : 'Open case')}</div>` : ''}</div>
       <div><div class="status-title">${escapeHtml(r.actionTitle || r.aiStatus || 'Monitoring')}</div><div class="status-summary">${escapeHtml(r.actionSummary || r.aiExplanation || r.patternExplanation || 'No additional explanation')}</div></div>
       <div class="sensor-pill">${r.onlineSensorCount || 0}/${r.sensorCount || 0} online<div class="small">${escapeHtml(r.coverageStatus || '')}</div></div>
       <div class="last-col small">${r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity'}</div>
@@ -252,10 +254,33 @@ function insightCards(items) {
   }).join('');
 }
 
+
+function caseTimeline(incident) {
+  const rows = incident?.timeline || [];
+  if (!rows.length) return '<div class="muted small">No case activity recorded yet.</div>';
+  return `<div class="timeline">${rows.map((e) => `<div class="timeline-row"><div class="timeline-dot"></div><div><strong>${escapeHtml(e.label)}</strong><div class="small">${fmtDate(e.createdAt)}${e.operatorName ? ` · ${escapeHtml(e.operatorName)}` : ''}</div>${e.note ? `<div class="timeline-note">${escapeHtml(e.note)}</div>` : ''}</div></div>`).join('')}</div>`;
+}
+
+async function refreshSelectedResident() {
+  if (!state.selectedId) return;
+  const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
+  state.selectedResident = data.resident;
+  renderResident(data.resident);
+  await loadDashboard();
+}
+
+async function submitCaseAction(caseId, action, note = '') {
+  await api(`/monitoring/api/cases/${encodeURIComponent(caseId)}/actions`, { method:'POST', body:JSON.stringify({ action, note }) });
+  await refreshSelectedResident();
+}
+
 function renderResident(r) {
   const insights = Array.isArray(r.behaviorInsights) ? r.behaviorInsights : [];
   const sensors = Array.isArray(r.sensors) ? r.sensors : [];
   const contextCards = insightCards(insights);
+  const incident = r.incident || null;
+  const activeCase = incident && ['open','accepted','escalated'].includes(incident.status);
+  const mine = activeCase && incident.assignedOperatorId && String(incident.assignedOperatorId) === String(state.operator?.id);
 
   $('#residentPanel').innerHTML = `
     <div class="resident-head">
@@ -293,8 +318,28 @@ function renderResident(r) {
           <div class="${s.isOnline ? 'online' : 'offline'}">${s.isOnline ? 'Online' : 'Offline'}<div class="small">${fmtDate(s.lastSeenAt)}</div></div>
         </div>`).join('') : '<div class="muted">No assigned sensors reported by the AI summary.</div>'}
     </div>
+    <div class="section case-section">
+      <h3>Operator case</h3>
+      ${!activeCase ? `<div class="case-empty"><div>No active case is assigned for this resident.</div><button id="acceptCaseBtn" class="primary case-primary" type="button">Accept Case</button></div>` : `
+        <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
+        ${mine ? `<div class="action-grid">
+          <button type="button" data-case-action="resident_call">Resident call attempt</button>
+          <button type="button" data-case-action="check_in_sent">Check-in sent</button>
+          <button type="button" data-case-action="contact_1_call">Contact #1 call attempt</button>
+          <button type="button" data-case-action="contact_2_call">Contact #2 call attempt</button>
+          <button type="button" data-case-action="supervisor_escalation">Escalate to supervisor</button>
+          <button type="button" data-case-action="technical_review">Technical review</button>
+          <button type="button" data-case-action="field_response">Field response requested</button>
+          <button type="button" data-case-action="emergency_escalation" class="danger-action">Emergency / 911 escalation</button>
+        </div>
+        <form id="caseNoteForm" class="follow-form"><textarea id="caseNote" placeholder="Add operator note to this case…" required></textarea><button class="ghost" type="submit">Add note</button></form>
+        <form id="resolveForm" class="resolve-form"><textarea id="resolutionNote" placeholder="Resolution / closure evidence…" required></textarea><button class="primary resolve-btn" type="submit">Resolve Case</button></form>` : `<div class="notice">This case is being handled by ${escapeHtml(incident.assignedOperatorName || 'another operator')}.</div>`}
+        <div class="case-timeline-title">Incident timeline</div>${caseTimeline(incident)}
+      `}
+      <div id="caseNotice" class="notice"></div>
+    </div>
     <div class="section">
-      <h3>Follow-up</h3>
+      <h3>AI follow-up record</h3>
       <div class="small">${escapeHtml(r.followUpStatus || 'No status')} · ${escapeHtml(r.followUpExplanation || '')}</div>
       <form id="followForm" class="follow-form">
         <textarea id="followNote" placeholder="Record the real outcome or action taken…" required></textarea>
@@ -302,6 +347,38 @@ function renderResident(r) {
         <div id="followNotice" class="notice"></div>
       </form>
     </div>`;
+
+
+  const acceptBtn = $('#acceptCaseBtn');
+  if (acceptBtn) acceptBtn.addEventListener('click', async () => {
+    acceptBtn.disabled = true;
+    try {
+      await api(`/monitoring/api/residents/${encodeURIComponent(r.residentId)}/cases/accept`, { method:'POST', body:'{}' });
+      await refreshSelectedResident();
+    } catch (err) { const n=$('#caseNotice'); if(n) n.textContent=err.message; acceptBtn.disabled=false; }
+  });
+
+  document.querySelectorAll('[data-case-action]').forEach((btn) => btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try { await submitCaseAction(incident.id, btn.dataset.caseAction); }
+    catch (err) { const n=$('#caseNotice'); if(n) n.textContent=err.message; btn.disabled=false; }
+  }));
+
+  const noteForm = $('#caseNoteForm');
+  if (noteForm) noteForm.addEventListener('submit', async (e) => {
+    e.preventDefault(); const note=$('#caseNote').value.trim(); if(!note) return;
+    e.submitter.disabled=true;
+    try { await submitCaseAction(incident.id,'note',note); }
+    catch(err){ const n=$('#caseNotice'); if(n) n.textContent=err.message; e.submitter.disabled=false; }
+  });
+
+  const resolveForm = $('#resolveForm');
+  if (resolveForm) resolveForm.addEventListener('submit', async (e) => {
+    e.preventDefault(); const resolution=$('#resolutionNote').value.trim(); if(!resolution) return;
+    e.submitter.disabled=true;
+    try { await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/resolve`, {method:'POST',body:JSON.stringify({resolution})}); await refreshSelectedResident(); }
+    catch(err){ const n=$('#caseNotice'); if(n) n.textContent=err.message; e.submitter.disabled=false; }
+  });
 
   $('#followForm').addEventListener('submit', async (e) => {
     e.preventDefault();

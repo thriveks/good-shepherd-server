@@ -453,6 +453,44 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_audit_log_created_at_idx ON monitoring_audit_log (created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_audit_log_operator_id_idx ON monitoring_audit_log (operator_id, created_at DESC)`);
 
+  // Monitoring Center v2: durable operator-owned incident cases and timeline.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS monitoring_cases (
+      id UUID PRIMARY KEY,
+      resident_id UUID NOT NULL REFERENCES residents(id) ON DELETE CASCADE,
+      resident_name TEXT NOT NULL,
+      priority TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      assigned_operator_id UUID REFERENCES monitoring_operators(id) ON DELETE SET NULL,
+      assigned_operator_name TEXT,
+      opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      accepted_at TIMESTAMPTZ,
+      resolved_at TIMESTAMPTZ,
+      resolved_by_operator_id UUID REFERENCES monitoring_operators(id) ON DELETE SET NULL,
+      resolved_by_operator_name TEXT,
+      resolution TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_cases_resident_idx ON monitoring_cases (resident_id, opened_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_cases_status_idx ON monitoring_cases (status, opened_at DESC)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS monitoring_cases_one_active_per_resident_idx ON monitoring_cases (resident_id) WHERE status IN ('open','accepted','escalated')`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS monitoring_case_events (
+      id UUID PRIMARY KEY,
+      case_id UUID NOT NULL REFERENCES monitoring_cases(id) ON DELETE CASCADE,
+      operator_id UUID REFERENCES monitoring_operators(id) ON DELETE SET NULL,
+      operator_name TEXT,
+      event_type TEXT NOT NULL,
+      label TEXT NOT NULL,
+      note TEXT,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_case_events_case_idx ON monitoring_case_events (case_id, created_at ASC)`);
+
   await ensureMonitoringBootstrapOperator();
 
   await ensureResidentAccessCodes();
@@ -6595,6 +6633,52 @@ app.get("/monitoring/api/me", async (req, res) => {
   return res.json({ success:true, operator });
 });
 
+
+async function monitoringActiveCasesByResident() {
+  const result = await pool.query(`
+    SELECT id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
+           assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
+           opened_at AS "openedAt", accepted_at AS "acceptedAt", updated_at AS "updatedAt"
+    FROM monitoring_cases
+    WHERE status IN ('open','accepted','escalated')
+  `);
+  return new Map(result.rows.map(row => [String(row.residentId), row]));
+}
+
+async function monitoringCasePayloadForResident(residentId) {
+  const caseResult = await pool.query(`
+    SELECT id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
+           assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
+           opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
+           resolved_by_operator_name AS "resolvedByOperatorName", resolution, updated_at AS "updatedAt"
+    FROM monitoring_cases
+    WHERE resident_id=$1
+    ORDER BY CASE WHEN status IN ('open','accepted','escalated') THEN 0 ELSE 1 END, opened_at DESC
+    LIMIT 1
+  `, [residentId]);
+  const incident = caseResult.rows[0] || null;
+  if (!incident) return null;
+  const events = await pool.query(`
+    SELECT id, event_type AS "eventType", label, note, operator_id AS "operatorId",
+           operator_name AS "operatorName", metadata, created_at AS "createdAt"
+    FROM monitoring_case_events WHERE case_id=$1 ORDER BY created_at ASC
+  `, [incident.id]);
+  incident.timeline = events.rows;
+  return incident;
+}
+
+const MONITORING_CASE_ACTIONS = new Map([
+  ['resident_call', 'Resident call attempt'],
+  ['check_in_sent', 'Check-in sent'],
+  ['contact_1_call', 'Contact #1 call attempt'],
+  ['contact_2_call', 'Contact #2 call attempt'],
+  ['supervisor_escalation', 'Escalated to supervisor'],
+  ['technical_review', 'Technical review'],
+  ['field_response', 'Field response requested'],
+  ['emergency_escalation', 'Emergency / 911 escalation'],
+  ['note', 'Operator note']
+]);
+
 app.get("/monitoring/api/dashboard", async (req, res) => {
   try {
     const operator = await requireMonitoringOperator(req, res); if (!operator) return;
@@ -6602,6 +6686,8 @@ app.get("/monitoring/api/dashboard", async (req, res) => {
     const residents = (summary.residents || []).map(monitoringResidentPayload);
     const order = { P1:1, P2:2, P3:3, P4:4, P5:5 };
     residents.sort((a,b) => (order[a.priority]-order[b.priority]) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
+    const activeCases = await monitoringActiveCasesByResident();
+    for (const resident of residents) resident.activeCase = activeCases.get(String(resident.residentId)) || null;
     const counts = residents.reduce((acc,row)=>{ acc[row.priority]=(acc[row.priority]||0)+1; return acc; }, {P1:0,P2:0,P3:0,P4:0,P5:0});
     return res.json({ success:true, generatedAt:summary.generatedAt, operator:{id:operator.id,displayName:operator.displayName,role:operator.role}, counts, residents });
   } catch (error) {
@@ -6617,11 +6703,84 @@ app.get("/monitoring/api/residents/:residentId", async (req, res) => {
     const resident = (summary.residents || []).find(row => String(row.residentId) === String(req.params.residentId));
     if (!resident) return res.status(404).json({ success:false, error:"Resident not found" });
     await writeMonitoringAudit(operator, req, "resident_viewed", "resident", resident.residentId, { priority: monitoringPriorityForResident(resident) });
-    return res.json({ success:true, generatedAt:summary.generatedAt, resident:monitoringResidentPayload(resident) });
+    const incident = await monitoringCasePayloadForResident(resident.residentId);
+    return res.json({ success:true, generatedAt:summary.generatedAt, resident:{ ...monitoringResidentPayload(resident), incident } });
   } catch (error) {
     console.error("Monitoring resident view failed:", error);
     return res.status(500).json({ success:false, error:"Failed to load resident operational view" });
   }
+});
+
+
+app.post("/monitoring/api/residents/:residentId/cases/accept", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const summary = await loadMonitoringSummaryFast();
+    const resident = (summary.residents || []).find(row => String(row.residentId) === String(req.params.residentId));
+    if (!resident) return res.status(404).json({ success:false, error:"Resident not found" });
+    await client.query('BEGIN');
+    const existing = await client.query(`SELECT id,status,assigned_operator_id AS "assignedOperatorId",assigned_operator_name AS "assignedOperatorName" FROM monitoring_cases WHERE resident_id=$1 AND status IN ('open','accepted','escalated') FOR UPDATE`, [resident.residentId]);
+    let incident = existing.rows[0];
+    if (incident && incident.assignedOperatorId && String(incident.assignedOperatorId) !== String(operator.id)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success:false, error:`Case is already assigned to ${incident.assignedOperatorName || 'another operator'}` });
+    }
+    if (!incident) {
+      const id = randomUUID();
+      const created = await client.query(`INSERT INTO monitoring_cases (id,resident_id,resident_name,priority,status,assigned_operator_id,assigned_operator_name,accepted_at) VALUES ($1,$2,$3,$4,'accepted',$5,$6,NOW()) RETURNING id`, [id,resident.residentId,resident.residentName,monitoringPriorityForResident(resident),operator.id,operator.displayName]);
+      incident = created.rows[0];
+      await client.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_opened','Case accepted',NULL)`, [randomUUID(),id,operator.id,operator.displayName]);
+    } else {
+      await client.query(`UPDATE monitoring_cases SET status='accepted',assigned_operator_id=$2,assigned_operator_name=$3,accepted_at=COALESCE(accepted_at,NOW()),updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName]);
+      await client.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_accepted','Case accepted',NULL)`, [randomUUID(),incident.id,operator.id,operator.displayName]);
+    }
+    await client.query('COMMIT');
+    await writeMonitoringAudit(operator, req, "case_accepted", "resident", resident.residentId, { caseId:incident.id });
+    return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(resident.residentId) });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    if (error?.code === '23505') return res.status(409).json({ success:false, error:"An active case already exists for this resident. Refresh and try again." });
+    console.error("Monitoring case accept failed:", error);
+    return res.status(500).json({ success:false, error:"Failed to accept case" });
+  } finally { client.release(); }
+});
+
+app.post("/monitoring/api/cases/:caseId/actions", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const action = cleanText(req.body?.action);
+    const note = cleanText(req.body?.note);
+    const label = MONITORING_CASE_ACTIONS.get(action);
+    if (!label) return res.status(400).json({ success:false, error:"Unsupported case action" });
+    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
+    const incident = found.rows[0];
+    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
+    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
+    if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Accept this case before recording operator actions" });
+    const nextStatus = ['supervisor_escalation','emergency_escalation'].includes(action) ? 'escalated' : incident.status;
+    await pool.query(`UPDATE monitoring_cases SET status=$2,updated_at=NOW() WHERE id=$1`, [incident.id,nextStatus]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,$5,$6,$7)`, [randomUUID(),incident.id,operator.id,operator.displayName,action,label,note || null]);
+    await writeMonitoringAudit(operator, req, "case_action", "case", incident.id, { action, label, note:note || null });
+    return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
+  } catch (error) { console.error("Monitoring case action failed:", error); return res.status(500).json({ success:false, error:"Failed to record case action" }); }
+});
+
+app.post("/monitoring/api/cases/:caseId/resolve", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const resolution = cleanText(req.body?.resolution);
+    if (!resolution) return res.status(400).json({ success:false, error:"A resolution note is required" });
+    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
+    const incident = found.rows[0];
+    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
+    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
+    if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Only the assigned operator can resolve this case" });
+    await pool.query(`UPDATE monitoring_cases SET status='resolved',resolved_at=NOW(),resolved_by_operator_id=$2,resolved_by_operator_name=$3,resolution=$4,updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName,resolution]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_resolved','Case resolved',$5)`, [randomUUID(),incident.id,operator.id,operator.displayName,resolution]);
+    await writeMonitoringAudit(operator, req, "case_resolved", "case", incident.id, { resolution });
+    return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
+  } catch (error) { console.error("Monitoring case resolve failed:", error); return res.status(500).json({ success:false, error:"Failed to resolve case" }); }
 });
 
 app.post("/monitoring/api/residents/:residentId/follow-up", async (req, res) => {
