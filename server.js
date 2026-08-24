@@ -6870,6 +6870,19 @@ async function monitoringActiveCasesByResident() {
   return new Map(result.rows.map(row => [String(row.residentId), row]));
 }
 
+async function monitoringLatestCasesByResident() {
+  const result = await pool.query(`
+    SELECT DISTINCT ON (resident_id)
+           id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
+           assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
+           opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
+           resolved_by_operator_name AS "resolvedByOperatorName", resolution, updated_at AS "updatedAt"
+    FROM monitoring_cases
+    ORDER BY resident_id, opened_at DESC
+  `);
+  return new Map(result.rows.map(row => [String(row.residentId), row]));
+}
+
 async function monitoringCasePayloadForResident(residentId) {
   const caseResult = await pool.query(`
     SELECT id, resident_id AS "residentId", resident_name AS "residentName", priority, status,
@@ -6911,8 +6924,17 @@ app.get("/monitoring/api/dashboard", async (req, res) => {
     const residents = (summary.residents || []).map(monitoringResidentPayload);
     const order = { P1:1, P2:2, P3:3, P4:4, P5:5 };
     residents.sort((a,b) => (order[a.priority]-order[b.priority]) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
-    const activeCases = await monitoringActiveCasesByResident();
-    for (const resident of residents) resident.activeCase = activeCases.get(String(resident.residentId)) || null;
+    const [activeCases, latestCases, accessCodesResult] = await Promise.all([
+      monitoringActiveCasesByResident(),
+      monitoringLatestCasesByResident(),
+      pool.query(`SELECT id, access_code AS "accessCode" FROM residents WHERE is_deleted = FALSE`)
+    ]);
+    const accessCodes = new Map(accessCodesResult.rows.map(row => [String(row.id), row.accessCode || null]));
+    for (const resident of residents) {
+      resident.activeCase = activeCases.get(String(resident.residentId)) || null;
+      resident.latestCase = latestCases.get(String(resident.residentId)) || null;
+      resident.accessCode = accessCodes.get(String(resident.residentId)) || null;
+    }
     const counts = residents.reduce((acc,row)=>{ acc[row.priority]=(acc[row.priority]||0)+1; return acc; }, {P1:0,P2:0,P3:0,P4:0,P5:0});
     return res.json({ success:true, generatedAt:summary.generatedAt, operator:{id:operator.id,displayName:operator.displayName,role:operator.role}, counts, residents });
   } catch (error) {
@@ -6928,8 +6950,11 @@ app.get("/monitoring/api/residents/:residentId", async (req, res) => {
     const resident = (summary.residents || []).find(row => String(row.residentId) === String(req.params.residentId));
     if (!resident) return res.status(404).json({ success:false, error:"Resident not found" });
     await writeMonitoringAudit(operator, req, "resident_viewed", "resident", resident.residentId, { priority: monitoringPriorityForResident(resident) });
-    const incident = await monitoringCasePayloadForResident(resident.residentId);
-    return res.json({ success:true, generatedAt:summary.generatedAt, resident:{ ...monitoringResidentPayload(resident), incident } });
+    const [incident, accessCodeResult] = await Promise.all([
+      monitoringCasePayloadForResident(resident.residentId),
+      pool.query(`SELECT access_code AS "accessCode" FROM residents WHERE id=$1 AND is_deleted=FALSE LIMIT 1`, [resident.residentId])
+    ]);
+    return res.json({ success:true, generatedAt:summary.generatedAt, resident:{ ...monitoringResidentPayload(resident), accessCode:accessCodeResult.rows[0]?.accessCode || null, incident } });
   } catch (error) {
     console.error("Monitoring resident view failed:", error);
     return res.status(500).json({ success:false, error:"Failed to load resident operational view" });

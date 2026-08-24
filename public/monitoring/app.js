@@ -228,7 +228,7 @@ function renderQueue() {
   $('#queue').innerHTML = rows.map((r) => `
     <div class="queue-row ${r.residentId === state.selectedId ? 'active' : ''}" data-id="${escapeHtml(r.residentId)}">
       <div><span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span></div>
-      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div>${r.activeCase ? `<div class="case-badge">${escapeHtml(r.activeCase.assignedOperatorName ? `Assigned: ${r.activeCase.assignedOperatorName}` : 'Open case')}</div>` : ''}</div>
+      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div>${r.accessCode ? `<div class="access-code-inline">Access code <strong>${escapeHtml(r.accessCode)}</strong></div>` : ''}${r.activeCase ? `<div class="case-badge">${escapeHtml(r.activeCase.assignedOperatorName ? `Assigned: ${r.activeCase.assignedOperatorName}` : 'Open case')}</div>` : (r.latestCase?.status === 'resolved' ? `<div class="case-badge case-badge-resolved">${escapeHtml(r.latestCase.resolvedByOperatorName ? `Resolved: ${r.latestCase.resolvedByOperatorName}` : 'Resolved')}</div>` : '')}</div>
       <div><div class="status-title">${escapeHtml(r.actionTitle || r.aiStatus || 'Monitoring')}</div><div class="status-summary">${escapeHtml(r.actionSummary || r.aiExplanation || r.patternExplanation || 'No additional explanation')}</div></div>
       <div class="sensor-pill">${r.onlineSensorCount || 0}/${r.sensorCount || 0} online<div class="small">${escapeHtml(r.coverageStatus || '')}</div></div>
       <div class="last-col small">${r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity'}</div>
@@ -370,13 +370,14 @@ function renderResident(r) {
   const activeCase = incident && ['open','accepted','escalated'].includes(incident.status);
   const mine = activeCase && incident.assignedOperatorId && String(incident.assignedOperatorId) === String(state.operator?.id);
   const sensorSummary = `${r.onlineSensorCount ?? sensors.filter(s => s.isOnline).length}/${r.sensorCount ?? sensors.length} online`;
-  const caseState = activeCase ? String(incident.status || 'open').toUpperCase() : 'NO ACTIVE CASE';
+  const resolvedCase = incident && incident.status === 'resolved';
+  const caseState = activeCase ? String(incident.status || 'open').toUpperCase() : (resolvedCase ? 'RESOLVED' : 'NO ACTIVE CASE');
 
   panel.innerHTML = `
     <div class="resident-sticky-header">
       <div class="resident-head compact-head">
         <div class="resident-title-line"><span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span><div><h2>${escapeHtml(r.residentName)}</h2><div class="location">${escapeHtml(r.location || 'Location not set')}</div></div></div>
-        <div class="sticky-facts"><span><b>${escapeHtml(caseState)}</b>${activeCase && incident.assignedOperatorName ? ` · ${escapeHtml(incident.assignedOperatorName)}` : ''}</span><span>${activeCase ? `Open ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}` : '—'}</span><span>${escapeHtml(sensorSummary)}</span><span>Last ${escapeHtml(r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity')}</span></div>
+        <div class="sticky-facts"><span><b>${escapeHtml(caseState)}</b>${activeCase && incident.assignedOperatorName ? ` · ${escapeHtml(incident.assignedOperatorName)}` : (resolvedCase && incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : '')}</span>${r.accessCode ? `<span class="access-code-pill"><b>Access code</b> ${escapeHtml(r.accessCode)}</span>` : ''}<span>${activeCase ? `Open ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}` : (resolvedCase ? `Closed ${escapeHtml(fmtDate(incident.resolvedAt))}` : '—')}</span><span>${escapeHtml(sensorSummary)}</span><span>Last ${escapeHtml(r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity')}</span></div>
       </div>
     </div>
     <div class="section">
@@ -392,11 +393,12 @@ function renderResident(r) {
         <div class="fact"><span>Last hour</span><strong>${Number(r.motionCountLastHour || 0)}</strong></div>
         <div class="fact"><span>Typical first activity</span><strong>${escapeHtml(r.typicalFirstActivityTime || '—')}</strong></div>
         <div class="fact"><span>Baseline</span><strong>${Number(r.baselineDayCount || 0)} days</strong></div>
+        <div class="fact access-code-fact"><span>Resident access code</span><strong>${escapeHtml(r.accessCode || '—')}</strong></div>
       </div>
     </div>
     <div class="section case-section">
       <h3>Operator case</h3>
-      ${!activeCase ? `<div class="case-empty"><div>No active case is assigned for this resident.</div><button id="acceptCaseBtn" class="primary case-primary" type="button">Accept Case</button></div>` : `
+      ${!activeCase ? `<div class="case-empty ${resolvedCase ? 'case-resolved-summary' : ''}">${resolvedCase ? `<div><strong>Resolved</strong><div class="small">Closed ${escapeHtml(fmtDate(incident.resolvedAt))}${incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : ''}</div>${incident.resolution ? `<div class="resolution-summary">${escapeHtml(incident.resolution)}</div>` : ''}<div class="notice">The case is closed. The resident's P-level above still reflects the live monitoring signal and is not hidden by case resolution.</div></div>` : `<div>No active case is assigned for this resident.</div>`}<button id="acceptCaseBtn" class="primary case-primary" type="button">${resolvedCase ? 'Accept New Case' : 'Accept Case'}</button></div>` : `
         <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)} · ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
         ${mine ? `<div class="action-groups">
           <div class="action-group"><div class="action-group-title">Contact</div><div class="action-grid compact-actions">

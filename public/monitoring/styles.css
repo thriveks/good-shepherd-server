@@ -9,3 +9,23 @@
 
 /* Monitoring Center v2.1: operator workspace ergonomics */
 .workspace{height:calc(100vh - 128px);min-height:560px;align-items:stretch}.queue-panel{height:100%;overflow:hidden;display:flex;flex-direction:column}.queue{overflow:auto;min-height:0;flex:1}.resident-panel{position:relative;top:auto;height:100%;max-height:none;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.resident-sticky-header{position:sticky;top:0;z-index:6;background:linear-gradient(180deg,#0d1b29 85%,rgba(13,27,41,.96));border-bottom:1px solid var(--line);box-shadow:0 8px 18px rgba(0,0,0,.2)}.compact-head{border-bottom:0;padding:13px 16px}.resident-title-line{display:flex;gap:10px;align-items:center}.compact-head h2{margin:0;font-size:17px}.sticky-facts{display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:10px;color:var(--muted);font-size:11px}.sticky-facts span{background:#0a1926;border:1px solid #1d374b;border-radius:999px;padding:4px 7px}.sticky-facts b{color:#e9f4fb}.action-groups{display:grid;grid-template-columns:1fr;gap:10px}.action-group{background:#0a1926;border:1px solid #1b3448;border-radius:11px;padding:10px}.action-group-title{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#9fb8cb;margin-bottom:8px;font-weight:800}.compact-actions{margin:0}.documentation-group{margin-top:10px}.case-flash{padding:8px 10px;border-radius:8px;margin:10px 0 0}.case-flash.success{background:rgba(128,216,167,.12);color:#a8e8c2;border:1px solid rgba(128,216,167,.25)}.case-flash.error{background:rgba(255,119,119,.12);color:#ffaaaa;border:1px solid rgba(255,119,119,.25)}.case-section{padding-top:14px}.case-timeline-title{position:sticky;top:104px;background:#0d1b29;padding:8px 0 6px;z-index:3}.timeline{padding-bottom:6px}.action-grid button:focus-visible,.ghost:focus-visible,.primary:focus-visible{outline:2px solid #76c7ff;outline-offset:2px}@media(max-width:1100px){.workspace{height:auto;min-height:0}.queue-panel{height:auto}.queue{overflow:visible}.resident-panel{height:auto;max-height:none}.resident-sticky-header{position:sticky;top:0}.case-timeline-title{position:static}}@media(max-width:700px){.sticky-facts{gap:5px}.sticky-facts span{border-radius:8px}.resident-title-line{align-items:flex-start}}
+
+/* Monitoring Center v3.4: viewport-safe operator workspace + resolved-case state */
+.app-shell{height:100vh;overflow:hidden;display:flex;flex-direction:column}
+.app-shell main{height:auto;min-height:0;flex:1;display:flex;flex-direction:column;overflow:hidden}
+.metrics{flex:0 0 auto}
+.workspace{height:auto!important;min-height:0!important;flex:1;overflow:hidden}
+.queue-panel,.resident-panel{min-height:0}
+.resident-panel{padding-bottom:84px;scroll-padding-bottom:110px}
+.documentation-group{margin-bottom:18px}
+.resolve-form{padding-bottom:10px}
+.resolve-btn{margin-bottom:8px!important}
+.case-badge-resolved{background:rgba(128,216,167,.12);color:#a8e8c2;border:1px solid rgba(128,216,167,.22)}
+.case-resolved-summary{border-color:rgba(128,216,167,.30)}
+.case-resolved-summary>div>strong{color:#a8e8c2}
+.resolution-summary{margin-top:8px;padding:9px 10px;background:#081622;border-radius:8px;white-space:pre-wrap;line-height:1.4;color:#dceaf4;font-size:12px}
+@media(max-width:1100px){.app-shell{height:auto;overflow:visible}.app-shell main{height:auto;overflow:visible;display:block}.workspace{overflow:visible}.resident-panel{padding-bottom:28px}}
+
+
+/* Monitoring Center v3.5: resident access code visibility */
+.access-code-inline{display:inline-flex;align-items:center;gap:4px;margin-top:5px;padding:3px 7px;border-radius:7px;background:rgba(118,199,255,.08);border:1px solid rgba(118,199,255,.18);color:#b9dff8;font-size:10px}.access-code-inline strong{font-size:11px;letter-spacing:.08em;color:#e8f6ff}.access-code-pill{border-color:rgba(118,199,255,.30)!important;background:rgba(118,199,255,.10)!important;color:#c8e9ff!important}.access-code-pill b{color:#f0f9ff!important}.access-code-fact{border-color:rgba(118,199,255,.22)}.access-code-fact strong{font-size:18px;letter-spacing:.12em;color:#dff2ff}
