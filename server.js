@@ -19,6 +19,13 @@ const http2 = require("http2");
 const mqtt = require("mqtt");
 const QRCode = require("./lib/qrcode");
 const QRErrorCorrectLevel = require("./lib/qrcode/QRErrorCorrectLevel");
+let webPush = null;
+try {
+  webPush = require("web-push");
+} catch (error) {
+  console.warn("Web Push support is unavailable until the web-push package is installed.");
+}
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -525,6 +532,26 @@ async function initializeDatabase() {
   await pool.query(`DROP INDEX IF EXISTS customer_push_devices_token_unique_idx`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS customer_push_devices_token_environment_unique_idx ON customer_push_devices (device_token, apns_environment)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS customer_push_devices_resident_idx ON customer_push_devices (resident_id, is_active)`);
+
+  // Browser/PWA Web Push subscriptions. These are separate from native APNs
+  // device tokens and allow installed Home Screen apps / supported browsers to
+  // receive the same Good Shepherd resident check-ins.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_web_push_subscriptions (
+      id UUID PRIMARY KEY,
+      resident_id UUID NOT NULL REFERENCES residents(id) ON DELETE CASCADE,
+      endpoint TEXT NOT NULL,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      user_agent TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS customer_web_push_endpoint_unique_idx ON customer_web_push_subscriptions (endpoint)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS customer_web_push_resident_idx ON customer_web_push_subscriptions (resident_id, is_active)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS resident_checkins (
@@ -3644,6 +3671,55 @@ async function sendApnsNotification(deviceToken, payload, environment = "product
     request.end(JSON.stringify(payload));
   });
 }
+
+
+function webPushConfiguration() {
+  const publicKey = cleanText(process.env.WEB_PUSH_VAPID_PUBLIC_KEY);
+  const privateKey = cleanText(process.env.WEB_PUSH_VAPID_PRIVATE_KEY);
+  const subject = cleanText(process.env.WEB_PUSH_VAPID_SUBJECT) || "mailto:dev@thriveks.com";
+  return {
+    publicKey,
+    privateKey,
+    subject,
+    configured: Boolean(webPush && publicKey && privateKey && subject),
+  };
+}
+
+async function sendWebPushNotification(subscriptionRow, payload) {
+  const cfg = webPushConfiguration();
+  if (!cfg.configured) return { delivered:false, reason:webPush ? "web_push_not_configured" : "web_push_package_missing" };
+  const subscription = {
+    endpoint: subscriptionRow.endpoint,
+    keys: {
+      p256dh: subscriptionRow.p256dh,
+      auth: subscriptionRow.auth,
+    },
+  };
+  try {
+    const response = await webPush.sendNotification(
+      subscription,
+      JSON.stringify(payload),
+      {
+        TTL: 2 * 60 * 60,
+        urgency: "high",
+        vapidDetails: {
+          subject: cfg.subject,
+          publicKey: cfg.publicKey,
+          privateKey: cfg.privateKey,
+        },
+      }
+    );
+    return { delivered:true, status:response?.statusCode || 201 };
+  } catch (error) {
+    return {
+      delivered:false,
+      status:error?.statusCode || null,
+      reason:error?.body || error?.message || "web_push_error",
+      expired:[404,410].includes(Number(error?.statusCode)),
+    };
+  }
+}
+
 
 function customerCheckInPayload(row) {
   if (!row) return null;
@@ -6871,6 +6947,57 @@ app.get("/presence-telemetry/latest", async (req, res) => {
 
 
 // Customer communications endpoints. The resident session is authoritative for ownership.
+
+// Browser/PWA Web Push configuration and subscription registration.
+app.get("/customer/push/web/config", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res); if (!session) return;
+    const cfg = webPushConfiguration();
+    res.set("Cache-Control", "no-store");
+    return res.json({ success:true, configured:cfg.configured, publicKey:cfg.publicKey || null });
+  } catch (error) {
+    console.error("Customer Web Push config failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to load notification configuration" });
+  }
+});
+
+app.post("/customer/push/web/register", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res); if (!session) return;
+    const endpoint = cleanText(req.body?.endpoint);
+    const p256dh = cleanText(req.body?.keys?.p256dh);
+    const auth = cleanText(req.body?.keys?.auth);
+    if (!endpoint || !/^https:\/\//i.test(endpoint) || !p256dh || !auth) {
+      return res.status(400).json({ success:false, error:"A valid Web Push subscription is required" });
+    }
+    await pool.query(`
+      INSERT INTO customer_web_push_subscriptions (id,resident_id,endpoint,p256dh,auth,is_active,user_agent,last_seen_at,updated_at)
+      VALUES ($1,$2,$3,$4,$5,TRUE,$6,NOW(),NOW())
+      ON CONFLICT (endpoint) DO UPDATE
+      SET resident_id=EXCLUDED.resident_id,p256dh=EXCLUDED.p256dh,auth=EXCLUDED.auth,
+          is_active=TRUE,user_agent=EXCLUDED.user_agent,last_seen_at=NOW(),updated_at=NOW()
+    `, [randomUUID(), session.residentId, endpoint, p256dh, auth, cleanText(req.header("user-agent")) || null]);
+    return res.json({ success:true, configured:webPushConfiguration().configured });
+  } catch (error) {
+    console.error("Customer Web Push registration failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to register browser notifications" });
+  }
+});
+
+app.delete("/customer/push/web/register", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res); if (!session) return;
+    const endpoint = cleanText(req.body?.endpoint);
+    if (endpoint) {
+      await pool.query(`UPDATE customer_web_push_subscriptions SET is_active=FALSE,updated_at=NOW() WHERE resident_id=$1 AND endpoint=$2`, [session.residentId, endpoint]);
+    }
+    return res.json({ success:true });
+  } catch (error) {
+    console.error("Customer Web Push unregister failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to unregister browser notifications" });
+  }
+});
+
 app.post("/customer/push/register", async (req, res) => {
   try {
     const session = await requireCustomerSession(req, res); if (!session) return;
@@ -7423,9 +7550,15 @@ app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
     const checkInId = randomUUID();
     await pool.query(`INSERT INTO resident_checkins (id,resident_id,case_id,created_by_operator_id,created_by_operator_name,message,status,delivery_channel) VALUES ($1,$2,$3,$4,$5,$6,'pending','in_app')`, [checkInId,incident.residentId,incident.id,operator.id,operator.displayName,message]);
 
-    const devices = await pool.query(`SELECT device_token AS "deviceToken",apns_environment AS "apnsEnvironment" FROM customer_push_devices WHERE resident_id=$1 AND is_active=TRUE ORDER BY last_seen_at DESC LIMIT 10`, [incident.residentId]);
-    let pushDelivered = false;
+    const [devices, webSubscriptions] = await Promise.all([
+      pool.query(`SELECT device_token AS "deviceToken",apns_environment AS "apnsEnvironment" FROM customer_push_devices WHERE resident_id=$1 AND is_active=TRUE ORDER BY last_seen_at DESC LIMIT 10`, [incident.residentId]),
+      pool.query(`SELECT endpoint,p256dh,auth FROM customer_web_push_subscriptions WHERE resident_id=$1 AND is_active=TRUE ORDER BY last_seen_at DESC LIMIT 20`, [incident.residentId]),
+    ]);
+
+    let apnsDelivered = false;
+    let webPushDelivered = false;
     const deliveryResults = [];
+
     if (devices.rows.length && apnsConfiguration().configured) {
       const payload = {
         aps: { alert: { title:"Good Shepherd Check-In", body:message }, sound:"default", category:"GOOD_SHEPHERD_CHECKIN" },
@@ -7438,8 +7571,9 @@ app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
         apnsEnvironment: normalizeApnsEnvironment(apnsEnvironment),
         result: await sendApnsNotification(deviceToken,payload,apnsEnvironment)
       })));
-      pushDelivered = results.some(({result}) => result.delivered);
+      apnsDelivered = results.some(({result}) => result.delivered);
       deliveryResults.push(...results.map(({apnsEnvironment,result}) => ({
+        channel:"apns",
         delivered:result.delivered,
         status:result.status || null,
         reason:result.reason || null,
@@ -7453,15 +7587,85 @@ app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
         await pool.query(`UPDATE customer_push_devices SET is_active=FALSE,updated_at=NOW() WHERE device_token=$1 AND apns_environment=$2`, [expiredToken,expiredEnvironment]);
       }
     }
-    const deliveryChannel = pushDelivered ? 'apns+in_app' : 'in_app';
-    const status = pushDelivered ? 'sent' : 'pending';
+
+    if (webSubscriptions.rows.length && webPushConfiguration().configured) {
+      const webPayload = {
+        title:"Good Shepherd Check-In",
+        body:message,
+        checkInId,
+        residentId:incident.residentId,
+        type:"resident_check_in",
+        url:`./?checkin=${encodeURIComponent(checkInId)}`,
+      };
+      const webResults = await Promise.all(webSubscriptions.rows.map(async (subscription) => ({
+        endpoint:subscription.endpoint,
+        result:await sendWebPushNotification(subscription, webPayload),
+      })));
+      webPushDelivered = webResults.some(({result}) => result.delivered);
+      deliveryResults.push(...webResults.map(({result}) => ({
+        channel:"web_push",
+        delivered:result.delivered,
+        status:result.status || null,
+        reason:result.reason || null,
+      })));
+
+      for (const item of webResults.filter(({result}) => result.expired)) {
+        await pool.query(`UPDATE customer_web_push_subscriptions SET is_active=FALSE,updated_at=NOW() WHERE endpoint=$1`, [item.endpoint]);
+      }
+    }
+
+    const pushDelivered = apnsDelivered || webPushDelivered;
+    const channels = ["in_app"];
+    if (apnsDelivered) channels.unshift("apns");
+    if (webPushDelivered) channels.unshift("web_push");
+    const deliveryChannel = channels.join("+");
+    const status = pushDelivered ? "sent" : "pending";
+    const totalPushTargets = devices.rows.length + webSubscriptions.rows.length;
+
     await pool.query(`UPDATE resident_checkins SET status=$2,delivery_channel=$3,sent_at=CASE WHEN $2='sent' THEN NOW() ELSE sent_at END WHERE id=$1`, [checkInId,status,deliveryChannel]);
     await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'check_in_sent','Check-in sent',$5,$6::jsonb)`, [
-      randomUUID(),incident.id,operator.id,operator.displayName,pushDelivered ? 'Push notification and in-app check-in created.' : 'In-app check-in created; push delivery is not currently available.', JSON.stringify({checkInId,deliveryChannel,pushDelivered,deviceCount:devices.rows.length,deliveryResults})
+      randomUUID(),
+      incident.id,
+      operator.id,
+      operator.displayName,
+      pushDelivered
+        ? `Check-in delivered through ${[apnsDelivered ? "APNs" : null, webPushDelivered ? "Web Push" : null].filter(Boolean).join(" + ")} and created in-app.`
+        : "In-app check-in created; no push-capable registered device was successfully reached.",
+      JSON.stringify({
+        checkInId,
+        deliveryChannel,
+        pushDelivered,
+        apnsDelivered,
+        webPushDelivered,
+        deviceCount:totalPushTargets,
+        apnsDeviceCount:devices.rows.length,
+        webPushSubscriptionCount:webSubscriptions.rows.length,
+        deliveryResults
+      })
     ]);
     await pool.query(`UPDATE monitoring_cases SET updated_at=NOW() WHERE id=$1`, [incident.id]);
-    await writeMonitoringAudit(operator, req, "check_in_sent", "case", incident.id, { checkInId, residentId:incident.residentId, deliveryChannel, pushDelivered, deviceCount:devices.rows.length });
-    return res.status(201).json({ success:true, checkIn:{ id:checkInId, residentId:incident.residentId, caseId:incident.id, message, status, deliveryChannel, pushDelivered } });
+    await writeMonitoringAudit(operator, req, "check_in_sent", "case", incident.id, {
+      checkInId,
+      residentId:incident.residentId,
+      deliveryChannel,
+      pushDelivered,
+      apnsDelivered,
+      webPushDelivered,
+      deviceCount:totalPushTargets,
+      apnsDeviceCount:devices.rows.length,
+      webPushSubscriptionCount:webSubscriptions.rows.length
+    });
+    return res.status(201).json({ success:true, checkIn:{
+      id:checkInId,
+      residentId:incident.residentId,
+      caseId:incident.id,
+      message,
+      status,
+      deliveryChannel,
+      pushDelivered,
+      apnsDelivered,
+      webPushDelivered
+    } });
   } catch (error) {
     console.error("Monitoring check-in send failed:", error);
     return res.status(500).json({ success:false, error:"Failed to send resident check-in" });
