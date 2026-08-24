@@ -9,6 +9,7 @@ const state = {
   operator: null,
   panelScrollTop: 0,
   caseNoticeTimer: null,
+  drafts: {},
 };
 
 const $ = (s) => document.querySelector(s);
@@ -118,6 +119,40 @@ $('#priorityFilter').addEventListener('change', (e) => {
   renderQueue();
 });
 
+
+
+function draftKey(residentId, fieldId) {
+  return `${residentId || 'none'}:${fieldId}`;
+}
+
+function captureResidentDrafts(residentId = state.selectedId) {
+  if (!residentId) return;
+  ['caseNote', 'resolutionNote', 'followNote'].forEach((fieldId) => {
+    const el = document.getElementById(fieldId);
+    if (el) state.drafts[draftKey(residentId, fieldId)] = el.value;
+  });
+}
+
+function restoreResidentDrafts(residentId = state.selectedId) {
+  if (!residentId) return;
+  ['caseNote', 'resolutionNote', 'followNote'].forEach((fieldId) => {
+    const el = document.getElementById(fieldId);
+    if (!el) return;
+    const key = draftKey(residentId, fieldId);
+    if (Object.prototype.hasOwnProperty.call(state.drafts, key)) el.value = state.drafts[key];
+    el.addEventListener('input', () => { state.drafts[key] = el.value; });
+  });
+}
+
+function clearResidentDraft(residentId, fieldId) {
+  delete state.drafts[draftKey(residentId, fieldId)];
+}
+
+function residentEditorIsActive() {
+  const active = document.activeElement;
+  return Boolean(active && $('#residentPanel')?.contains(active) && /^(TEXTAREA|INPUT|SELECT)$/.test(active.tagName));
+}
+
 async function loadDashboard({ initial = false } = {}) {
   if (state.refreshing && !initial) return;
   const seq = ++state.refreshSeq;
@@ -154,7 +189,10 @@ async function loadDashboard({ initial = false } = {}) {
 
   if (state.selectedId && residentResult.status === 'fulfilled' && residentResult.value) {
     state.selectedResident = residentResult.value.resident;
-    renderResident(state.selectedResident);
+    // Never tear down the operator's editor while they are typing. The queue and
+    // metrics can continue refreshing in the background; the resident panel will
+    // catch up on the next refresh after the field loses focus.
+    if (!residentEditorIsActive()) renderResident(state.selectedResident);
   } else if (state.selectedId && residentResult.status === 'rejected') {
     hadError = true;
     // Keep the last resident view visible. Do not blank the panel during a transient failure.
@@ -322,6 +360,7 @@ async function submitCaseAction(caseId, action, note = '') {
 }
 
 function renderResident(r) {
+  captureResidentDrafts(r?.residentId || state.selectedId);
   const panel = $('#residentPanel');
   const priorScroll = panel ? panel.scrollTop : 0;
   const insights = Array.isArray(r.behaviorInsights) ? r.behaviorInsights : [];
@@ -406,6 +445,7 @@ function renderResident(r) {
       </form>
     </div>`;
 
+  restoreResidentDrafts(r.residentId);
   requestAnimationFrame(() => { panel.scrollTop = priorScroll; });
 
   const acceptBtn = $('#acceptCaseBtn');
@@ -452,6 +492,7 @@ function renderResident(r) {
     try {
       rememberPanelScroll();
       await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify({action:'note',note}) });
+      clearResidentDraft(r.residentId, 'caseNote');
       const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
       state.selectedResident = data.resident; renderResident(data.resident); restorePanelScroll();
       showCaseNotice('✓ Operator note added.'); loadDashboard().catch(()=>{});
@@ -466,6 +507,7 @@ function renderResident(r) {
     try {
       rememberPanelScroll();
       await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/resolve`, {method:'POST',body:JSON.stringify({resolution})});
+      clearResidentDraft(r.residentId, 'resolutionNote');
       const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
       state.selectedResident=data.resident; renderResident(data.resident); restorePanelScroll();
       showCaseNotice('✓ Case resolved and closed.'); loadDashboard().catch(()=>{});
@@ -481,6 +523,7 @@ function renderResident(r) {
     try {
       await api(`/monitoring/api/residents/${encodeURIComponent(r.residentId)}/follow-up`, { method:'POST', body:JSON.stringify({ note, status:'completed' }) });
       $('#followNotice').textContent = '✓ Follow-up logged to Good Shepherd.';
+      clearResidentDraft(r.residentId, 'followNote');
       $('#followNote').value = '';
       loadDashboard().catch(()=>{});
     } catch (err) { $('#followNotice').textContent = err.message; }
