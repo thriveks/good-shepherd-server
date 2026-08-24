@@ -7,6 +7,8 @@ const state = {
   refreshing: false,
   lastSuccessfulRefresh: null,
   operator: null,
+  panelScrollTop: 0,
+  caseNoticeTimer: null,
 };
 
 const $ = (s) => document.querySelector(s);
@@ -261,12 +263,57 @@ function caseTimeline(incident) {
   return `<div class="timeline">${rows.map((e) => `<div class="timeline-row"><div class="timeline-dot"></div><div><strong>${escapeHtml(e.label)}</strong><div class="small">${fmtDate(e.createdAt)}${e.operatorName ? ` · ${escapeHtml(e.operatorName)}` : ''}</div>${e.note ? `<div class="timeline-note">${escapeHtml(e.note)}</div>` : ''}</div></div>`).join('')}</div>`;
 }
 
+function rememberPanelScroll() {
+  const panel = $('#residentPanel');
+  if (panel) state.panelScrollTop = panel.scrollTop;
+}
+
+function restorePanelScroll() {
+  const panel = $('#residentPanel');
+  if (!panel) return;
+  requestAnimationFrame(() => { panel.scrollTop = state.panelScrollTop || 0; });
+}
+
+function showCaseNotice(message, kind = 'success') {
+  const n = $('#caseNotice');
+  if (!n) return;
+  n.textContent = message;
+  n.className = `notice case-flash ${kind}`;
+  if (state.caseNoticeTimer) clearTimeout(state.caseNoticeTimer);
+  state.caseNoticeTimer = setTimeout(() => {
+    const current = $('#caseNotice');
+    if (current) { current.textContent = ''; current.className = 'notice'; }
+  }, 3200);
+}
+
+function confirmCaseAction(action) {
+  const prompts = {
+    supervisor_escalation: 'Record an escalation to a supervisor for this case?',
+    field_response: 'Record that a field response has been requested?',
+    emergency_escalation: 'Record an Emergency / 911 escalation for this case? This is a consequential incident action.',
+  };
+  return prompts[action] ? window.confirm(prompts[action]) : true;
+}
+
+function elapsedText(openedAt, closedAt) {
+  if (!openedAt) return '—';
+  const start = new Date(openedAt).getTime();
+  const end = closedAt ? new Date(closedAt).getTime() : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return '—';
+  const mins = Math.max(0, Math.floor((end - start) / 60000));
+  if (mins < 60) return `${mins}m`;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return `${h}h ${m}m`;
+}
+
 async function refreshSelectedResident() {
   if (!state.selectedId) return;
+  rememberPanelScroll();
   const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
   state.selectedResident = data.resident;
   renderResident(data.resident);
-  await loadDashboard();
+  restorePanelScroll();
+  loadDashboard().catch(() => {});
 }
 
 async function submitCaseAction(caseId, action, note = '') {
@@ -275,18 +322,23 @@ async function submitCaseAction(caseId, action, note = '') {
 }
 
 function renderResident(r) {
+  const panel = $('#residentPanel');
+  const priorScroll = panel ? panel.scrollTop : 0;
   const insights = Array.isArray(r.behaviorInsights) ? r.behaviorInsights : [];
   const sensors = Array.isArray(r.sensors) ? r.sensors : [];
   const contextCards = insightCards(insights);
   const incident = r.incident || null;
   const activeCase = incident && ['open','accepted','escalated'].includes(incident.status);
   const mine = activeCase && incident.assignedOperatorId && String(incident.assignedOperatorId) === String(state.operator?.id);
+  const sensorSummary = `${r.onlineSensorCount ?? sensors.filter(s => s.isOnline).length}/${r.sensorCount ?? sensors.length} online`;
+  const caseState = activeCase ? String(incident.status || 'open').toUpperCase() : 'NO ACTIVE CASE';
 
-  $('#residentPanel').innerHTML = `
-    <div class="resident-head">
-      <span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span>
-      <h2>${escapeHtml(r.residentName)}</h2>
-      <div class="location">${escapeHtml(r.location || 'Location not set')}</div>
+  panel.innerHTML = `
+    <div class="resident-sticky-header">
+      <div class="resident-head compact-head">
+        <div class="resident-title-line"><span class="priority ${String(r.priority || 'P5').toLowerCase()}">${escapeHtml(r.priority || 'P5')}</span><div><h2>${escapeHtml(r.residentName)}</h2><div class="location">${escapeHtml(r.location || 'Location not set')}</div></div></div>
+        <div class="sticky-facts"><span><b>${escapeHtml(caseState)}</b>${activeCase && incident.assignedOperatorName ? ` · ${escapeHtml(incident.assignedOperatorName)}` : ''}</span><span>${activeCase ? `Open ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}` : '—'}</span><span>${escapeHtml(sensorSummary)}</span><span>Last ${escapeHtml(r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity')}</span></div>
+      </div>
     </div>
     <div class="section">
       <h3>Current assessment</h3>
@@ -303,12 +355,31 @@ function renderResident(r) {
         <div class="fact"><span>Baseline</span><strong>${Number(r.baselineDayCount || 0)} days</strong></div>
       </div>
     </div>
-    <div class="section">
-      <h3>AI / routine context</h3>
-      <div class="ai-summary-line"><strong>${escapeHtml(r.aiLevel || r.aiStatus || 'AI status')}</strong><span>${escapeHtml(r.aiConfidence || 'Confidence unavailable')}${r.aiConfidenceScore != null ? ` (${escapeHtml(r.aiConfidenceScore)}%)` : ''}</span></div>
-      ${r.aiExplanation ? `<div class="insight-card"><div>${escapeHtml(r.aiExplanation)}</div></div>` : ''}
-      ${r.patternExplanation && r.patternExplanation !== r.aiExplanation ? `<div class="insight-card"><div>${escapeHtml(r.patternExplanation)}</div></div>` : ''}
-      ${contextCards || '<div class="muted small">No additional routine insights reported.</div>'}
+    <div class="section case-section">
+      <h3>Operator case</h3>
+      ${!activeCase ? `<div class="case-empty"><div>No active case is assigned for this resident.</div><button id="acceptCaseBtn" class="primary case-primary" type="button">Accept Case</button></div>` : `
+        <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)} · ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
+        ${mine ? `<div class="action-groups">
+          <div class="action-group"><div class="action-group-title">Contact</div><div class="action-grid compact-actions">
+            <button type="button" data-case-action="resident_call" data-success="Resident call attempt recorded">Resident call attempt</button>
+            <button type="button" data-case-action="check_in_sent" data-success="Check-in recorded">Check-in sent</button>
+            <button type="button" data-case-action="contact_1_call" data-success="Contact #1 call attempt recorded">Contact #1 call attempt</button>
+            <button type="button" data-case-action="contact_2_call" data-success="Contact #2 call attempt recorded">Contact #2 call attempt</button>
+          </div></div>
+          <div class="action-group"><div class="action-group-title">Escalation</div><div class="action-grid compact-actions">
+            <button type="button" data-case-action="supervisor_escalation" data-success="Supervisor escalation recorded">Escalate to supervisor</button>
+            <button type="button" data-case-action="technical_review" data-success="Technical review recorded">Technical review</button>
+            <button type="button" data-case-action="field_response" data-success="Field response request recorded">Field response requested</button>
+            <button type="button" data-case-action="emergency_escalation" data-success="Emergency / 911 escalation recorded" class="danger-action">Emergency / 911 escalation</button>
+          </div></div>
+        </div>
+        <div class="action-group documentation-group"><div class="action-group-title">Documentation</div>
+          <form id="caseNoteForm" class="follow-form"><textarea id="caseNote" placeholder="Add operator note to this case…" required></textarea><button class="ghost" type="submit">Add note</button></form>
+          <form id="resolveForm" class="resolve-form"><textarea id="resolutionNote" placeholder="Resolution / closure evidence…" required></textarea><button class="primary resolve-btn" type="submit">Resolve Case</button></form>
+        </div>` : `<div class="notice">This case is being handled by ${escapeHtml(incident.assignedOperatorName || 'another operator')}.</div>`}
+        <div id="caseNotice" class="notice"></div>
+        <div class="case-timeline-title">Incident timeline</div>${caseTimeline(incident)}
+      `}
     </div>
     <div class="section">
       <h3>Sensor health</h3>
@@ -318,25 +389,12 @@ function renderResident(r) {
           <div class="${s.isOnline ? 'online' : 'offline'}">${s.isOnline ? 'Online' : 'Offline'}<div class="small">${fmtDate(s.lastSeenAt)}</div></div>
         </div>`).join('') : '<div class="muted">No assigned sensors reported by the AI summary.</div>'}
     </div>
-    <div class="section case-section">
-      <h3>Operator case</h3>
-      ${!activeCase ? `<div class="case-empty"><div>No active case is assigned for this resident.</div><button id="acceptCaseBtn" class="primary case-primary" type="button">Accept Case</button></div>` : `
-        <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
-        ${mine ? `<div class="action-grid">
-          <button type="button" data-case-action="resident_call">Resident call attempt</button>
-          <button type="button" data-case-action="check_in_sent">Check-in sent</button>
-          <button type="button" data-case-action="contact_1_call">Contact #1 call attempt</button>
-          <button type="button" data-case-action="contact_2_call">Contact #2 call attempt</button>
-          <button type="button" data-case-action="supervisor_escalation">Escalate to supervisor</button>
-          <button type="button" data-case-action="technical_review">Technical review</button>
-          <button type="button" data-case-action="field_response">Field response requested</button>
-          <button type="button" data-case-action="emergency_escalation" class="danger-action">Emergency / 911 escalation</button>
-        </div>
-        <form id="caseNoteForm" class="follow-form"><textarea id="caseNote" placeholder="Add operator note to this case…" required></textarea><button class="ghost" type="submit">Add note</button></form>
-        <form id="resolveForm" class="resolve-form"><textarea id="resolutionNote" placeholder="Resolution / closure evidence…" required></textarea><button class="primary resolve-btn" type="submit">Resolve Case</button></form>` : `<div class="notice">This case is being handled by ${escapeHtml(incident.assignedOperatorName || 'another operator')}.</div>`}
-        <div class="case-timeline-title">Incident timeline</div>${caseTimeline(incident)}
-      `}
-      <div id="caseNotice" class="notice"></div>
+    <div class="section">
+      <h3>AI / routine context</h3>
+      <div class="ai-summary-line"><strong>${escapeHtml(r.aiLevel || r.aiStatus || 'AI status')}</strong><span>${escapeHtml(r.aiConfidence || 'Confidence unavailable')}${r.aiConfidenceScore != null ? ` (${escapeHtml(r.aiConfidenceScore)}%)` : ''}</span></div>
+      ${r.aiExplanation ? `<div class="insight-card"><div>${escapeHtml(r.aiExplanation)}</div></div>` : ''}
+      ${r.patternExplanation && r.patternExplanation !== r.aiExplanation ? `<div class="insight-card"><div>${escapeHtml(r.patternExplanation)}</div></div>` : ''}
+      ${contextCards || '<div class="muted small">No additional routine insights reported.</div>'}
     </div>
     <div class="section">
       <h3>AI follow-up record</h3>
@@ -348,6 +406,7 @@ function renderResident(r) {
       </form>
     </div>`;
 
+  requestAnimationFrame(() => { panel.scrollTop = priorScroll; });
 
   const acceptBtn = $('#acceptCaseBtn');
   if (acceptBtn) acceptBtn.addEventListener('click', async () => {
@@ -355,50 +414,67 @@ function renderResident(r) {
     try {
       await api(`/monitoring/api/residents/${encodeURIComponent(r.residentId)}/cases/accept`, { method:'POST', body:'{}' });
       await refreshSelectedResident();
-    } catch (err) { const n=$('#caseNotice'); if(n) n.textContent=err.message; acceptBtn.disabled=false; }
+      showCaseNotice('✓ Case accepted and assigned to you.');
+    } catch (err) { showCaseNotice(err.message, 'error'); acceptBtn.disabled=false; }
   });
 
   document.querySelectorAll('[data-case-action]').forEach((btn) => btn.addEventListener('click', async () => {
+    const action = btn.dataset.caseAction;
+    if (!confirmCaseAction(action)) return;
     btn.disabled = true;
-    try { await submitCaseAction(incident.id, btn.dataset.caseAction); }
-    catch (err) { const n=$('#caseNotice'); if(n) n.textContent=err.message; btn.disabled=false; }
+    const success = btn.dataset.success || 'Action recorded';
+    try {
+      rememberPanelScroll();
+      await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify({ action, note:'' }) });
+      const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
+      state.selectedResident = data.resident;
+      renderResident(data.resident);
+      restorePanelScroll();
+      showCaseNotice(`✓ ${success}`);
+      loadDashboard().catch(() => {});
+    } catch (err) { showCaseNotice(err.message, 'error'); btn.disabled=false; }
   }));
 
   const noteForm = $('#caseNoteForm');
   if (noteForm) noteForm.addEventListener('submit', async (e) => {
     e.preventDefault(); const note=$('#caseNote').value.trim(); if(!note) return;
     e.submitter.disabled=true;
-    try { await submitCaseAction(incident.id,'note',note); }
-    catch(err){ const n=$('#caseNotice'); if(n) n.textContent=err.message; e.submitter.disabled=false; }
+    try {
+      rememberPanelScroll();
+      await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify({action:'note',note}) });
+      const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
+      state.selectedResident = data.resident; renderResident(data.resident); restorePanelScroll();
+      showCaseNotice('✓ Operator note added.'); loadDashboard().catch(()=>{});
+    } catch(err){ showCaseNotice(err.message,'error'); e.submitter.disabled=false; }
   });
 
   const resolveForm = $('#resolveForm');
   if (resolveForm) resolveForm.addEventListener('submit', async (e) => {
     e.preventDefault(); const resolution=$('#resolutionNote').value.trim(); if(!resolution) return;
+    if (!window.confirm('Resolve and close this case with the entered closure evidence?')) return;
     e.submitter.disabled=true;
-    try { await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/resolve`, {method:'POST',body:JSON.stringify({resolution})}); await refreshSelectedResident(); }
-    catch(err){ const n=$('#caseNotice'); if(n) n.textContent=err.message; e.submitter.disabled=false; }
+    try {
+      rememberPanelScroll();
+      await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/resolve`, {method:'POST',body:JSON.stringify({resolution})});
+      const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
+      state.selectedResident=data.resident; renderResident(data.resident); restorePanelScroll();
+      showCaseNotice('✓ Case resolved and closed.'); loadDashboard().catch(()=>{});
+    } catch(err){ showCaseNotice(err.message,'error'); e.submitter.disabled=false; }
   });
 
-  $('#followForm').addEventListener('submit', async (e) => {
+  const followForm = $('#followForm');
+  if (followForm) followForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const note = $('#followNote').value.trim();
     if (!note) return;
-    const b = e.submitter;
-    b.disabled = true;
+    const b = e.submitter; b.disabled = true;
     try {
-      await api(`/monitoring/api/residents/${encodeURIComponent(r.residentId)}/follow-up`, {
-        method: 'POST',
-        body: JSON.stringify({ note, status: 'completed' }),
-      });
-      $('#followNotice').textContent = 'Follow-up logged to Good Shepherd.';
+      await api(`/monitoring/api/residents/${encodeURIComponent(r.residentId)}/follow-up`, { method:'POST', body:JSON.stringify({ note, status:'completed' }) });
+      $('#followNotice').textContent = '✓ Follow-up logged to Good Shepherd.';
       $('#followNote').value = '';
-      await loadDashboard();
-    } catch (err) {
-      $('#followNotice').textContent = err.message;
-    } finally {
-      b.disabled = false;
-    }
+      loadDashboard().catch(()=>{});
+    } catch (err) { $('#followNotice').textContent = err.message; }
+    finally { b.disabled = false; }
   });
 }
 
