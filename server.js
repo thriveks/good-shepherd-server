@@ -420,6 +420,7 @@ async function initializeDatabase() {
       last_login_at TIMESTAMPTZ
     )
   `);
+  await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS is_bootstrap BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS monitoring_operators_username_unique_idx ON monitoring_operators (LOWER(username))`);
 
   await pool.query(`
@@ -3501,20 +3502,60 @@ async function ensureMonitoringBootstrapOperator() {
   const totpSecret = cleanText(process.env.MONITORING_ADMIN_TOTP_SECRET);
   const displayName = cleanText(process.env.MONITORING_ADMIN_DISPLAY_NAME) || username;
   if (!username || !password || !totpSecret) {
-    console.warn("Monitoring Center bootstrap operator not created: MONITORING_ADMIN_USERNAME, MONITORING_ADMIN_PASSWORD, and MONITORING_ADMIN_TOTP_SECRET are required.");
+    console.warn("Monitoring Center bootstrap operator not synchronized: MONITORING_ADMIN_USERNAME, MONITORING_ADMIN_PASSWORD, and MONITORING_ADMIN_TOTP_SECRET are required.");
     return;
   }
   if (!monitoringEncryptionKey()) {
-    console.warn("Monitoring Center bootstrap operator not created: MONITORING_ENCRYPTION_KEY is required.");
+    console.warn("Monitoring Center bootstrap operator not synchronized: MONITORING_ENCRYPTION_KEY is required.");
     return;
   }
-  const existing = await pool.query(`SELECT id FROM monitoring_operators WHERE LOWER(username)=LOWER($1) LIMIT 1`, [username]);
-  if (existing.rowCount > 0) return;
+
+  const existing = await pool.query(`
+    SELECT id, username, display_name AS "displayName", role, password_hash AS "passwordHash",
+           totp_secret_encrypted AS "totpSecretEncrypted", is_active AS "isActive",
+           COALESCE(is_bootstrap, FALSE) AS "isBootstrap"
+    FROM monitoring_operators
+    WHERE LOWER(username)=LOWER($1)
+    LIMIT 1
+  `, [username]);
+
+  if (existing.rowCount === 0) {
+    const id = randomUUID();
+    await pool.query(`
+      INSERT INTO monitoring_operators (id, username, display_name, role, password_hash, totp_secret_encrypted, is_active, is_bootstrap)
+      VALUES ($1, $2, $3, 'admin', $4, $5, TRUE, TRUE)
+    `, [id, username, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
+    console.log(`Monitoring Center bootstrap admin created: ${username}`);
+    return;
+  }
+
+  const operator = existing.rows[0];
+  let storedTotp = null;
+  try { storedTotp = decryptMonitoringSecret(operator.totpSecretEncrypted); }
+  catch (_) { storedTotp = null; }
+
+  const credentialsChanged = !passwordMatches(password, operator.passwordHash) || storedTotp !== totpSecret;
+  const profileChanged = operator.displayName !== displayName || operator.role !== "admin" || operator.isActive !== true || operator.isBootstrap !== true;
+
+  if (!credentialsChanged && !profileChanged) return;
+
   await pool.query(`
-    INSERT INTO monitoring_operators (id, username, display_name, role, password_hash, totp_secret_encrypted)
-    VALUES ($1, $2, $3, 'admin', $4, $5)
-  `, [randomUUID(), username, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
-  console.log(`Monitoring Center bootstrap admin created: ${username}`);
+    UPDATE monitoring_operators
+    SET display_name=$2,
+        role='admin',
+        password_hash=$3,
+        totp_secret_encrypted=$4,
+        is_active=TRUE,
+        is_bootstrap=TRUE,
+        updated_at=NOW()
+    WHERE id=$1
+  `, [operator.id, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
+
+  if (credentialsChanged) {
+    await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [operator.id]);
+  }
+
+  console.log(`Monitoring Center bootstrap admin synchronized: ${username}${credentialsChanged ? " (credentials refreshed)" : ""}`);
 }
 
 function parseCookies(req) {
