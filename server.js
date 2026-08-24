@@ -422,6 +422,7 @@ async function initializeDatabase() {
     )
   `);
   await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS is_bootstrap BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS monitoring_operators_username_unique_idx ON monitoring_operators (LOWER(username))`);
 
   await pool.query(`
@@ -3711,6 +3712,34 @@ function decodeBase32(input) {
   return Buffer.from(out);
 }
 
+function encodeBase32(buffer) {
+  let bits = "";
+  for (const byte of buffer) bits += byte.toString(2).padStart(8, "0");
+  let out = "";
+  for (let i = 0; i < bits.length; i += 5) {
+    const chunk = bits.slice(i, i + 5).padEnd(5, "0");
+    out += BASE32_ALPHABET[parseInt(chunk, 2)];
+  }
+  return out;
+}
+
+function generateMonitoringCredentials() {
+  const password = randomBytes(18).toString("base64url");
+  const totpSecret = encodeBase32(randomBytes(20));
+  return { password, totpSecret };
+}
+
+function monitoringOtpAuthUri(username, totpSecret) {
+  const issuer = "Good Shepherd Monitoring Center";
+  const label = `${issuer}:${username}`;
+  return `otpauth://totp/${encodeURIComponent(label)}?secret=${encodeURIComponent(totpSecret)}&issuer=${encodeURIComponent(issuer)}&digits=6&period=30`;
+}
+
+function normalizeMonitoringRole(role) {
+  const value = cleanText(role).toLowerCase();
+  return ["admin", "supervisor", "operator"].includes(value) ? value : null;
+}
+
 function monitoringTotp(secret, counter) {
   const buffer = Buffer.alloc(8);
   buffer.writeBigUInt64BE(BigInt(counter));
@@ -3841,7 +3870,10 @@ async function authenticatedMonitoringOperator(req) {
   if (!token) return null;
   const tokenHash = hashSessionToken(token);
   const result = await pool.query(`
-    SELECT o.id, o.username, o.display_name AS "displayName", o.role, s.expires_at AS "expiresAt"
+    SELECT o.id, o.username, o.display_name AS "displayName", o.role,
+           COALESCE(o.is_bootstrap,FALSE) AS "isBootstrap",
+           COALESCE(o.must_change_password,FALSE) AS "mustChangePassword",
+           s.expires_at AS "expiresAt"
     FROM monitoring_sessions s
     JOIN monitoring_operators o ON o.id=s.operator_id
     WHERE s.token_hash=$1 AND s.expires_at>NOW() AND o.is_active=TRUE
@@ -3856,6 +3888,16 @@ async function requireMonitoringOperator(req, res) {
   const operator = await authenticatedMonitoringOperator(req);
   if (!operator) {
     res.status(401).json({ success:false, error:"Monitoring Center sign-in required" });
+    return null;
+  }
+  return operator;
+}
+
+async function requireMonitoringAdmin(req, res) {
+  const operator = await requireMonitoringOperator(req, res);
+  if (!operator) return null;
+  if (operator.role !== "admin") {
+    res.status(403).json({ success:false, error:"Administrator access required" });
     return null;
   }
   return operator;
@@ -6817,7 +6859,7 @@ app.post("/monitoring/api/login", async (req, res) => {
     const username = cleanText(req.body?.username);
     const password = String(req.body?.password || "");
     const code = String(req.body?.code || "");
-    const result = await pool.query(`SELECT id, username, display_name AS "displayName", role, password_hash AS "passwordHash", totp_secret_encrypted AS "totpSecretEncrypted" FROM monitoring_operators WHERE LOWER(username)=LOWER($1) AND is_active=TRUE LIMIT 1`, [username]);
+    const result = await pool.query(`SELECT id, username, display_name AS "displayName", role, password_hash AS "passwordHash", totp_secret_encrypted AS "totpSecretEncrypted", COALESCE(is_bootstrap,FALSE) AS "isBootstrap", COALESCE(must_change_password,FALSE) AS "mustChangePassword" FROM monitoring_operators WHERE LOWER(username)=LOWER($1) AND is_active=TRUE LIMIT 1`, [username]);
     const operator = result.rows[0];
     let valid = Boolean(operator) && passwordMatches(password, operator.passwordHash);
     if (valid) {
@@ -6836,7 +6878,7 @@ app.post("/monitoring/api/login", async (req, res) => {
     await pool.query(`UPDATE monitoring_operators SET last_login_at=NOW() WHERE id=$1`, [operator.id]);
     res.cookie("gs_monitor_session", token, { httpOnly:true, secure: process.env.NODE_ENV === "production", sameSite:"lax", path:"/monitoring", maxAge: MONITORING_SESSION_HOURS * 60 * 60 * 1000 });
     await writeMonitoringAudit(operator, req, "login_success", "operator", operator.id, {});
-    return res.json({ success:true, operator:{ id:operator.id, username:operator.username, displayName:operator.displayName, role:operator.role }, expiresAt });
+    return res.json({ success:true, operator:{ id:operator.id, username:operator.username, displayName:operator.displayName, role:operator.role, isBootstrap:Boolean(operator.isBootstrap), mustChangePassword:Boolean(operator.mustChangePassword) }, expiresAt });
   } catch (error) {
     console.error("Monitoring login failed:", error);
     return res.status(500).json({ success:false, error:"Monitoring Center sign-in failed" });
@@ -6857,6 +6899,108 @@ app.post("/monitoring/api/logout", async (req, res) => {
 app.get("/monitoring/api/me", async (req, res) => {
   const operator = await requireMonitoringOperator(req, res); if (!operator) return;
   return res.json({ success:true, operator });
+});
+
+// Monitoring Center staff administration. Individual accounts are database-backed;
+// Render environment credentials remain bootstrap/recovery credentials only.
+app.get("/monitoring/api/operators", async (req, res) => {
+  try {
+    const admin = await requireMonitoringAdmin(req, res); if (!admin) return;
+    const result = await pool.query(`
+      SELECT id, username, display_name AS "displayName", role, is_active AS "isActive",
+             COALESCE(is_bootstrap,FALSE) AS "isBootstrap",
+             COALESCE(must_change_password,FALSE) AS "mustChangePassword",
+             created_at AS "createdAt", updated_at AS "updatedAt", last_login_at AS "lastLoginAt"
+      FROM monitoring_operators
+      ORDER BY COALESCE(is_bootstrap,FALSE) DESC, is_active DESC, LOWER(display_name), LOWER(username)
+    `);
+    return res.json({ success:true, operators:result.rows });
+  } catch (error) {
+    console.error("Monitoring operator list failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to load staff accounts" });
+  }
+});
+
+app.post("/monitoring/api/operators", async (req, res) => {
+  try {
+    const admin = await requireMonitoringAdmin(req, res); if (!admin) return;
+    const username = cleanText(req.body?.username).toLowerCase();
+    const displayName = cleanText(req.body?.displayName);
+    const role = normalizeMonitoringRole(req.body?.role);
+    if (!username || username.length < 3 || !/^[a-z0-9._-]+$/.test(username)) return res.status(400).json({ success:false, error:"Username must be at least 3 characters and use only letters, numbers, dots, underscores, or hyphens" });
+    if (!displayName) return res.status(400).json({ success:false, error:"Display name is required" });
+    if (!role) return res.status(400).json({ success:false, error:"Role must be Administrator, Supervisor, or Operator" });
+    if (!monitoringEncryptionKey()) return res.status(503).json({ success:false, error:"Monitoring encryption is not configured" });
+    const prior = await pool.query(`SELECT id FROM monitoring_operators WHERE LOWER(username)=LOWER($1) LIMIT 1`, [username]);
+    if (prior.rowCount) return res.status(409).json({ success:false, error:"That username already exists" });
+    const { password, totpSecret } = generateMonitoringCredentials();
+    const id = randomUUID();
+    await pool.query(`
+      INSERT INTO monitoring_operators (id,username,display_name,role,password_hash,totp_secret_encrypted,is_active,is_bootstrap,must_change_password)
+      VALUES ($1,$2,$3,$4,$5,$6,TRUE,FALSE,TRUE)
+    `, [id, username, displayName, role, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
+    await writeMonitoringAudit(admin, req, "operator_created", "operator", id, { username, displayName, role });
+    return res.status(201).json({ success:true, operator:{id,username,displayName,role,isActive:true,isBootstrap:false,mustChangePassword:true}, credentials:{ username,password,totpSecret,otpauthUri:monitoringOtpAuthUri(username,totpSecret) } });
+  } catch (error) {
+    console.error("Monitoring operator create failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to create staff account" });
+  }
+});
+
+app.patch("/monitoring/api/operators/:operatorId", async (req, res) => {
+  try {
+    const admin = await requireMonitoringAdmin(req, res); if (!admin) return;
+    const found = await pool.query(`SELECT id,username,display_name AS "displayName",role,is_active AS "isActive",COALESCE(is_bootstrap,FALSE) AS "isBootstrap" FROM monitoring_operators WHERE id=$1 LIMIT 1`, [req.params.operatorId]);
+    const target = found.rows[0];
+    if (!target) return res.status(404).json({ success:false, error:"Staff account not found" });
+    const displayName = req.body?.displayName === undefined ? target.displayName : cleanText(req.body.displayName);
+    const role = req.body?.role === undefined ? target.role : normalizeMonitoringRole(req.body.role);
+    const isActive = req.body?.isActive === undefined ? target.isActive : Boolean(req.body.isActive);
+    if (!displayName) return res.status(400).json({ success:false, error:"Display name is required" });
+    if (!role) return res.status(400).json({ success:false, error:"Invalid role" });
+    if (target.isBootstrap && (role !== "admin" || !isActive)) return res.status(400).json({ success:false, error:"The bootstrap administrator must remain active with the Administrator role" });
+    if (String(target.id) === String(admin.id) && !isActive) return res.status(400).json({ success:false, error:"You cannot disable your own account" });
+    await pool.query(`UPDATE monitoring_operators SET display_name=$2,role=$3,is_active=$4,updated_at=NOW() WHERE id=$1`, [target.id,displayName,role,isActive]);
+    if (!isActive) await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [target.id]);
+    await writeMonitoringAudit(admin, req, "operator_updated", "operator", target.id, { displayName, role, isActive });
+    return res.json({ success:true });
+  } catch (error) {
+    console.error("Monitoring operator update failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to update staff account" });
+  }
+});
+
+app.post("/monitoring/api/operators/:operatorId/reset-credentials", async (req, res) => {
+  try {
+    const admin = await requireMonitoringAdmin(req, res); if (!admin) return;
+    const found = await pool.query(`SELECT id,username,COALESCE(is_bootstrap,FALSE) AS "isBootstrap" FROM monitoring_operators WHERE id=$1 LIMIT 1`, [req.params.operatorId]);
+    const target = found.rows[0];
+    if (!target) return res.status(404).json({ success:false, error:"Staff account not found" });
+    if (target.isBootstrap) return res.status(400).json({ success:false, error:"Reset the bootstrap administrator through the protected Render/1Password recovery credentials" });
+    const { password, totpSecret } = generateMonitoringCredentials();
+    await pool.query(`UPDATE monitoring_operators SET password_hash=$2,totp_secret_encrypted=$3,must_change_password=TRUE,is_active=TRUE,updated_at=NOW() WHERE id=$1`, [target.id,passwordHash(password),encryptMonitoringSecret(totpSecret)]);
+    await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [target.id]);
+    await writeMonitoringAudit(admin, req, "operator_credentials_reset", "operator", target.id, { username:target.username });
+    return res.json({ success:true, credentials:{ username:target.username,password,totpSecret,otpauthUri:monitoringOtpAuthUri(target.username,totpSecret) } });
+  } catch (error) {
+    console.error("Monitoring operator credential reset failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to reset staff credentials" });
+  }
+});
+
+app.post("/monitoring/api/change-password", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    if (operator.isBootstrap) return res.status(400).json({ success:false, error:"Bootstrap administrator credentials are managed through the protected recovery configuration" });
+    const newPassword = String(req.body?.newPassword || "");
+    if (newPassword.length < 12) return res.status(400).json({ success:false, error:"New password must be at least 12 characters" });
+    await pool.query(`UPDATE monitoring_operators SET password_hash=$2,must_change_password=FALSE,updated_at=NOW() WHERE id=$1`, [operator.id,passwordHash(newPassword)]);
+    await writeMonitoringAudit(operator, req, "password_changed", "operator", operator.id, {});
+    return res.json({ success:true });
+  } catch (error) {
+    console.error("Monitoring password change failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to change password" });
+  }
 });
 
 

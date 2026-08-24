@@ -23,7 +23,7 @@
   <div id="appView" class="app-shell hidden">
     <header class="topbar">
       <div><strong>GOOD SHEPHERD</strong><span>Monitoring Center</span></div>
-      <div class="top-actions"><span id="generatedAt" class="muted"></span><span id="operatorName"></span><button id="refreshBtn" class="ghost">Refresh</button><button id="logoutBtn" class="ghost">Sign out</button></div>
+      <div class="top-actions"><span id="generatedAt" class="muted"></span><span id="operatorName"></span><button id="staffBtn" class="ghost hidden" type="button">Staff</button><button id="refreshBtn" class="ghost">Refresh</button><button id="logoutBtn" class="ghost">Sign out</button></div>
     </header>
 
     <main>
@@ -39,6 +39,40 @@
       </section>
     </main>
   </div>
+
+  <div id="staffModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="staffTitle">
+    <section class="staff-modal">
+      <div class="staff-modal-head"><div><h2 id="staffTitle">Monitoring Center Staff</h2><p>Individual accounts, roles, MFA, and access status.</p></div><button id="closeStaffBtn" class="ghost" type="button">Close</button></div>
+      <div class="staff-layout">
+        <div class="staff-list-panel">
+          <div id="staffList" class="staff-list"><div class="loading">Loading staff…</div></div>
+        </div>
+        <div class="staff-create-panel">
+          <h3>Add Staff Member</h3>
+          <form id="createStaffForm" class="staff-form">
+            <label>Full name<input id="staffDisplayName" required placeholder="Example: Jane Smith"></label>
+            <label>Username<input id="staffUsername" required autocomplete="off" placeholder="jane.smith"></label>
+            <label>Role<select id="staffRole"><option value="operator">Operator</option><option value="supervisor">Supervisor</option><option value="admin">Administrator</option></select></label>
+            <button class="primary" type="submit">Create Staff Account</button>
+            <div id="staffFormError" class="error"></div>
+          </form>
+          <div id="staffCredentials" class="credential-box hidden"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="passwordModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="passwordTitle">
+    <form id="changePasswordForm" class="password-modal">
+      <h2 id="passwordTitle">Set Your Password</h2>
+      <p>Your administrator issued temporary credentials. Choose your permanent Monitoring Center password before continuing.</p>
+      <label>New password<input id="newStaffPassword" type="password" minlength="12" autocomplete="new-password" required></label>
+      <label>Confirm password<input id="confirmStaffPassword" type="password" minlength="12" autocomplete="new-password" required></label>
+      <button class="primary" type="submit">Save Password</button>
+      <div id="passwordChangeError" class="error"></div>
+    </form>
+  </div>
+
 <script src="/monitoring/app.js" defer></script>
 </body>
 </html>

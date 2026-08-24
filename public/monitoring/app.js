@@ -49,6 +49,9 @@ function showApp(operator) {
   $('#loginView').classList.add('hidden');
   $('#appView').classList.remove('hidden');
   $('#operatorName').textContent = operator?.displayName || operator?.username || '';
+  const staffBtn = $('#staffBtn');
+  if (staffBtn) staffBtn.classList.toggle('hidden', operator?.role !== 'admin');
+  if (operator?.mustChangePassword && !operator?.isBootstrap) showPasswordChange();
 }
 
 function setRefreshState(active, error = false) {
@@ -74,6 +77,91 @@ function setRefreshState(active, error = false) {
   } else if (state.lastSuccessfulRefresh) {
     el.textContent = `Updated ${fmtDate(state.lastSuccessfulRefresh)}`;
     el.classList.remove('refresh-error');
+  }
+}
+
+function showPasswordChange() {
+  $('#passwordModal')?.classList.remove('hidden');
+}
+
+function hidePasswordChange() {
+  $('#passwordModal')?.classList.add('hidden');
+}
+
+function credentialMarkup(credentials, heading = 'Staff account created') {
+  if (!credentials) return '';
+  return `<div class="credential-title">${escapeHtml(heading)}</div>
+    <p>Give these setup details directly to the staff member. The password and MFA secret are shown only for this setup/reset.</p>
+    <div class="credential-row"><span>Username</span><code>${escapeHtml(credentials.username)}</code></div>
+    <div class="credential-row"><span>Temporary password</span><code>${escapeHtml(credentials.password)}</code></div>
+    <div class="credential-row"><span>MFA secret</span><code>${escapeHtml(credentials.totpSecret)}</code></div>
+    <div class="credential-actions"><button class="ghost" type="button" id="copyStaffCredentials">Copy setup details</button></div>`;
+}
+
+function staffSetupText(credentials) {
+  return `Good Shepherd Monitoring Center\nUsername: ${credentials.username}\nTemporary password: ${credentials.password}\nMFA secret: ${credentials.totpSecret}\n\nAdd the MFA secret to 1Password or another authenticator as a 6-digit TOTP, then sign in. You will be required to set a permanent password.`;
+}
+
+async function openStaffManager() {
+  $('#staffModal').classList.remove('hidden');
+  $('#staffCredentials').classList.add('hidden');
+  await loadStaffList();
+}
+
+function closeStaffManager() {
+  $('#staffModal').classList.add('hidden');
+}
+
+async function loadStaffList() {
+  const list = $('#staffList');
+  if (!list) return;
+  list.innerHTML = '<div class="loading">Loading staff…</div>';
+  try {
+    const data = await api('/monitoring/api/operators');
+    list.innerHTML = (data.operators || []).map((op) => `
+      <article class="staff-card ${op.isActive ? '' : 'staff-disabled'}" data-operator-id="${escapeHtml(op.id)}">
+        <div class="staff-card-head"><div><strong>${escapeHtml(op.displayName)}</strong><span>@${escapeHtml(op.username)}</span></div><div class="staff-badges">${op.isBootstrap ? '<span class="staff-badge bootstrap">Bootstrap</span>' : ''}${!op.isActive ? '<span class="staff-badge disabled">Disabled</span>' : ''}${op.mustChangePassword ? '<span class="staff-badge pending">Password setup</span>' : ''}</div></div>
+        <div class="staff-edit-row">
+          <label>Name<input class="staff-edit-name" value="${escapeHtml(op.displayName)}" ${op.isBootstrap ? 'disabled' : ''}></label>
+          <label>Role<select class="staff-edit-role" ${op.isBootstrap ? 'disabled' : ''}><option value="operator" ${op.role==='operator'?'selected':''}>Operator</option><option value="supervisor" ${op.role==='supervisor'?'selected':''}>Supervisor</option><option value="admin" ${op.role==='admin'?'selected':''}>Administrator</option></select></label>
+        </div>
+        <div class="staff-meta">Last login: ${op.lastLoginAt ? escapeHtml(fmtDate(op.lastLoginAt)) : 'Never'} · Created: ${escapeHtml(fmtDate(op.createdAt))}</div>
+        <div class="staff-card-actions">
+          ${op.isBootstrap ? '<span class="muted">Protected recovery administrator</span>' : `<button type="button" class="ghost staff-save">Save</button><button type="button" class="ghost staff-toggle">${op.isActive ? 'Disable' : 'Enable'}</button><button type="button" class="ghost staff-reset">Reset credentials</button>`}
+        </div>
+      </article>`).join('') || '<div class="empty-state">No staff accounts found.</div>';
+
+    list.querySelectorAll('.staff-save').forEach(btn => btn.addEventListener('click', async () => {
+      const card = btn.closest('.staff-card');
+      btn.disabled = true;
+      try {
+        await api(`/monitoring/api/operators/${card.dataset.operatorId}`, {method:'PATCH', body:JSON.stringify({displayName:card.querySelector('.staff-edit-name').value, role:card.querySelector('.staff-edit-role').value})});
+        await loadStaffList();
+      } catch (err) { alert(err.message); } finally { btn.disabled = false; }
+    }));
+    list.querySelectorAll('.staff-toggle').forEach(btn => btn.addEventListener('click', async () => {
+      const card = btn.closest('.staff-card');
+      const enabling = btn.textContent.trim() === 'Enable';
+      if (!enabling && !confirm('Disable this staff account? Their active Monitoring Center sessions will be signed out.')) return;
+      btn.disabled = true;
+      try { await api(`/monitoring/api/operators/${card.dataset.operatorId}`, {method:'PATCH',body:JSON.stringify({isActive:enabling})}); await loadStaffList(); }
+      catch (err) { alert(err.message); } finally { btn.disabled=false; }
+    }));
+    list.querySelectorAll('.staff-reset').forEach(btn => btn.addEventListener('click', async () => {
+      const card = btn.closest('.staff-card');
+      if (!confirm('Reset this staff member’s password and MFA? Their current sessions will be signed out.')) return;
+      btn.disabled = true;
+      try {
+        const data = await api(`/monitoring/api/operators/${card.dataset.operatorId}/reset-credentials`, {method:'POST',body:'{}'});
+        const box = $('#staffCredentials');
+        box.innerHTML = credentialMarkup(data.credentials, 'Credentials reset');
+        box.classList.remove('hidden');
+        $('#copyStaffCredentials')?.addEventListener('click', () => navigator.clipboard.writeText(staffSetupText(data.credentials)));
+        await loadStaffList();
+      } catch (err) { alert(err.message); } finally { btn.disabled=false; }
+    }));
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state">${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -545,5 +633,38 @@ function renderResident(r) {
 setInterval(() => {
   if (!$('#appView').classList.contains('hidden')) loadDashboard().catch(() => {});
 }, 15000);
+
+$('#staffBtn')?.addEventListener('click', openStaffManager);
+$('#closeStaffBtn')?.addEventListener('click', closeStaffManager);
+$('#staffModal')?.addEventListener('click', (e) => { if (e.target.id === 'staffModal') closeStaffManager(); });
+
+$('#createStaffForm')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('#staffFormError').textContent = '';
+  try {
+    const data = await api('/monitoring/api/operators', {method:'POST',body:JSON.stringify({displayName:$('#staffDisplayName').value,username:$('#staffUsername').value,role:$('#staffRole').value})});
+    e.target.reset();
+    const box = $('#staffCredentials');
+    box.innerHTML = credentialMarkup(data.credentials);
+    box.classList.remove('hidden');
+    $('#copyStaffCredentials')?.addEventListener('click', () => navigator.clipboard.writeText(staffSetupText(data.credentials)));
+    await loadStaffList();
+  } catch (err) { $('#staffFormError').textContent = err.message; }
+});
+
+$('#changePasswordForm')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const p1 = $('#newStaffPassword').value;
+  const p2 = $('#confirmStaffPassword').value;
+  $('#passwordChangeError').textContent = '';
+  if (p1 !== p2) { $('#passwordChangeError').textContent = 'Passwords do not match.'; return; }
+  try {
+    await api('/monitoring/api/change-password', {method:'POST',body:JSON.stringify({newPassword:p1})});
+    state.operator.mustChangePassword = false;
+    $('#newStaffPassword').value = '';
+    $('#confirmStaffPassword').value = '';
+    hidePasswordChange();
+  } catch (err) { $('#passwordChangeError').textContent = err.message; }
+});
 
 boot();
