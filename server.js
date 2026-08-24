@@ -3903,6 +3903,20 @@ async function requireMonitoringAdmin(req, res) {
   return operator;
 }
 
+function monitoringRoleRank(role) {
+  return ({ operator:1, supervisor:2, admin:3 })[normalizeMonitoringRole(role)] || 0;
+}
+
+async function requireMonitoringSupervisor(req, res) {
+  const operator = await requireMonitoringOperator(req, res);
+  if (!operator) return null;
+  if (monitoringRoleRank(operator.role) < monitoringRoleRank("supervisor")) {
+    res.status(403).json({ success:false, error:"Supervisor or Administrator access required" });
+    return null;
+  }
+  return operator;
+}
+
 function monitoringPriorityForResident(resident) {
   const action = cleanText(resident?.actionLevel).toLowerCase();
   const ai = cleanText(resident?.aiLevel).toLowerCase();
@@ -7185,6 +7199,29 @@ app.post("/monitoring/api/residents/:residentId/cases/accept", async (req, res) 
   } finally { client.release(); }
 });
 
+
+// Supervisors and administrators may take ownership of an active case when
+// operational coverage requires reassignment. Operators cannot take cases away
+// from another staff member. Every takeover is written to the incident timeline
+// and audit log.
+app.post("/monitoring/api/cases/:caseId/takeover", async (req, res) => {
+  try {
+    const operator = await requireMonitoringSupervisor(req, res); if (!operator) return;
+    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId",assigned_operator_name AS "assignedOperatorName" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
+    const incident = found.rows[0];
+    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
+    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"Only an active case can be reassigned" });
+    if (incident.assignedOperatorId && String(incident.assignedOperatorId) === String(operator.id)) return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
+    const priorName = incident.assignedOperatorName || 'Unassigned';
+    await pool.query(`UPDATE monitoring_cases SET assigned_operator_id=$2,assigned_operator_name=$3,status='accepted',accepted_at=COALESCE(accepted_at,NOW()),updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_reassigned','Case reassigned',$5)`, [randomUUID(),incident.id,operator.id,operator.displayName,`Supervisor takeover from ${priorName}`]);
+    await writeMonitoringAudit(operator, req, "case_reassigned", "case", incident.id, { priorOperatorName:priorName, assignedOperatorId:operator.id, assignedOperatorName:operator.displayName });
+    return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
+  } catch (error) {
+    console.error("Monitoring case takeover failed:", error);
+    return res.status(500).json({ success:false, error:"Failed to reassign case" });
+  }
+});
 
 app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
   try {

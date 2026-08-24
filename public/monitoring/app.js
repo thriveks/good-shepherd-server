@@ -49,6 +49,8 @@ function showApp(operator) {
   $('#loginView').classList.add('hidden');
   $('#appView').classList.remove('hidden');
   $('#operatorName').textContent = operator?.displayName || operator?.username || '';
+  const roleBadge = $('#operatorRole');
+  if (roleBadge) roleBadge.textContent = operator?.role ? ({admin:'Administrator',supervisor:'Supervisor',operator:'Operator'}[operator.role] || operator.role) : '';
   const staffBtn = $('#staffBtn');
   if (staffBtn) staffBtn.classList.toggle('hidden', operator?.role !== 'admin');
   if (operator?.mustChangePassword && !operator?.isBootstrap) showPasswordChange();
@@ -513,7 +515,7 @@ function renderResident(r) {
         <div class="action-group documentation-group"><div class="action-group-title">Documentation</div>
           <form id="caseNoteForm" class="follow-form"><textarea id="caseNote" placeholder="Add operator note to this case…" required></textarea><button class="ghost" type="submit">Add note</button></form>
           <form id="resolveForm" class="resolve-form"><textarea id="resolutionNote" placeholder="Resolution / closure evidence…" required></textarea><button class="primary resolve-btn" type="submit">Resolve Case</button></form>
-        </div>` : `<div class="notice">This case is being handled by ${escapeHtml(incident.assignedOperatorName || 'another operator')}.</div>`}
+        </div>` : `<div class="notice">This case is being handled by ${escapeHtml(incident.assignedOperatorName || 'another operator')}.${['supervisor','admin'].includes(state.operator?.role) ? ` <button id="takeoverCaseBtn" class="ghost inline-case-action" type="button">Take Over Case</button>` : ''}</div>`}
         <div id="caseNotice" class="notice"></div>
         <div class="case-timeline-title">Incident timeline</div>${caseTimeline(incident)}
       `}
@@ -545,6 +547,17 @@ function renderResident(r) {
 
   restoreResidentDrafts(r.residentId);
   requestAnimationFrame(() => { panel.scrollTop = priorScroll; });
+
+  const takeoverBtn = $('#takeoverCaseBtn');
+  if (takeoverBtn) takeoverBtn.addEventListener('click', async () => {
+    if (!window.confirm(`Take over this case from ${incident.assignedOperatorName || 'the current operator'}?`)) return;
+    takeoverBtn.disabled = true;
+    try {
+      await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/takeover`, { method:'POST', body:'{}' });
+      await refreshSelectedResident();
+      showCaseNotice('✓ Case reassigned to you.');
+    } catch (err) { showCaseNotice(err.message, 'error'); takeoverBtn.disabled=false; }
+  });
 
   const acceptBtn = $('#acceptCaseBtn');
   if (acceptBtn) acceptBtn.addEventListener('click', async () => {
