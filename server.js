@@ -3350,6 +3350,49 @@ async function loadCachedAIDashboardPayload() {
   return result.rows[0] || null;
 }
 
+// Monitoring Center must never recompute the full AI motion summary on every
+// page load or resident click. Serve the latest persisted AI dashboard snapshot
+// immediately and refresh it in the background when it is stale.
+let monitoringSummaryMemoryCache = null;
+let monitoringSummaryMemoryLoadedAt = 0;
+const MONITORING_SUMMARY_MEMORY_TTL_MS = 5000;
+
+async function loadMonitoringSummaryFast() {
+  const now = Date.now();
+  if (monitoringSummaryMemoryCache && (now - monitoringSummaryMemoryLoadedAt) < MONITORING_SUMMARY_MEMORY_TTL_MS) {
+    return monitoringSummaryMemoryCache;
+  }
+
+  let cached = null;
+  try {
+    cached = await loadCachedAIDashboardPayload();
+  } catch (error) {
+    console.error("Monitoring Center AI cache read failed:", error);
+  }
+
+  if (cached?.payload?.summary) {
+    const generatedAt = new Date(cached.generatedAt);
+    const ageSeconds = Number.isNaN(generatedAt.getTime())
+      ? AI_DASHBOARD_CACHE_MAX_AGE_SECONDS + 1
+      : Math.max(0, Math.floor((now - generatedAt.getTime()) / 1000));
+
+    monitoringSummaryMemoryCache = cached.payload.summary;
+    monitoringSummaryMemoryLoadedAt = now;
+
+    if (ageSeconds > AI_DASHBOARD_CACHE_MAX_AGE_SECONDS) {
+      refreshAIDashboardPayloadSingleFlight().catch(() => {});
+    }
+
+    return monitoringSummaryMemoryCache;
+  }
+
+  // Only the cold-start/no-cache path performs the expensive rebuild.
+  const payload = await refreshAIDashboardPayloadSingleFlight();
+  monitoringSummaryMemoryCache = payload.summary;
+  monitoringSummaryMemoryLoadedAt = Date.now();
+  return monitoringSummaryMemoryCache;
+}
+
 async function buildAIDashboardPayload() {
   const summary = await buildAIMotionSummary();
   const briefing = buildAIBriefingFromSummary(summary);
@@ -6555,7 +6598,7 @@ app.get("/monitoring/api/me", async (req, res) => {
 app.get("/monitoring/api/dashboard", async (req, res) => {
   try {
     const operator = await requireMonitoringOperator(req, res); if (!operator) return;
-    const summary = await buildAIMotionSummary();
+    const summary = await loadMonitoringSummaryFast();
     const residents = (summary.residents || []).map(monitoringResidentPayload);
     const order = { P1:1, P2:2, P3:3, P4:4, P5:5 };
     residents.sort((a,b) => (order[a.priority]-order[b.priority]) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
@@ -6570,7 +6613,7 @@ app.get("/monitoring/api/dashboard", async (req, res) => {
 app.get("/monitoring/api/residents/:residentId", async (req, res) => {
   try {
     const operator = await requireMonitoringOperator(req, res); if (!operator) return;
-    const summary = await buildAIMotionSummary();
+    const summary = await loadMonitoringSummaryFast();
     const resident = (summary.residents || []).find(row => String(row.residentId) === String(req.params.residentId));
     if (!resident) return res.status(404).json({ success:false, error:"Resident not found" });
     await writeMonitoringAudit(operator, req, "resident_viewed", "resident", resident.residentId, { priority: monitoringPriorityForResident(resident) });
@@ -6584,7 +6627,7 @@ app.get("/monitoring/api/residents/:residentId", async (req, res) => {
 app.post("/monitoring/api/residents/:residentId/follow-up", async (req, res) => {
   try {
     const operator = await requireMonitoringOperator(req, res); if (!operator) return;
-    const summary = await buildAIMotionSummary();
+    const summary = await loadMonitoringSummaryFast();
     const resident = (summary.residents || []).find(row => String(row.residentId) === String(req.params.residentId));
     if (!resident) return res.status(404).json({ success:false, error:"Resident not found" });
     const note = cleanText(req.body?.note);
