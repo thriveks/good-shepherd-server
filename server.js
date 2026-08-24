@@ -11,10 +11,11 @@
 
 const express = require("express");
 const { Pool } = require("pg");
-const { randomUUID, randomBytes, randomInt, createHash, pbkdf2Sync, timingSafeEqual, createHmac, createCipheriv, createDecipheriv } = require("crypto");
+const { randomUUID, randomBytes, randomInt, createHash, pbkdf2Sync, timingSafeEqual, createHmac, createCipheriv, createDecipheriv, createSign } = require("crypto");
 const path = require("path");
 const https = require("https");
 const http = require("http");
+const http2 = require("http2");
 const mqtt = require("mqtt");
 
 const app = express();
@@ -490,6 +491,45 @@ async function initializeDatabase() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_case_events_case_idx ON monitoring_case_events (case_id, created_at ASC)`);
+
+  // Monitoring Center v3: resident communications and APNs device registration.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_push_devices (
+      id UUID PRIMARY KEY,
+      resident_id UUID NOT NULL REFERENCES residents(id) ON DELETE CASCADE,
+      device_token TEXT NOT NULL,
+      platform TEXT NOT NULL DEFAULT 'ios',
+      app_build TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS customer_push_devices_token_unique_idx ON customer_push_devices (device_token)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS customer_push_devices_resident_idx ON customer_push_devices (resident_id, is_active)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS resident_checkins (
+      id UUID PRIMARY KEY,
+      resident_id UUID NOT NULL REFERENCES residents(id) ON DELETE CASCADE,
+      case_id UUID REFERENCES monitoring_cases(id) ON DELETE SET NULL,
+      created_by_operator_id UUID REFERENCES monitoring_operators(id) ON DELETE SET NULL,
+      created_by_operator_name TEXT,
+      message TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      delivery_channel TEXT NOT NULL DEFAULT 'in_app',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      sent_at TIMESTAMPTZ,
+      responded_at TIMESTAMPTZ,
+      response_code TEXT,
+      response_note TEXT,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '2 hours')
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS resident_checkins_resident_idx ON resident_checkins (resident_id, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS resident_checkins_case_idx ON resident_checkins (case_id, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS resident_checkins_pending_idx ON resident_checkins (resident_id, expires_at) WHERE responded_at IS NULL`);
 
   await ensureMonitoringBootstrapOperator();
 
@@ -3496,6 +3536,104 @@ async function incrementResidentDailyActivity({ resident, event, sensor }) {
   );
 }
 
+
+
+// ---------------- Resident Check-In / APNs ----------------
+let apnsJwtCache = { token: null, createdAt: 0 };
+
+function apnsConfiguration() {
+  const keyId = cleanText(process.env.APNS_KEY_ID);
+  const teamId = cleanText(process.env.APNS_TEAM_ID);
+  const bundleId = cleanText(process.env.APNS_BUNDLE_ID);
+  const privateKeyRaw = String(process.env.APNS_PRIVATE_KEY || "").trim();
+  const environment = String(process.env.APNS_ENVIRONMENT || "production").toLowerCase();
+  return {
+    configured: Boolean(keyId && teamId && bundleId && privateKeyRaw),
+    keyId,
+    teamId,
+    bundleId,
+    privateKey: privateKeyRaw.replace(/\\n/g, "\n"),
+    host: environment === "sandbox" ? "https://api.sandbox.push.apple.com" : "https://api.push.apple.com"
+  };
+}
+
+function base64UrlJson(value) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function apnsProviderToken() {
+  const cfg = apnsConfiguration();
+  if (!cfg.configured) return null;
+  const now = Math.floor(Date.now() / 1000);
+  if (apnsJwtCache.token && (now - apnsJwtCache.createdAt) < 50 * 60) return apnsJwtCache.token;
+  const header = base64UrlJson({ alg: "ES256", kid: cfg.keyId });
+  const claims = base64UrlJson({ iss: cfg.teamId, iat: now });
+  const unsigned = `${header}.${claims}`;
+  const signer = createSign("SHA256");
+  signer.update(unsigned);
+  signer.end();
+  const signature = signer.sign({ key: cfg.privateKey, dsaEncoding: "ieee-p1363" }).toString("base64url");
+  apnsJwtCache = { token: `${unsigned}.${signature}`, createdAt: now };
+  return apnsJwtCache.token;
+}
+
+async function sendApnsNotification(deviceToken, payload) {
+  const cfg = apnsConfiguration();
+  if (!cfg.configured) return { delivered: false, reason: "apns_not_configured" };
+  const providerToken = apnsProviderToken();
+  return new Promise((resolve) => {
+    const client = http2.connect(cfg.host);
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      try { client.close(); } catch (_) {}
+      resolve(result);
+    };
+    client.on("error", (error) => finish({ delivered:false, reason:error.message || "apns_connection_error" }));
+    const request = client.request({
+      ":method": "POST",
+      ":path": `/3/device/${encodeURIComponent(deviceToken)}`,
+      "authorization": `bearer ${providerToken}`,
+      "apns-topic": cfg.bundleId,
+      "apns-push-type": "alert",
+      "apns-priority": "10",
+      "content-type": "application/json"
+    });
+    let status = 0;
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("response", (headers) => { status = Number(headers[":status"] || 0); });
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      if (status === 200) return finish({ delivered:true, status });
+      let reason = `apns_http_${status}`;
+      try { reason = JSON.parse(body)?.reason || reason; } catch (_) {}
+      finish({ delivered:false, status, reason });
+    });
+    request.on("error", (error) => finish({ delivered:false, reason:error.message || "apns_request_error" }));
+    request.setTimeout(8000, () => { try { request.close(); } catch (_) {}; finish({ delivered:false, reason:"apns_timeout" }); });
+    request.end(JSON.stringify(payload));
+  });
+}
+
+function customerCheckInPayload(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    residentId: row.residentId,
+    caseId: row.caseId,
+    message: row.message,
+    status: row.status,
+    deliveryChannel: row.deliveryChannel,
+    createdAt: row.createdAt,
+    sentAt: row.sentAt,
+    respondedAt: row.respondedAt,
+    responseCode: row.responseCode,
+    responseNote: row.responseNote,
+    expiresAt: row.expiresAt
+  };
+}
 
 const MONITORING_SESSION_HOURS = 12;
 const MONITORING_LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -6584,6 +6722,74 @@ app.get("/presence-telemetry/latest", async (req, res) => {
 });
 
 
+
+// Customer communications endpoints. The resident session is authoritative for ownership.
+app.post("/customer/push/register", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res); if (!session) return;
+    const deviceToken = cleanText(req.body?.deviceToken).replace(/[^A-Fa-f0-9]/g, "").toLowerCase();
+    if (!deviceToken || deviceToken.length < 32) return res.status(400).json({ success:false, error:"A valid iOS push token is required" });
+    const appBuild = cleanText(req.body?.appBuild);
+    await pool.query(`
+      INSERT INTO customer_push_devices (id,resident_id,device_token,platform,app_build,is_active,last_seen_at,updated_at)
+      VALUES ($1,$2,$3,'ios',$4,TRUE,NOW(),NOW())
+      ON CONFLICT (device_token) DO UPDATE SET resident_id=EXCLUDED.resident_id,app_build=EXCLUDED.app_build,is_active=TRUE,last_seen_at=NOW(),updated_at=NOW()
+    `, [randomUUID(), session.residentId, deviceToken, appBuild || null]);
+    return res.json({ success:true, apnsConfigured:apnsConfiguration().configured });
+  } catch (error) {
+    console.error("Customer push registration failed:", error);
+    return res.status(500).json({ success:false, error:"Push registration failed" });
+  }
+});
+
+app.get("/customer/check-ins", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res); if (!session) return;
+    await pool.query(`UPDATE resident_checkins SET status='expired' WHERE resident_id=$1 AND responded_at IS NULL AND expires_at <= NOW() AND status <> 'expired'`, [session.residentId]);
+    const result = await pool.query(`
+      SELECT id,resident_id AS "residentId",case_id AS "caseId",message,status,delivery_channel AS "deliveryChannel",
+             created_at AS "createdAt",sent_at AS "sentAt",responded_at AS "respondedAt",response_code AS "responseCode",
+             response_note AS "responseNote",expires_at AS "expiresAt"
+      FROM resident_checkins
+      WHERE resident_id=$1 AND responded_at IS NULL AND expires_at > NOW() AND status IN ('pending','sent')
+      ORDER BY created_at DESC LIMIT 5
+    `, [session.residentId]);
+    return res.json({ success:true, checkIns:result.rows.map(customerCheckInPayload) });
+  } catch (error) {
+    console.error("Customer check-ins failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to load check-ins" });
+  }
+});
+
+app.post("/customer/check-ins/:checkInId/respond", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res); if (!session) return;
+    const responseCode = cleanText(req.body?.response);
+    const allowed = new Map([["safe","Resident confirmed safe"],["call_me","Resident requested a call"],["need_help","Resident requested help"]]);
+    if (!allowed.has(responseCode)) return res.status(400).json({ success:false, error:"Unsupported check-in response" });
+    const note = cleanText(req.body?.note);
+    const result = await pool.query(`
+      UPDATE resident_checkins SET status='responded',responded_at=NOW(),response_code=$3,response_note=$4
+      WHERE id=$1 AND resident_id=$2 AND responded_at IS NULL AND expires_at > NOW()
+      RETURNING id,resident_id AS "residentId",case_id AS "caseId",message,status,delivery_channel AS "deliveryChannel",
+                created_at AS "createdAt",sent_at AS "sentAt",responded_at AS "respondedAt",response_code AS "responseCode",
+                response_note AS "responseNote",expires_at AS "expiresAt"
+    `, [req.params.checkInId, session.residentId, responseCode, note || null]);
+    const checkIn = result.rows[0];
+    if (!checkIn) return res.status(404).json({ success:false, error:"This check-in is no longer active" });
+    if (checkIn.caseId) {
+      await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,NULL,$3,'check_in_response',$4,$5,$6::jsonb)`, [
+        randomUUID(), checkIn.caseId, session.residentName, allowed.get(responseCode), note || null, JSON.stringify({ checkInId:checkIn.id, responseCode })
+      ]);
+      await pool.query(`UPDATE monitoring_cases SET updated_at=NOW() WHERE id=$1`, [checkIn.caseId]);
+    }
+    return res.json({ success:true, checkIn:customerCheckInPayload(checkIn) });
+  } catch (error) {
+    console.error("Customer check-in response failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to record check-in response" });
+  }
+});
+
 // ---------------- Monitoring Center API ----------------
 app.post("/monitoring/api/login", async (req, res) => {
   try {
@@ -6744,6 +6950,48 @@ app.post("/monitoring/api/residents/:residentId/cases/accept", async (req, res) 
     console.error("Monitoring case accept failed:", error);
     return res.status(500).json({ success:false, error:"Failed to accept case" });
   } finally { client.release(); }
+});
+
+
+app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const found = await pool.query(`SELECT id,resident_id AS "residentId",resident_name AS "residentName",status,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
+    const incident = found.rows[0];
+    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
+    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
+    if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Accept this case before sending a check-in" });
+    const message = cleanText(req.body?.message) || "Good Shepherd is checking in. Are you okay?";
+    const checkInId = randomUUID();
+    await pool.query(`INSERT INTO resident_checkins (id,resident_id,case_id,created_by_operator_id,created_by_operator_name,message,status,delivery_channel) VALUES ($1,$2,$3,$4,$5,$6,'pending','in_app')`, [checkInId,incident.residentId,incident.id,operator.id,operator.displayName,message]);
+
+    const devices = await pool.query(`SELECT device_token AS "deviceToken" FROM customer_push_devices WHERE resident_id=$1 AND is_active=TRUE ORDER BY last_seen_at DESC LIMIT 10`, [incident.residentId]);
+    let pushDelivered = false;
+    const deliveryResults = [];
+    if (devices.rows.length && apnsConfiguration().configured) {
+      const payload = {
+        aps: { alert: { title:"Good Shepherd Check-In", body:message }, sound:"default", category:"GOOD_SHEPHERD_CHECKIN" },
+        checkInId,
+        residentId:incident.residentId,
+        type:"resident_check_in"
+      };
+      const results = await Promise.all(devices.rows.map(async ({deviceToken}) => ({ deviceToken, result:await sendApnsNotification(deviceToken,payload) })));
+      pushDelivered = results.some(({result}) => result.delivered);
+      deliveryResults.push(...results.map(({result}) => ({ delivered:result.delivered, status:result.status || null, reason:result.reason || null })));
+    }
+    const deliveryChannel = pushDelivered ? 'apns+in_app' : 'in_app';
+    const status = pushDelivered ? 'sent' : 'pending';
+    await pool.query(`UPDATE resident_checkins SET status=$2,delivery_channel=$3,sent_at=CASE WHEN $2='sent' THEN NOW() ELSE sent_at END WHERE id=$1`, [checkInId,status,deliveryChannel]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'check_in_sent','Check-in sent',$5,$6::jsonb)`, [
+      randomUUID(),incident.id,operator.id,operator.displayName,pushDelivered ? 'Push notification and in-app check-in created.' : 'In-app check-in created; push delivery is not currently available.', JSON.stringify({checkInId,deliveryChannel,pushDelivered,deviceCount:devices.rows.length,deliveryResults})
+    ]);
+    await pool.query(`UPDATE monitoring_cases SET updated_at=NOW() WHERE id=$1`, [incident.id]);
+    await writeMonitoringAudit(operator, req, "check_in_sent", "case", incident.id, { checkInId, residentId:incident.residentId, deliveryChannel, pushDelivered, deviceCount:devices.rows.length });
+    return res.status(201).json({ success:true, checkIn:{ id:checkInId, residentId:incident.residentId, caseId:incident.id, message, status, deliveryChannel, pushDelivered } });
+  } catch (error) {
+    console.error("Monitoring check-in send failed:", error);
+    return res.status(500).json({ success:false, error:"Failed to send resident check-in" });
+  }
 });
 
 app.post("/monitoring/api/cases/:caseId/actions", async (req, res) => {

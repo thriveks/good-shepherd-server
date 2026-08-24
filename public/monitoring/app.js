@@ -425,12 +425,18 @@ function renderResident(r) {
     const success = btn.dataset.success || 'Action recorded';
     try {
       rememberPanelScroll();
-      await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify({ action, note:'' }) });
+      if (action === 'check_in_sent') {
+        const result = await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/check-ins`, { method:'POST', body:JSON.stringify({}) });
+        const delivery = result.checkIn?.pushDelivered ? 'Push + in-app check-in sent' : 'In-app check-in created';
+        showCaseNotice(`✓ ${delivery}`);
+      } else {
+        await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify({ action, note:'' }) });
+      }
       const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
       state.selectedResident = data.resident;
       renderResident(data.resident);
       restorePanelScroll();
-      showCaseNotice(`✓ ${success}`);
+      if (action !== 'check_in_sent') showCaseNotice(`✓ ${success}`);
       loadDashboard().catch(() => {});
     } catch (err) { showCaseNotice(err.message, 'error'); btn.disabled=false; }
   }));
