@@ -362,7 +362,7 @@ function renderResident(r) {
         ${mine ? `<div class="action-groups">
           <div class="action-group"><div class="action-group-title">Contact</div><div class="action-grid compact-actions">
             <button type="button" data-case-action="resident_call" data-success="Resident call attempt recorded">Resident call attempt</button>
-            <button type="button" data-case-action="check_in_sent" data-success="Check-in recorded">Check-in sent</button>
+            <button type="button" data-case-action="check_in_sent" data-success="Check-in sent">Send Check-In</button>
             <button type="button" data-case-action="contact_1_call" data-success="Contact #1 call attempt recorded">Contact #1 call attempt</button>
             <button type="button" data-case-action="contact_2_call" data-success="Contact #2 call attempt recorded">Contact #2 call attempt</button>
           </div></div>
@@ -427,8 +427,12 @@ function renderResident(r) {
       rememberPanelScroll();
       if (action === 'check_in_sent') {
         const result = await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/check-ins`, { method:'POST', body:JSON.stringify({}) });
-        const delivery = result.checkIn?.pushDelivered ? 'Push + in-app check-in sent' : 'In-app check-in created';
-        showCaseNotice(`✓ ${delivery}`);
+        const pushDelivered = Boolean(result.checkIn?.pushDelivered);
+        if (pushDelivered) {
+          showCaseNotice('✓ Push notification + in-app check-in sent.');
+        } else {
+          showCaseNotice('⚠ In-app check-in created, but APNs push was not delivered.', 'error');
+        }
       } else {
         await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify({ action, note:'' }) });
       }
