@@ -506,7 +506,11 @@ async function initializeDatabase() {
       last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS customer_push_devices_token_unique_idx ON customer_push_devices (device_token)`);
+  // APNs tokens are environment-scoped. Debug/Xcode builds register sandbox tokens;
+  // TestFlight/App Store builds register production tokens. Keep both safely.
+  await pool.query(`ALTER TABLE customer_push_devices ADD COLUMN IF NOT EXISTS apns_environment TEXT NOT NULL DEFAULT 'production'`);
+  await pool.query(`DROP INDEX IF EXISTS customer_push_devices_token_unique_idx`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS customer_push_devices_token_environment_unique_idx ON customer_push_devices (device_token, apns_environment)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS customer_push_devices_resident_idx ON customer_push_devices (resident_id, is_active)`);
 
   await pool.query(`
@@ -3541,20 +3545,30 @@ async function incrementResidentDailyActivity({ resident, event, sensor }) {
 // ---------------- Resident Check-In / APNs ----------------
 let apnsJwtCache = { token: null, createdAt: 0 };
 
+function normalizeApnsEnvironment(value, fallback = "production") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "sandbox" || normalized === "production") return normalized;
+  return fallback;
+}
+
 function apnsConfiguration() {
   const keyId = cleanText(process.env.APNS_KEY_ID);
   const teamId = cleanText(process.env.APNS_TEAM_ID);
   const bundleId = cleanText(process.env.APNS_BUNDLE_ID);
   const privateKeyRaw = String(process.env.APNS_PRIVATE_KEY || "").trim();
-  const environment = String(process.env.APNS_ENVIRONMENT || "production").toLowerCase();
   return {
     configured: Boolean(keyId && teamId && bundleId && privateKeyRaw),
     keyId,
     teamId,
     bundleId,
-    privateKey: privateKeyRaw.replace(/\\n/g, "\n"),
-    host: environment === "sandbox" ? "https://api.sandbox.push.apple.com" : "https://api.push.apple.com"
+    privateKey: privateKeyRaw.replace(/\\n/g, "\n")
   };
+}
+
+function apnsHostForEnvironment(environment) {
+  return normalizeApnsEnvironment(environment) === "sandbox"
+    ? "https://api.sandbox.push.apple.com"
+    : "https://api.push.apple.com";
 }
 
 function base64UrlJson(value) {
@@ -3577,12 +3591,13 @@ function apnsProviderToken() {
   return apnsJwtCache.token;
 }
 
-async function sendApnsNotification(deviceToken, payload) {
+async function sendApnsNotification(deviceToken, payload, environment = "production") {
   const cfg = apnsConfiguration();
-  if (!cfg.configured) return { delivered: false, reason: "apns_not_configured" };
+  if (!cfg.configured) return { delivered: false, reason: "apns_not_configured", environment: normalizeApnsEnvironment(environment) };
   const providerToken = apnsProviderToken();
+  const apnsEnvironment = normalizeApnsEnvironment(environment);
   return new Promise((resolve) => {
-    const client = http2.connect(cfg.host);
+    const client = http2.connect(apnsHostForEnvironment(apnsEnvironment));
     let settled = false;
     const finish = (result) => {
       if (settled) return;
@@ -3590,7 +3605,7 @@ async function sendApnsNotification(deviceToken, payload) {
       try { client.close(); } catch (_) {}
       resolve(result);
     };
-    client.on("error", (error) => finish({ delivered:false, reason:error.message || "apns_connection_error" }));
+    client.on("error", (error) => finish({ delivered:false, reason:error.message || "apns_connection_error", environment:apnsEnvironment }));
     const request = client.request({
       ":method": "POST",
       ":path": `/3/device/${encodeURIComponent(deviceToken)}`,
@@ -3606,13 +3621,13 @@ async function sendApnsNotification(deviceToken, payload) {
     request.on("response", (headers) => { status = Number(headers[":status"] || 0); });
     request.on("data", (chunk) => { body += chunk; });
     request.on("end", () => {
-      if (status === 200) return finish({ delivered:true, status });
+      if (status === 200) return finish({ delivered:true, status, environment:apnsEnvironment });
       let reason = `apns_http_${status}`;
       try { reason = JSON.parse(body)?.reason || reason; } catch (_) {}
-      finish({ delivered:false, status, reason });
+      finish({ delivered:false, status, reason, environment:apnsEnvironment });
     });
-    request.on("error", (error) => finish({ delivered:false, reason:error.message || "apns_request_error" }));
-    request.setTimeout(8000, () => { try { request.close(); } catch (_) {}; finish({ delivered:false, reason:"apns_timeout" }); });
+    request.on("error", (error) => finish({ delivered:false, reason:error.message || "apns_request_error", environment:apnsEnvironment }));
+    request.setTimeout(8000, () => { try { request.close(); } catch (_) {}; finish({ delivered:false, reason:"apns_timeout", environment:apnsEnvironment }); });
     request.end(JSON.stringify(payload));
   });
 }
@@ -6730,12 +6745,16 @@ app.post("/customer/push/register", async (req, res) => {
     const deviceToken = cleanText(req.body?.deviceToken).replace(/[^A-Fa-f0-9]/g, "").toLowerCase();
     if (!deviceToken || deviceToken.length < 32) return res.status(400).json({ success:false, error:"A valid iOS push token is required" });
     const appBuild = cleanText(req.body?.appBuild);
+    // iOS explicitly reports sandbox for Debug/Xcode builds and production for
+    // Release/TestFlight/App Store builds. This prevents BadDeviceToken errors
+    // caused by sending a valid token to the wrong APNs endpoint.
+    const apnsEnvironment = normalizeApnsEnvironment(req.body?.apnsEnvironment);
     await pool.query(`
-      INSERT INTO customer_push_devices (id,resident_id,device_token,platform,app_build,is_active,last_seen_at,updated_at)
-      VALUES ($1,$2,$3,'ios',$4,TRUE,NOW(),NOW())
-      ON CONFLICT (device_token) DO UPDATE SET resident_id=EXCLUDED.resident_id,app_build=EXCLUDED.app_build,is_active=TRUE,last_seen_at=NOW(),updated_at=NOW()
-    `, [randomUUID(), session.residentId, deviceToken, appBuild || null]);
-    return res.json({ success:true, apnsConfigured:apnsConfiguration().configured });
+      INSERT INTO customer_push_devices (id,resident_id,device_token,platform,app_build,apns_environment,is_active,last_seen_at,updated_at)
+      VALUES ($1,$2,$3,'ios',$4,$5,TRUE,NOW(),NOW())
+      ON CONFLICT (device_token,apns_environment) DO UPDATE SET resident_id=EXCLUDED.resident_id,app_build=EXCLUDED.app_build,is_active=TRUE,last_seen_at=NOW(),updated_at=NOW()
+    `, [randomUUID(), session.residentId, deviceToken, appBuild || null, apnsEnvironment]);
+    return res.json({ success:true, apnsConfigured:apnsConfiguration().configured, apnsEnvironment });
   } catch (error) {
     console.error("Customer push registration failed:", error);
     return res.status(500).json({ success:false, error:"Push registration failed" });
@@ -6965,7 +6984,7 @@ app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
     const checkInId = randomUUID();
     await pool.query(`INSERT INTO resident_checkins (id,resident_id,case_id,created_by_operator_id,created_by_operator_name,message,status,delivery_channel) VALUES ($1,$2,$3,$4,$5,$6,'pending','in_app')`, [checkInId,incident.residentId,incident.id,operator.id,operator.displayName,message]);
 
-    const devices = await pool.query(`SELECT device_token AS "deviceToken" FROM customer_push_devices WHERE resident_id=$1 AND is_active=TRUE ORDER BY last_seen_at DESC LIMIT 10`, [incident.residentId]);
+    const devices = await pool.query(`SELECT device_token AS "deviceToken",apns_environment AS "apnsEnvironment" FROM customer_push_devices WHERE resident_id=$1 AND is_active=TRUE ORDER BY last_seen_at DESC LIMIT 10`, [incident.residentId]);
     let pushDelivered = false;
     const deliveryResults = [];
     if (devices.rows.length && apnsConfiguration().configured) {
@@ -6975,9 +6994,25 @@ app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
         residentId:incident.residentId,
         type:"resident_check_in"
       };
-      const results = await Promise.all(devices.rows.map(async ({deviceToken}) => ({ deviceToken, result:await sendApnsNotification(deviceToken,payload) })));
+      const results = await Promise.all(devices.rows.map(async ({deviceToken,apnsEnvironment}) => ({
+        deviceToken,
+        apnsEnvironment: normalizeApnsEnvironment(apnsEnvironment),
+        result: await sendApnsNotification(deviceToken,payload,apnsEnvironment)
+      })));
       pushDelivered = results.some(({result}) => result.delivered);
-      deliveryResults.push(...results.map(({result}) => ({ delivered:result.delivered, status:result.status || null, reason:result.reason || null })));
+      deliveryResults.push(...results.map(({apnsEnvironment,result}) => ({
+        delivered:result.delivered,
+        status:result.status || null,
+        reason:result.reason || null,
+        environment:apnsEnvironment
+      })));
+
+      // Apple explicitly tells us when a token has expired. Disable only those
+      // tokens; transport/configuration failures remain active for retry.
+      const expiredTokens = results.filter(({result}) => result.reason === "Unregistered").map(({deviceToken,apnsEnvironment}) => [deviceToken,apnsEnvironment]);
+      for (const [expiredToken, expiredEnvironment] of expiredTokens) {
+        await pool.query(`UPDATE customer_push_devices SET is_active=FALSE,updated_at=NOW() WHERE device_token=$1 AND apns_environment=$2`, [expiredToken,expiredEnvironment]);
+      }
     }
     const deliveryChannel = pushDelivered ? 'apns+in_app' : 'in_app';
     const status = pushDelivered ? 'sent' : 'pending';
