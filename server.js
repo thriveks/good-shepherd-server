@@ -17,6 +17,8 @@ const https = require("https");
 const http = require("http");
 const http2 = require("http2");
 const mqtt = require("mqtt");
+const QRCode = require("./lib/qrcode");
+const QRErrorCorrectLevel = require("./lib/qrcode/QRErrorCorrectLevel");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -423,7 +425,13 @@ async function initializeDatabase() {
   `);
   await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS is_bootstrap BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS is_enrolled BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS activation_token_hash TEXT`);
+  await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS activation_expires_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS activation_created_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE monitoring_operators ADD COLUMN IF NOT EXISTS activation_used_at TIMESTAMPTZ`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS monitoring_operators_username_unique_idx ON monitoring_operators (LOWER(username))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitoring_operators_activation_token_idx ON monitoring_operators (activation_token_hash) WHERE activation_token_hash IS NOT NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS monitoring_sessions (
@@ -3735,6 +3743,66 @@ function monitoringOtpAuthUri(username, totpSecret) {
   return `otpauth://totp/${encodeURIComponent(label)}?secret=${encodeURIComponent(totpSecret)}&issuer=${encodeURIComponent(issuer)}&digits=6&period=30`;
 }
 
+const MONITORING_ACTIVATION_HOURS = 24;
+
+function monitoringActivationTokenHash(token) {
+  return createHash("sha256").update(String(token || "")).digest("hex");
+}
+
+function monitoringActivationUrl(req, token) {
+  const forwardedProto = cleanText(req.header("x-forwarded-proto")).split(",")[0].trim();
+  const protocol = forwardedProto || req.protocol || "https";
+  const host = cleanText(req.header("host"));
+  if (!host) return `/monitoring/?activate=${encodeURIComponent(token)}`;
+  return `${protocol}://${host}/monitoring/?activate=${encodeURIComponent(token)}`;
+}
+
+function monitoringQrSvg(text) {
+  const qr = new QRCode(0, QRErrorCorrectLevel.M);
+  qr.addData(String(text || ""));
+  qr.make();
+  const count = qr.getModuleCount();
+  const margin = 4;
+  const size = count + margin * 2;
+  let pathData = "";
+  for (let row = 0; row < count; row += 1) {
+    for (let col = 0; col < count; col += 1) {
+      if (qr.isDark(row, col)) pathData += `M${col + margin} ${row + margin}h1v1h-1z`;
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="white"/><path d="${pathData}" fill="black"/></svg>`;
+}
+
+async function monitoringActivationRecord(token) {
+  const tokenHash = monitoringActivationTokenHash(token);
+  const result = await pool.query(`
+    SELECT id, username, display_name AS "displayName", role, is_active AS "isActive",
+           COALESCE(is_bootstrap,FALSE) AS "isBootstrap", COALESCE(is_enrolled,TRUE) AS "isEnrolled",
+           totp_secret_encrypted AS "totpSecretEncrypted", activation_expires_at AS "activationExpiresAt"
+    FROM monitoring_operators
+    WHERE activation_token_hash=$1 AND activation_expires_at>NOW() AND is_active=TRUE AND COALESCE(is_enrolled,TRUE)=FALSE
+    LIMIT 1
+  `, [tokenHash]);
+  return result.rows[0] || null;
+}
+
+async function issueMonitoringActivation(operatorId, req) {
+  const token = randomBytes(32).toString("base64url");
+  const tokenHash = monitoringActivationTokenHash(token);
+  const totpSecret = encodeBase32(randomBytes(20));
+  const placeholderPassword = randomBytes(48).toString("base64url");
+  const expiresAt = new Date(Date.now() + MONITORING_ACTIVATION_HOURS * 60 * 60 * 1000);
+  await pool.query(`
+    UPDATE monitoring_operators
+    SET password_hash=$2, totp_secret_encrypted=$3, is_enrolled=FALSE, must_change_password=FALSE,
+        activation_token_hash=$4, activation_expires_at=$5, activation_created_at=NOW(), activation_used_at=NULL,
+        is_active=TRUE, updated_at=NOW()
+    WHERE id=$1
+  `, [operatorId, passwordHash(placeholderPassword), encryptMonitoringSecret(totpSecret), tokenHash, expiresAt]);
+  await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [operatorId]);
+  return { token, activationUrl: monitoringActivationUrl(req, token), expiresAt };
+}
+
 function normalizeMonitoringRole(role) {
   const value = cleanText(role).toLowerCase();
   return ["admin", "supervisor", "operator"].includes(value) ? value : null;
@@ -3786,8 +3854,8 @@ async function ensureMonitoringBootstrapOperator() {
   if (existing.rowCount === 0) {
     const id = randomUUID();
     await pool.query(`
-      INSERT INTO monitoring_operators (id, username, display_name, role, password_hash, totp_secret_encrypted, is_active, is_bootstrap)
-      VALUES ($1, $2, $3, 'admin', $4, $5, TRUE, TRUE)
+      INSERT INTO monitoring_operators (id, username, display_name, role, password_hash, totp_secret_encrypted, is_active, is_bootstrap, is_enrolled)
+      VALUES ($1, $2, $3, 'admin', $4, $5, TRUE, TRUE, TRUE)
     `, [id, username, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
     console.log(`Monitoring Center bootstrap admin created: ${username}`);
     return;
@@ -3811,6 +3879,9 @@ async function ensureMonitoringBootstrapOperator() {
         totp_secret_encrypted=$4,
         is_active=TRUE,
         is_bootstrap=TRUE,
+        is_enrolled=TRUE,
+        activation_token_hash=NULL,
+        activation_expires_at=NULL,
         updated_at=NOW()
     WHERE id=$1
   `, [operator.id, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
@@ -3873,10 +3944,11 @@ async function authenticatedMonitoringOperator(req) {
     SELECT o.id, o.username, o.display_name AS "displayName", o.role,
            COALESCE(o.is_bootstrap,FALSE) AS "isBootstrap",
            COALESCE(o.must_change_password,FALSE) AS "mustChangePassword",
+           COALESCE(o.is_enrolled,TRUE) AS "isEnrolled",
            s.expires_at AS "expiresAt"
     FROM monitoring_sessions s
     JOIN monitoring_operators o ON o.id=s.operator_id
-    WHERE s.token_hash=$1 AND s.expires_at>NOW() AND o.is_active=TRUE
+    WHERE s.token_hash=$1 AND s.expires_at>NOW() AND o.is_active=TRUE AND COALESCE(o.is_enrolled,TRUE)=TRUE
     LIMIT 1
   `, [tokenHash]);
   const operator = result.rows[0] || null;
@@ -6873,9 +6945,9 @@ app.post("/monitoring/api/login", async (req, res) => {
     const username = cleanText(req.body?.username);
     const password = String(req.body?.password || "");
     const code = String(req.body?.code || "");
-    const result = await pool.query(`SELECT id, username, display_name AS "displayName", role, password_hash AS "passwordHash", totp_secret_encrypted AS "totpSecretEncrypted", COALESCE(is_bootstrap,FALSE) AS "isBootstrap", COALESCE(must_change_password,FALSE) AS "mustChangePassword" FROM monitoring_operators WHERE LOWER(username)=LOWER($1) AND is_active=TRUE LIMIT 1`, [username]);
+    const result = await pool.query(`SELECT id, username, display_name AS "displayName", role, password_hash AS "passwordHash", totp_secret_encrypted AS "totpSecretEncrypted", COALESCE(is_bootstrap,FALSE) AS "isBootstrap", COALESCE(must_change_password,FALSE) AS "mustChangePassword", COALESCE(is_enrolled,TRUE) AS "isEnrolled" FROM monitoring_operators WHERE LOWER(username)=LOWER($1) AND is_active=TRUE LIMIT 1`, [username]);
     const operator = result.rows[0];
-    let valid = Boolean(operator) && passwordMatches(password, operator.passwordHash);
+    let valid = Boolean(operator) && operator.isEnrolled !== false && passwordMatches(password, operator.passwordHash);
     if (valid) {
       try { valid = verifyMonitoringTotp(decryptMonitoringSecret(operator.totpSecretEncrypted), code); }
       catch (_) { valid = false; }
@@ -6892,7 +6964,7 @@ app.post("/monitoring/api/login", async (req, res) => {
     await pool.query(`UPDATE monitoring_operators SET last_login_at=NOW() WHERE id=$1`, [operator.id]);
     res.cookie("gs_monitor_session", token, { httpOnly:true, secure: process.env.NODE_ENV === "production", sameSite:"lax", path:"/monitoring", maxAge: MONITORING_SESSION_HOURS * 60 * 60 * 1000 });
     await writeMonitoringAudit(operator, req, "login_success", "operator", operator.id, {});
-    return res.json({ success:true, operator:{ id:operator.id, username:operator.username, displayName:operator.displayName, role:operator.role, isBootstrap:Boolean(operator.isBootstrap), mustChangePassword:Boolean(operator.mustChangePassword) }, expiresAt });
+    return res.json({ success:true, operator:{ id:operator.id, username:operator.username, displayName:operator.displayName, role:operator.role, isBootstrap:Boolean(operator.isBootstrap), mustChangePassword:Boolean(operator.mustChangePassword), isEnrolled:Boolean(operator.isEnrolled) }, expiresAt });
   } catch (error) {
     console.error("Monitoring login failed:", error);
     return res.status(500).json({ success:false, error:"Monitoring Center sign-in failed" });
@@ -6924,6 +6996,8 @@ app.get("/monitoring/api/operators", async (req, res) => {
       SELECT id, username, display_name AS "displayName", role, is_active AS "isActive",
              COALESCE(is_bootstrap,FALSE) AS "isBootstrap",
              COALESCE(must_change_password,FALSE) AS "mustChangePassword",
+             COALESCE(is_enrolled,TRUE) AS "isEnrolled",
+             activation_expires_at AS "activationExpiresAt",
              created_at AS "createdAt", updated_at AS "updatedAt", last_login_at AS "lastLoginAt"
       FROM monitoring_operators
       ORDER BY COALESCE(is_bootstrap,FALSE) DESC, is_active DESC, LOWER(display_name), LOWER(username)
@@ -6947,14 +7021,16 @@ app.post("/monitoring/api/operators", async (req, res) => {
     if (!monitoringEncryptionKey()) return res.status(503).json({ success:false, error:"Monitoring encryption is not configured" });
     const prior = await pool.query(`SELECT id FROM monitoring_operators WHERE LOWER(username)=LOWER($1) LIMIT 1`, [username]);
     if (prior.rowCount) return res.status(409).json({ success:false, error:"That username already exists" });
-    const { password, totpSecret } = generateMonitoringCredentials();
     const id = randomUUID();
+    const initialSecret = encodeBase32(randomBytes(20));
+    const placeholderPassword = randomBytes(48).toString("base64url");
     await pool.query(`
-      INSERT INTO monitoring_operators (id,username,display_name,role,password_hash,totp_secret_encrypted,is_active,is_bootstrap,must_change_password)
-      VALUES ($1,$2,$3,$4,$5,$6,TRUE,FALSE,TRUE)
-    `, [id, username, displayName, role, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
-    await writeMonitoringAudit(admin, req, "operator_created", "operator", id, { username, displayName, role });
-    return res.status(201).json({ success:true, operator:{id,username,displayName,role,isActive:true,isBootstrap:false,mustChangePassword:true}, credentials:{ username,password,totpSecret,otpauthUri:monitoringOtpAuthUri(username,totpSecret) } });
+      INSERT INTO monitoring_operators (id,username,display_name,role,password_hash,totp_secret_encrypted,is_active,is_bootstrap,must_change_password,is_enrolled)
+      VALUES ($1,$2,$3,$4,$5,$6,TRUE,FALSE,FALSE,FALSE)
+    `, [id, username, displayName, role, passwordHash(placeholderPassword), encryptMonitoringSecret(initialSecret)]);
+    const activation = await issueMonitoringActivation(id, req);
+    await writeMonitoringAudit(admin, req, "operator_created", "operator", id, { username, displayName, role, activationExpiresAt:activation.expiresAt });
+    return res.status(201).json({ success:true, operator:{id,username,displayName,role,isActive:true,isBootstrap:false,mustChangePassword:false,isEnrolled:false,activationExpiresAt:activation.expiresAt}, activation:{ url:activation.activationUrl, expiresAt:activation.expiresAt } });
   } catch (error) {
     console.error("Monitoring operator create failed:", error);
     return res.status(500).json({ success:false, error:"Unable to create staff account" });
@@ -6984,21 +7060,92 @@ app.patch("/monitoring/api/operators/:operatorId", async (req, res) => {
   }
 });
 
+app.post("/monitoring/api/operators/:operatorId/activation-link", async (req, res) => {
+  try {
+    const admin = await requireMonitoringAdmin(req, res); if (!admin) return;
+    const found = await pool.query(`SELECT id,username,display_name AS "displayName",COALESCE(is_bootstrap,FALSE) AS "isBootstrap" FROM monitoring_operators WHERE id=$1 LIMIT 1`, [req.params.operatorId]);
+    const target = found.rows[0];
+    if (!target) return res.status(404).json({ success:false, error:"Staff account not found" });
+    if (target.isBootstrap) return res.status(400).json({ success:false, error:"The bootstrap administrator uses the protected Render/1Password recovery credentials" });
+    const activation = await issueMonitoringActivation(target.id, req);
+    await writeMonitoringAudit(admin, req, "operator_activation_issued", "operator", target.id, { username:target.username, activationExpiresAt:activation.expiresAt });
+    return res.json({ success:true, activation:{ url:activation.activationUrl, expiresAt:activation.expiresAt } });
+  } catch (error) {
+    console.error("Monitoring operator activation link failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to issue staff activation link" });
+  }
+});
+
+// Backward-compatible alias for older Monitoring Center frontends during rollout.
 app.post("/monitoring/api/operators/:operatorId/reset-credentials", async (req, res) => {
   try {
     const admin = await requireMonitoringAdmin(req, res); if (!admin) return;
     const found = await pool.query(`SELECT id,username,COALESCE(is_bootstrap,FALSE) AS "isBootstrap" FROM monitoring_operators WHERE id=$1 LIMIT 1`, [req.params.operatorId]);
     const target = found.rows[0];
     if (!target) return res.status(404).json({ success:false, error:"Staff account not found" });
-    if (target.isBootstrap) return res.status(400).json({ success:false, error:"Reset the bootstrap administrator through the protected Render/1Password recovery credentials" });
-    const { password, totpSecret } = generateMonitoringCredentials();
-    await pool.query(`UPDATE monitoring_operators SET password_hash=$2,totp_secret_encrypted=$3,must_change_password=TRUE,is_active=TRUE,updated_at=NOW() WHERE id=$1`, [target.id,passwordHash(password),encryptMonitoringSecret(totpSecret)]);
-    await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [target.id]);
-    await writeMonitoringAudit(admin, req, "operator_credentials_reset", "operator", target.id, { username:target.username });
-    return res.json({ success:true, credentials:{ username:target.username,password,totpSecret,otpauthUri:monitoringOtpAuthUri(target.username,totpSecret) } });
+    if (target.isBootstrap) return res.status(400).json({ success:false, error:"The bootstrap administrator uses the protected Render/1Password recovery credentials" });
+    const activation = await issueMonitoringActivation(target.id, req);
+    await writeMonitoringAudit(admin, req, "operator_activation_issued", "operator", target.id, { username:target.username, activationExpiresAt:activation.expiresAt, compatibilityEndpoint:true });
+    return res.json({ success:true, activation:{ url:activation.activationUrl, expiresAt:activation.expiresAt } });
   } catch (error) {
-    console.error("Monitoring operator credential reset failed:", error);
-    return res.status(500).json({ success:false, error:"Unable to reset staff credentials" });
+    console.error("Monitoring operator activation reset failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to reset staff access" });
+  }
+});
+
+// Public, single-use staff activation flow. The activation token is stored only as a hash.
+app.get("/monitoring/api/activation/:token", async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    const operator = await monitoringActivationRecord(req.params.token);
+    if (!operator) return res.status(410).json({ success:false, error:"This activation link is invalid, expired, or has already been used" });
+    const totpSecret = decryptMonitoringSecret(operator.totpSecretEncrypted);
+    return res.json({ success:true, activation:{ username:operator.username, displayName:operator.displayName, role:operator.role, expiresAt:operator.activationExpiresAt, totpSecret, otpauthUri:monitoringOtpAuthUri(operator.username, totpSecret), qrUrl:`/monitoring/api/activation/${encodeURIComponent(req.params.token)}/qr.svg` } });
+  } catch (error) {
+    console.error("Monitoring activation lookup failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to load staff activation" });
+  }
+});
+
+app.get("/monitoring/api/activation/:token/qr.svg", async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    const operator = await monitoringActivationRecord(req.params.token);
+    if (!operator) return res.status(410).type("text/plain").send("Activation link expired");
+    const totpSecret = decryptMonitoringSecret(operator.totpSecretEncrypted);
+    res.type("image/svg+xml");
+    return res.send(monitoringQrSvg(monitoringOtpAuthUri(operator.username, totpSecret)));
+  } catch (error) {
+    console.error("Monitoring activation QR failed:", error);
+    return res.status(500).type("text/plain").send("Unable to generate QR code");
+  }
+});
+
+app.post("/monitoring/api/activation/:token/complete", async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    const operator = await monitoringActivationRecord(req.params.token);
+    if (!operator) return res.status(410).json({ success:false, error:"This activation link is invalid, expired, or has already been used" });
+    const newPassword = String(req.body?.password || "");
+    const code = String(req.body?.code || "");
+    if (newPassword.length < 12) return res.status(400).json({ success:false, error:"Password must be at least 12 characters" });
+    const totpSecret = decryptMonitoringSecret(operator.totpSecretEncrypted);
+    if (!verifyMonitoringTotp(totpSecret, code)) return res.status(400).json({ success:false, error:"Authenticator code is not valid. Wait for a new 6-digit code and try again." });
+    const tokenHash = monitoringActivationTokenHash(req.params.token);
+    const updated = await pool.query(`
+      UPDATE monitoring_operators
+      SET password_hash=$2, is_enrolled=TRUE, must_change_password=FALSE, activation_token_hash=NULL,
+          activation_expires_at=NULL, activation_used_at=NOW(), updated_at=NOW()
+      WHERE id=$1 AND activation_token_hash=$3 AND COALESCE(is_enrolled,TRUE)=FALSE
+      RETURNING id
+    `, [operator.id, passwordHash(newPassword), tokenHash]);
+    if (!updated.rowCount) return res.status(410).json({ success:false, error:"This activation link has already been used" });
+    await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [operator.id]);
+    await writeMonitoringAudit(operator, req, "operator_activation_completed", "operator", operator.id, { username:operator.username, role:operator.role });
+    return res.json({ success:true, username:operator.username });
+  } catch (error) {
+    console.error("Monitoring activation completion failed:", error);
+    return res.status(500).json({ success:false, error:"Unable to activate staff account" });
   }
 });
 

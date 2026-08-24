@@ -7,6 +7,34 @@
   <link rel="stylesheet" href="/monitoring/styles.css">
 </head>
 <body>
+  <div id="activationView" class="activation-shell hidden">
+    <section class="activation-card">
+      <div class="brand-mark">GS</div>
+      <h1>Activate Monitoring Center Account</h1>
+      <p id="activationIntro" class="muted">Loading your secure staff setup…</p>
+      <div id="activationSetup" class="hidden">
+        <div class="activation-identity"><strong id="activationName"></strong><span id="activationRole"></span><code id="activationUsername"></code></div>
+        <div class="activation-grid">
+          <div class="activation-qr-wrap"><img id="activationQr" alt="Authenticator QR code"><small>Scan with 1Password, Microsoft Authenticator, Google Authenticator, or another TOTP app.</small></div>
+          <div class="activation-steps">
+            <h2>1. Set up MFA</h2>
+            <a id="openAuthenticator" class="primary activation-link-button" href="#">Open authenticator</a>
+            <details><summary>Manual setup key</summary><code id="activationSecret" class="activation-secret"></code></details>
+            <h2>2. Choose your password</h2>
+            <form id="activationForm">
+              <label>New password<input id="activationPassword" type="password" minlength="12" autocomplete="new-password" required></label>
+              <label>Confirm password<input id="activationConfirm" type="password" minlength="12" autocomplete="new-password" required></label>
+              <label>6-digit authenticator code<input id="activationCode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+              <button class="primary" type="submit">Activate Account</button>
+              <div id="activationError" class="error" role="alert"></div>
+            </form>
+          </div>
+        </div>
+      </div>
+      <div id="activationComplete" class="activation-complete hidden"><strong>Account activated.</strong><p>Your password and MFA are now set. You can sign in to the Monitoring Center.</p><button id="activationSignIn" class="primary" type="button">Continue to Sign In</button></div>
+    </section>
+  </div>
+
   <div id="loginView" class="login-shell">
     <form id="loginForm" class="login-card" autocomplete="on">
       <div class="brand-mark">GS</div>

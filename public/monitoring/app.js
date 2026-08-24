@@ -90,19 +90,21 @@ function hidePasswordChange() {
   $('#passwordModal')?.classList.add('hidden');
 }
 
-function credentialMarkup(credentials, heading = 'Staff account created') {
-  if (!credentials) return '';
+function activationMarkup(activation, heading = 'Staff activation ready') {
+  if (!activation) return '';
   return `<div class="credential-title">${escapeHtml(heading)}</div>
-    <p>Give these setup details directly to the staff member. The password and MFA secret are shown only for this setup/reset.</p>
-    <div class="credential-row"><span>Username</span><code>${escapeHtml(credentials.username)}</code></div>
-    <div class="credential-row"><span>Temporary password</span><code>${escapeHtml(credentials.password)}</code></div>
-    <div class="credential-row"><span>MFA secret</span><code>${escapeHtml(credentials.totpSecret)}</code></div>
-    <div class="credential-actions"><button class="ghost" type="button" id="copyStaffCredentials">Copy setup details</button></div>`;
+    <p>Send this single-use activation link directly to the staff member. It expires ${escapeHtml(fmtDate(activation.expiresAt))}. The employee creates their own password and enrolls their own authenticator; you never need to handle their MFA secret.</p>
+    <div class="credential-row"><span>Activation link</span><code>${escapeHtml(activation.url)}</code></div>
+    <div class="credential-actions"><button class="ghost" type="button" id="copyActivationLink">Copy activation link</button></div>`;
 }
 
-function staffSetupText(credentials) {
-  return `Good Shepherd Monitoring Center\nUsername: ${credentials.username}\nTemporary password: ${credentials.password}\nMFA secret: ${credentials.totpSecret}\n\nAdd the MFA secret to 1Password or another authenticator as a 6-digit TOTP, then sign in. You will be required to set a permanent password.`;
+function activationSetupText(activation) {
+  return `Good Shepherd Monitoring Center staff activation
+${activation.url}
+
+This link expires ${fmtDate(activation.expiresAt)} and can be used only once.`;
 }
+
 
 async function openStaffManager() {
   $('#staffModal').classList.remove('hidden');
@@ -122,14 +124,14 @@ async function loadStaffList() {
     const data = await api('/monitoring/api/operators');
     list.innerHTML = (data.operators || []).map((op) => `
       <article class="staff-card ${op.isActive ? '' : 'staff-disabled'}" data-operator-id="${escapeHtml(op.id)}">
-        <div class="staff-card-head"><div><strong>${escapeHtml(op.displayName)}</strong><span>@${escapeHtml(op.username)}</span></div><div class="staff-badges">${op.isBootstrap ? '<span class="staff-badge bootstrap">Bootstrap</span>' : ''}${!op.isActive ? '<span class="staff-badge disabled">Disabled</span>' : ''}${op.mustChangePassword ? '<span class="staff-badge pending">Password setup</span>' : ''}</div></div>
+        <div class="staff-card-head"><div><strong>${escapeHtml(op.displayName)}</strong><span>@${escapeHtml(op.username)}</span></div><div class="staff-badges">${op.isBootstrap ? '<span class="staff-badge bootstrap">Bootstrap</span>' : ''}${!op.isActive ? '<span class="staff-badge disabled">Disabled</span>' : ''}${!op.isEnrolled ? '<span class="staff-badge pending">Activation pending</span>' : ''}</div></div>
         <div class="staff-edit-row">
           <label>Name<input class="staff-edit-name" value="${escapeHtml(op.displayName)}" ${op.isBootstrap ? 'disabled' : ''}></label>
           <label>Role<select class="staff-edit-role" ${op.isBootstrap ? 'disabled' : ''}><option value="operator" ${op.role==='operator'?'selected':''}>Operator</option><option value="supervisor" ${op.role==='supervisor'?'selected':''}>Supervisor</option><option value="admin" ${op.role==='admin'?'selected':''}>Administrator</option></select></label>
         </div>
-        <div class="staff-meta">Last login: ${op.lastLoginAt ? escapeHtml(fmtDate(op.lastLoginAt)) : 'Never'} · Created: ${escapeHtml(fmtDate(op.createdAt))}</div>
+        <div class="staff-meta">Last login: ${op.lastLoginAt ? escapeHtml(fmtDate(op.lastLoginAt)) : 'Never'} · Created: ${escapeHtml(fmtDate(op.createdAt))}${!op.isEnrolled && op.activationExpiresAt ? ` · Activation expires: ${escapeHtml(fmtDate(op.activationExpiresAt))}` : ''}</div>
         <div class="staff-card-actions">
-          ${op.isBootstrap ? '<span class="muted">Protected recovery administrator</span>' : `<button type="button" class="ghost staff-save">Save</button><button type="button" class="ghost staff-toggle">${op.isActive ? 'Disable' : 'Enable'}</button><button type="button" class="ghost staff-reset">Reset credentials</button>`}
+          ${op.isBootstrap ? '<span class="muted">Protected recovery administrator</span>' : `<button type="button" class="ghost staff-save">Save</button><button type="button" class="ghost staff-toggle">${op.isActive ? 'Disable' : 'Enable'}</button><button type="button" class="ghost staff-reset">${op.isEnrolled ? 'Reset access' : 'Reissue activation'}</button>`}
         </div>
       </article>`).join('') || '<div class="empty-state">No staff accounts found.</div>';
 
@@ -151,14 +153,14 @@ async function loadStaffList() {
     }));
     list.querySelectorAll('.staff-reset').forEach(btn => btn.addEventListener('click', async () => {
       const card = btn.closest('.staff-card');
-      if (!confirm('Reset this staff member’s password and MFA? Their current sessions will be signed out.')) return;
+      if (!confirm('Issue a new single-use activation link? Any active Monitoring Center sessions for this staff member will be signed out.')) return;
       btn.disabled = true;
       try {
-        const data = await api(`/monitoring/api/operators/${card.dataset.operatorId}/reset-credentials`, {method:'POST',body:'{}'});
+        const data = await api(`/monitoring/api/operators/${card.dataset.operatorId}/activation-link`, {method:'POST',body:'{}'});
         const box = $('#staffCredentials');
-        box.innerHTML = credentialMarkup(data.credentials, 'Credentials reset');
+        box.innerHTML = activationMarkup(data.activation, 'New activation link issued');
         box.classList.remove('hidden');
-        $('#copyStaffCredentials')?.addEventListener('click', () => navigator.clipboard.writeText(staffSetupText(data.credentials)));
+        $('#copyActivationLink')?.addEventListener('click', () => navigator.clipboard.writeText(activationSetupText(data.activation)));
         await loadStaffList();
       } catch (err) { alert(err.message); } finally { btn.disabled=false; }
     }));
@@ -167,7 +169,61 @@ async function loadStaffList() {
   }
 }
 
+function activationTokenFromUrl() {
+  return new URLSearchParams(window.location.search).get('activate') || '';
+}
+
+function showActivation() {
+  $('#appView')?.classList.add('hidden');
+  $('#loginView')?.classList.add('hidden');
+  $('#activationView')?.classList.remove('hidden');
+}
+
+function leaveActivationForLogin(username = '') {
+  history.replaceState({}, '', '/monitoring/');
+  $('#activationView')?.classList.add('hidden');
+  $('#loginView')?.classList.remove('hidden');
+  if (username) $('#username').value = username;
+}
+
+async function bootActivation(token) {
+  showActivation();
+  $('#activationIntro').textContent = 'Loading your secure staff setup…';
+  try {
+    const data = await api(`/monitoring/api/activation/${encodeURIComponent(token)}`);
+    const a = data.activation;
+    $('#activationName').textContent = a.displayName;
+    $('#activationRole').textContent = ({admin:'Administrator',supervisor:'Supervisor',operator:'Operator'}[a.role] || a.role);
+    $('#activationUsername').textContent = `@${a.username}`;
+    $('#activationQr').src = a.qrUrl;
+    $('#activationSecret').textContent = a.totpSecret;
+    $('#openAuthenticator').href = a.otpauthUri;
+    $('#activationIntro').textContent = `This single-use setup link expires ${fmtDate(a.expiresAt)}.`;
+    $('#activationSetup').classList.remove('hidden');
+    $('#activationForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const password = $('#activationPassword').value;
+      const confirmPassword = $('#activationConfirm').value;
+      const code = $('#activationCode').value;
+      $('#activationError').textContent = '';
+      if (password !== confirmPassword) { $('#activationError').textContent = 'Passwords do not match.'; return; }
+      const button = e.submitter; button.disabled = true;
+      try {
+        const completed = await api(`/monitoring/api/activation/${encodeURIComponent(token)}/complete`, {method:'POST',body:JSON.stringify({password,code})});
+        $('#activationSetup').classList.add('hidden');
+        $('#activationComplete').classList.remove('hidden');
+        $('#activationSignIn').onclick = () => leaveActivationForLogin(completed.username);
+      } catch (err) { $('#activationError').textContent = err.message; button.disabled = false; }
+    }, { once:true });
+  } catch (err) {
+    $('#activationIntro').textContent = err.message;
+    $('#activationIntro').classList.add('error');
+  }
+}
+
 async function boot() {
+  const activationToken = activationTokenFromUrl();
+  if (activationToken) { await bootActivation(activationToken); return; }
   try {
     const me = await api('/monitoring/api/me');
     showApp(me.operator);
@@ -658,9 +714,9 @@ $('#createStaffForm')?.addEventListener('submit', async (e) => {
     const data = await api('/monitoring/api/operators', {method:'POST',body:JSON.stringify({displayName:$('#staffDisplayName').value,username:$('#staffUsername').value,role:$('#staffRole').value})});
     e.target.reset();
     const box = $('#staffCredentials');
-    box.innerHTML = credentialMarkup(data.credentials);
+    box.innerHTML = activationMarkup(data.activation);
     box.classList.remove('hidden');
-    $('#copyStaffCredentials')?.addEventListener('click', () => navigator.clipboard.writeText(staffSetupText(data.credentials)));
+    $('#copyActivationLink')?.addEventListener('click', () => navigator.clipboard.writeText(activationSetupText(data.activation)));
     await loadStaffList();
   } catch (err) { $('#staffFormError').textContent = err.message; }
 });
