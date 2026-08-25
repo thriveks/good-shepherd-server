@@ -664,6 +664,7 @@ function renderResident(r) {
       <h3>Operator case</h3>
       ${!activeCase ? `<div class="case-empty ${resolvedCase ? 'case-resolved-summary' : ''}">${resolvedCase ? `<div><strong>Resolved</strong><div class="small">Closed ${escapeHtml(fmtDate(incident.resolvedAt))}${incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : ''}</div>${incident.resolution ? `<div class="resolution-summary">${escapeHtml(incident.resolution)}</div>` : ''}<div class="notice">The operator case is closed. The underlying live signal is retained for reference but is removed from active P1-P4 response counts until it clears/re-triggers or a new case is accepted.</div></div>` : `<div>No active case is assigned for this resident.</div>`}<button id="acceptCaseBtn" class="primary case-primary" type="button">${resolvedCase ? 'Accept New Case' : 'Accept Case'}</button></div>` : `
         <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)} · ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
+        ${incident.handoffToOperatorId ? `<div class="handoff-banner"><div><strong>Handoff pending → ${escapeHtml(incident.handoffToOperatorName || 'receiving staff')}</strong><div class="small">${incident.handoffReason ? `Reason: ${escapeHtml(incident.handoffReason)} · ` : ''}${incident.handoffRequestedAt ? escapeHtml(fmtDate(incident.handoffRequestedAt)) : ''}</div><div class="small">${escapeHtml(incident.assignedOperatorName || 'Current operator')} remains responsible until the handoff is accepted.</div></div><div class="handoff-banner-actions">${String(incident.handoffToOperatorId) === String(state.operator?.id) ? '<button id="acceptHandoffBtn" class="primary" type="button">Accept Handoff</button>' : ''}${mine || ['supervisor','admin'].includes(state.operator?.role) ? '<button id="cancelHandoffBtn" class="ghost" type="button">Cancel Handoff</button>' : ''}</div></div>` : ''}
         ${protocolGuidance ? `<div class="protocol-guidance"><div class="protocol-guidance-label">Required next step</div><strong>${escapeHtml(protocolGuidance.label)}</strong>${protocolGuidance.note ? `<div>${escapeHtml(protocolGuidance.note)}</div>` : ''}</div>` : ''}
         ${canSupervisorDisposition ? `<div class="action-group supervisor-disposition-group"><div class="action-group-title">Supervisor disposition</div><div class="notice">Record the supervisory decision without taking ownership away from the assigned operator.</div><div class="action-grid compact-actions">
           <button type="button" data-supervisor-disposition="continue_monitoring">Continue monitoring / contact attempts</button>
@@ -691,6 +692,7 @@ function renderResident(r) {
           </div></div>
         </div>
         <div class="action-group documentation-group"><div class="action-group-title">Documentation</div>
+          ${incident.handoffToOperatorId ? '' : '<button id="handoffCaseBtn" class="ghost handoff-case-btn" type="button">Hand Off Case</button>'}
           <form id="caseNoteForm" class="follow-form"><textarea id="caseNote" placeholder="Add operator note to this case…" required></textarea><button class="ghost" type="submit">Add note</button></form>
           <form id="resolveForm" class="resolve-form"><textarea id="resolutionNote" placeholder="Resolution / closure evidence…" required></textarea><button class="primary resolve-btn" type="submit">Resolve Case</button></form>
         </div>` : `<div class="notice">This case is being handled by ${escapeHtml(incident.assignedOperatorName || 'another operator')}.${['supervisor','admin'].includes(state.operator?.role) ? ` <button id="takeoverCaseBtn" class="ghost inline-case-action" type="button">Take Over Case</button>` : ''}</div>`}
@@ -726,6 +728,43 @@ function renderResident(r) {
   restoreResidentDrafts(r.residentId, activeCase ? incident.id : null);
   state.renderedCaseId = activeCase ? incident.id : null;
   requestAnimationFrame(() => { panel.scrollTop = priorScroll; });
+
+  const handoffBtn = $('#handoffCaseBtn');
+  if (handoffBtn) handoffBtn.addEventListener('click', async () => {
+    handoffBtn.disabled = true;
+    try {
+      const data = await api('/monitoring/api/handoff-targets');
+      const targets = data.operators || [];
+      if (!targets.length) { showCaseNotice('No other active staff accounts are available for handoff.', 'error'); handoffBtn.disabled=false; return; }
+      const choices = targets.map((op,i)=>`${i+1}. ${op.displayName || op.username} (${({admin:'Administrator',supervisor:'Supervisor',operator:'Operator'}[op.role]||op.role)})`).join('\n');
+      const picked = window.prompt(`Hand off this case to:\n\n${choices}\n\nEnter the number:`);
+      if (picked === null) { handoffBtn.disabled=false; return; }
+      const target = targets[Number(picked)-1];
+      if (!target) { showCaseNotice('Choose a valid staff number.', 'error'); handoffBtn.disabled=false; return; }
+      const reason = window.prompt(`Reason for handoff to ${target.displayName || target.username}:`, 'Shift handoff');
+      if (reason === null) { handoffBtn.disabled=false; return; }
+      if (!String(reason).trim()) { showCaseNotice('A handoff reason is required.', 'error'); handoffBtn.disabled=false; return; }
+      await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/handoff`, {method:'POST',body:JSON.stringify({targetOperatorId:target.id,reason:String(reason).trim()})});
+      await refreshSelectedResident();
+      showCaseNotice(`✓ Handoff requested. You remain responsible until ${target.displayName || target.username} accepts.`);
+    } catch(err) { showCaseNotice(err.message,'error'); handoffBtn.disabled=false; }
+  });
+
+  const acceptHandoffBtn = $('#acceptHandoffBtn');
+  if (acceptHandoffBtn) acceptHandoffBtn.addEventListener('click', async()=>{
+    if(!window.confirm(`Accept this case from ${incident.assignedOperatorName || 'the current operator'}? You will become the assigned operator.`)) return;
+    acceptHandoffBtn.disabled=true;
+    try { await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/handoff/accept`,{method:'POST',body:'{}'}); await refreshSelectedResident(); showCaseNotice('✓ Handoff accepted. This case is now assigned to you.'); }
+    catch(err){showCaseNotice(err.message,'error');acceptHandoffBtn.disabled=false;}
+  });
+
+  const cancelHandoffBtn = $('#cancelHandoffBtn');
+  if (cancelHandoffBtn) cancelHandoffBtn.addEventListener('click', async()=>{
+    if(!window.confirm(`Cancel the pending handoff to ${incident.handoffToOperatorName || 'the receiving operator'}?`)) return;
+    cancelHandoffBtn.disabled=true;
+    try { await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/handoff/cancel`,{method:'POST',body:'{}'}); await refreshSelectedResident(); showCaseNotice('✓ Pending handoff cancelled.'); }
+    catch(err){showCaseNotice(err.message,'error');cancelHandoffBtn.disabled=false;}
+  });
 
   const takeoverBtn = $('#takeoverCaseBtn');
   if (takeoverBtn) takeoverBtn.addEventListener('click', async () => {

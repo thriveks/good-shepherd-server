@@ -490,6 +490,13 @@ async function initializeDatabase() {
   await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS resident_response_code TEXT`);
   await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS resident_response_label TEXT`);
   await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS resident_response_at TIMESTAMPTZ`);
+  // Pending handoffs keep the current operator accountable until the recipient explicitly accepts.
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS handoff_to_operator_id UUID REFERENCES monitoring_operators(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS handoff_to_operator_name TEXT`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS handoff_requested_by_operator_id UUID REFERENCES monitoring_operators(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS handoff_requested_by_operator_name TEXT`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS handoff_reason TEXT`);
+  await pool.query(`ALTER TABLE monitoring_cases ADD COLUMN IF NOT EXISTS handoff_requested_at TIMESTAMPTZ`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS monitoring_case_events (
       id UUID PRIMARY KEY,
@@ -7204,7 +7211,10 @@ async function monitoringActiveCasesByResident() {
            assigned_operator_id AS "assignedOperatorId", assigned_operator_name AS "assignedOperatorName",
            opened_at AS "openedAt", accepted_at AS "acceptedAt",
            resident_response_code AS "residentResponseCode", resident_response_label AS "residentResponseLabel",
-           resident_response_at AS "residentResponseAt", updated_at AS "updatedAt"
+           resident_response_at AS "residentResponseAt",
+           handoff_to_operator_id AS "handoffToOperatorId", handoff_to_operator_name AS "handoffToOperatorName",
+           handoff_requested_by_operator_id AS "handoffRequestedByOperatorId", handoff_requested_by_operator_name AS "handoffRequestedByOperatorName",
+           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     WHERE status IN ('open','accepted','escalated')
   `);
@@ -7219,7 +7229,10 @@ async function monitoringLatestCasesByResident() {
            opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
            resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt",
            resident_response_code AS "residentResponseCode", resident_response_label AS "residentResponseLabel",
-           resident_response_at AS "residentResponseAt", updated_at AS "updatedAt"
+           resident_response_at AS "residentResponseAt",
+           handoff_to_operator_id AS "handoffToOperatorId", handoff_to_operator_name AS "handoffToOperatorName",
+           handoff_requested_by_operator_id AS "handoffRequestedByOperatorId", handoff_requested_by_operator_name AS "handoffRequestedByOperatorName",
+           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     ORDER BY resident_id, opened_at DESC
   `);
@@ -7233,7 +7246,10 @@ async function monitoringCasePayloadForResident(residentId) {
            opened_at AS "openedAt", accepted_at AS "acceptedAt", resolved_at AS "resolvedAt",
            resolved_by_operator_name AS "resolvedByOperatorName", resolution, signal_cleared_at AS "signalClearedAt",
            resident_response_code AS "residentResponseCode", resident_response_label AS "residentResponseLabel",
-           resident_response_at AS "residentResponseAt", updated_at AS "updatedAt"
+           resident_response_at AS "residentResponseAt",
+           handoff_to_operator_id AS "handoffToOperatorId", handoff_to_operator_name AS "handoffToOperatorName",
+           handoff_requested_by_operator_id AS "handoffRequestedByOperatorId", handoff_requested_by_operator_name AS "handoffRequestedByOperatorName",
+           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt", updated_at AS "updatedAt"
     FROM monitoring_cases
     WHERE resident_id=$1
     ORDER BY CASE WHEN status IN ('open','accepted','escalated') THEN 0 ELSE 1 END, opened_at DESC
@@ -7462,7 +7478,7 @@ app.post("/monitoring/api/cases/:caseId/takeover", async (req, res) => {
     if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"Only an active case can be reassigned" });
     if (incident.assignedOperatorId && String(incident.assignedOperatorId) === String(operator.id)) return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
     const priorName = incident.assignedOperatorName || 'Unassigned';
-    await pool.query(`UPDATE monitoring_cases SET assigned_operator_id=$2,assigned_operator_name=$3,status='accepted',accepted_at=COALESCE(accepted_at,NOW()),updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName]);
+    await pool.query(`UPDATE monitoring_cases SET assigned_operator_id=$2,assigned_operator_name=$3,status='accepted',accepted_at=COALESCE(accepted_at,NOW()),handoff_to_operator_id=NULL,handoff_to_operator_name=NULL,handoff_requested_by_operator_id=NULL,handoff_requested_by_operator_name=NULL,handoff_reason=NULL,handoff_requested_at=NULL,updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName]);
     await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_reassigned','Case reassigned',$5)`, [randomUUID(),incident.id,operator.id,operator.displayName,`Supervisor takeover from ${priorName}`]);
     await writeMonitoringAudit(operator, req, "case_reassigned", "case", incident.id, { priorOperatorName:priorName, assignedOperatorId:operator.id, assignedOperatorName:operator.displayName });
     return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
@@ -7470,6 +7486,81 @@ app.post("/monitoring/api/cases/:caseId/takeover", async (req, res) => {
     console.error("Monitoring case takeover failed:", error);
     return res.status(500).json({ success:false, error:"Failed to reassign case" });
   }
+});
+
+// Case handoff: the current owner remains accountable until the named recipient accepts.
+app.get("/monitoring/api/handoff-targets", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const result = await pool.query(`SELECT id,username,display_name AS "displayName",role FROM monitoring_operators WHERE is_active=TRUE AND COALESCE(is_enrolled,TRUE)=TRUE AND id<>$1 ORDER BY LOWER(display_name),LOWER(username)`, [operator.id]);
+    return res.json({success:true, operators:result.rows});
+  } catch (error) { console.error("Monitoring handoff targets failed:", error); return res.status(500).json({success:false,error:"Unable to load handoff recipients"}); }
+});
+
+app.post("/monitoring/api/cases/:caseId/handoff", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const targetOperatorId = cleanText(req.body?.targetOperatorId);
+    const reason = cleanText(req.body?.reason);
+    if (!targetOperatorId) return res.status(400).json({success:false,error:"Choose a receiving staff member"});
+    if (!reason) return res.status(400).json({success:false,error:"A handoff reason is required"});
+    await client.query('BEGIN');
+    const found = await client.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId",assigned_operator_name AS "assignedOperatorName",handoff_to_operator_id AS "handoffToOperatorId" FROM monitoring_cases WHERE id=$1 FOR UPDATE`, [req.params.caseId]);
+    const incident = found.rows[0];
+    if (!incident) { await client.query('ROLLBACK'); return res.status(404).json({success:false,error:"Case not found"}); }
+    if (!['open','accepted','escalated'].includes(incident.status)) { await client.query('ROLLBACK'); return res.status(409).json({success:false,error:"This case is already closed"}); }
+    if (!incident.assignedOperatorId || String(incident.assignedOperatorId)!==String(operator.id)) { await client.query('ROLLBACK'); return res.status(409).json({success:false,error:"Only the assigned operator can initiate a handoff"}); }
+    if (incident.handoffToOperatorId) { await client.query('ROLLBACK'); return res.status(409).json({success:false,error:"This case already has a pending handoff"}); }
+    if (String(targetOperatorId)===String(operator.id)) { await client.query('ROLLBACK'); return res.status(400).json({success:false,error:"Choose another staff member"}); }
+    const targetResult = await client.query(`SELECT id,display_name AS "displayName",username,role FROM monitoring_operators WHERE id=$1 AND is_active=TRUE AND COALESCE(is_enrolled,TRUE)=TRUE LIMIT 1`, [targetOperatorId]);
+    const target = targetResult.rows[0];
+    if (!target) { await client.query('ROLLBACK'); return res.status(400).json({success:false,error:"The receiving staff account is not active"}); }
+    const targetName = target.displayName || target.username;
+    await client.query(`UPDATE monitoring_cases SET handoff_to_operator_id=$2,handoff_to_operator_name=$3,handoff_requested_by_operator_id=$4,handoff_requested_by_operator_name=$5,handoff_reason=$6,handoff_requested_at=NOW(),updated_at=NOW() WHERE id=$1`, [incident.id,target.id,targetName,operator.id,operator.displayName,reason]);
+    await client.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'handoff_requested','Handoff requested',$5,$6::jsonb)`, [randomUUID(),incident.id,operator.id,operator.displayName,`${operator.displayName} → ${targetName}\nReason: ${reason}`,JSON.stringify({fromOperatorId:operator.id,fromOperatorName:operator.displayName,toOperatorId:target.id,toOperatorName:targetName,reason})]);
+    await client.query('COMMIT');
+    await writeMonitoringAudit(operator,req,'case_handoff_requested','case',incident.id,{toOperatorId:target.id,toOperatorName:targetName,reason});
+    return res.status(201).json({success:true,incident:await monitoringCasePayloadForResident(incident.residentId)});
+  } catch (error) { try{await client.query('ROLLBACK')}catch(_){} console.error("Monitoring handoff request failed:",error); return res.status(500).json({success:false,error:"Failed to request case handoff"}); }
+  finally { client.release(); }
+});
+
+app.post("/monitoring/api/cases/:caseId/handoff/accept", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const operator = await requireMonitoringOperator(req,res); if (!operator) return;
+    await client.query('BEGIN');
+    const found = await client.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId",assigned_operator_name AS "assignedOperatorName",handoff_to_operator_id AS "handoffToOperatorId",handoff_to_operator_name AS "handoffToOperatorName",handoff_reason AS "handoffReason" FROM monitoring_cases WHERE id=$1 FOR UPDATE`,[req.params.caseId]);
+    const incident=found.rows[0];
+    if(!incident){await client.query('ROLLBACK');return res.status(404).json({success:false,error:"Case not found"});}
+    if(!['open','accepted','escalated'].includes(incident.status)){await client.query('ROLLBACK');return res.status(409).json({success:false,error:"This case is already closed"});}
+    if(!incident.handoffToOperatorId){await client.query('ROLLBACK');return res.status(409).json({success:false,error:"This case has no pending handoff"});}
+    if(String(incident.handoffToOperatorId)!==String(operator.id)){await client.query('ROLLBACK');return res.status(403).json({success:false,error:"This handoff is assigned to another staff member"});}
+    const priorName=incident.assignedOperatorName||'Unassigned';
+    await client.query(`UPDATE monitoring_cases SET assigned_operator_id=$2,assigned_operator_name=$3,status=CASE WHEN status='open' THEN 'accepted' ELSE status END,accepted_at=COALESCE(accepted_at,NOW()),handoff_to_operator_id=NULL,handoff_to_operator_name=NULL,handoff_requested_by_operator_id=NULL,handoff_requested_by_operator_name=NULL,handoff_reason=NULL,handoff_requested_at=NULL,updated_at=NOW() WHERE id=$1`,[incident.id,operator.id,operator.displayName]);
+    await client.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'handoff_accepted','Handoff accepted',$5,$6::jsonb)`,[randomUUID(),incident.id,operator.id,operator.displayName,`Ownership transferred from ${priorName} to ${operator.displayName}.`,JSON.stringify({fromOperatorId:incident.assignedOperatorId,fromOperatorName:priorName,toOperatorId:operator.id,toOperatorName:operator.displayName,reason:incident.handoffReason||null})]);
+    await client.query('COMMIT');
+    await writeMonitoringAudit(operator,req,'case_handoff_accepted','case',incident.id,{priorOperatorId:incident.assignedOperatorId,priorOperatorName:priorName});
+    return res.json({success:true,incident:await monitoringCasePayloadForResident(incident.residentId)});
+  } catch(error){try{await client.query('ROLLBACK')}catch(_){} console.error("Monitoring handoff accept failed:",error);return res.status(500).json({success:false,error:"Failed to accept case handoff"});}
+  finally{client.release();}
+});
+
+app.post("/monitoring/api/cases/:caseId/handoff/cancel", async (req,res)=>{
+  try{
+    const operator=await requireMonitoringOperator(req,res);if(!operator)return;
+    const found=await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId",handoff_to_operator_id AS "handoffToOperatorId",handoff_to_operator_name AS "handoffToOperatorName" FROM monitoring_cases WHERE id=$1 LIMIT 1`,[req.params.caseId]);
+    const incident=found.rows[0];if(!incident)return res.status(404).json({success:false,error:"Case not found"});
+    if(!incident.handoffToOperatorId)return res.status(409).json({success:false,error:"This case has no pending handoff"});
+    const canCancel=String(incident.assignedOperatorId)===String(operator.id)||monitoringRoleRank(operator.role)>=monitoringRoleRank('supervisor');
+    if(!canCancel)return res.status(403).json({success:false,error:"Only the assigned operator or a supervisor can cancel this handoff"});
+    const targetName=incident.handoffToOperatorName||'receiving operator';
+    await pool.query(`UPDATE monitoring_cases SET handoff_to_operator_id=NULL,handoff_to_operator_name=NULL,handoff_requested_by_operator_id=NULL,handoff_requested_by_operator_name=NULL,handoff_reason=NULL,handoff_requested_at=NULL,updated_at=NOW() WHERE id=$1`,[incident.id]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'handoff_cancelled','Handoff cancelled',$5)`,[randomUUID(),incident.id,operator.id,operator.displayName,`Pending handoff to ${targetName} was cancelled.`]);
+    await writeMonitoringAudit(operator,req,'case_handoff_cancelled','case',incident.id,{targetOperatorName:targetName});
+    return res.json({success:true,incident:await monitoringCasePayloadForResident(incident.residentId)});
+  }catch(error){console.error("Monitoring handoff cancel failed:",error);return res.status(500).json({success:false,error:"Failed to cancel case handoff"});}
 });
 
 app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
