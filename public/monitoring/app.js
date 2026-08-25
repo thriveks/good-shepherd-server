@@ -532,6 +532,11 @@ function latestProtocolGuidance(incident) {
   return null;
 }
 
+function caseHasEvent(incident, eventType) {
+  const rows = Array.isArray(incident?.timeline) ? incident.timeline : [];
+  return rows.some((row) => row?.eventType === eventType);
+}
+
 function openContactOutcomeDialog(action) {
   return new Promise((resolve) => {
     document.getElementById('contactOutcomeModal')?.remove();
@@ -636,10 +641,14 @@ function renderResident(r) {
             <button type="button" data-case-action="contact_2_call" data-success="Contact #2 call attempt recorded">Call Contact #2</button>
           </div></div>
           <div class="action-group"><div class="action-group-title">Escalation</div><div class="action-grid compact-actions">
-            <button type="button" data-case-action="supervisor_escalation" data-success="Supervisor escalation recorded">Escalate to supervisor</button>
+            ${caseHasEvent(incident, 'supervisor_escalation')
+              ? '<button type="button" disabled title="Supervisor escalation already recorded">Supervisor escalated ✓</button>'
+              : '<button type="button" data-case-action="supervisor_escalation" data-success="Supervisor escalation recorded">Escalate to supervisor</button>'}
             <button type="button" data-case-action="technical_review" data-success="Technical review recorded">Technical review</button>
             <button type="button" data-case-action="field_response" data-success="Field response request recorded">Field response requested</button>
-            <button type="button" data-case-action="emergency_escalation" data-success="Emergency / 911 escalation recorded" class="danger-action">Emergency / 911 escalation</button>
+            ${caseHasEvent(incident, 'emergency_escalation')
+              ? '<button type="button" class="danger-action" disabled title="Emergency / 911 escalation already recorded">Emergency / 911 escalated ✓</button>'
+              : '<button type="button" data-case-action="emergency_escalation" data-success="Emergency / 911 escalation recorded" class="danger-action">Emergency / 911 escalation</button>'}
           </div></div>
         </div>
         <div class="action-group documentation-group"><div class="action-group-title">Documentation</div>

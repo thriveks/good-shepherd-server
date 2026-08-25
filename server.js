@@ -7538,6 +7538,24 @@ app.post("/monitoring/api/cases/:caseId/actions", async (req, res) => {
     if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
     if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Accept this case before recording operator actions" });
 
+    // Escalation actions are state transitions, not repeatable timeline notes.
+    // Reject duplicates server-side so a stale browser or direct API request cannot
+    // create multiple supervisor/emergency escalation events for the same open case.
+    if (['supervisor_escalation','emergency_escalation'].includes(action)) {
+      const duplicate = await pool.query(
+        `SELECT 1 FROM monitoring_case_events WHERE case_id=$1 AND event_type=$2 LIMIT 1`,
+        [incident.id, action]
+      );
+      if (duplicate.rowCount) {
+        return res.status(409).json({
+          success:false,
+          error: action === 'supervisor_escalation'
+            ? 'This case has already been escalated to a supervisor'
+            : 'Emergency / 911 escalation has already been recorded for this case'
+        });
+      }
+    }
+
     let nextStatus = ['supervisor_escalation','emergency_escalation'].includes(action) ? 'escalated' : incident.status;
     let nextPriority = incident.priority;
     let label = baseLabel;
