@@ -7214,7 +7214,9 @@ async function monitoringActiveCasesByResident() {
            resident_response_at AS "residentResponseAt",
            handoff_to_operator_id AS "handoffToOperatorId", handoff_to_operator_name AS "handoffToOperatorName",
            handoff_requested_by_operator_id AS "handoffRequestedByOperatorId", handoff_requested_by_operator_name AS "handoffRequestedByOperatorName",
-           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt", updated_at AS "updatedAt"
+           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt",
+           COALESCE((SELECT MAX(e.created_at) FROM monitoring_case_events e WHERE e.case_id=monitoring_cases.id), accepted_at, opened_at) AS "lastActionAt",
+           updated_at AS "updatedAt"
     FROM monitoring_cases
     WHERE status IN ('open','accepted','escalated')
   `);
@@ -7232,7 +7234,9 @@ async function monitoringLatestCasesByResident() {
            resident_response_at AS "residentResponseAt",
            handoff_to_operator_id AS "handoffToOperatorId", handoff_to_operator_name AS "handoffToOperatorName",
            handoff_requested_by_operator_id AS "handoffRequestedByOperatorId", handoff_requested_by_operator_name AS "handoffRequestedByOperatorName",
-           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt", updated_at AS "updatedAt"
+           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt",
+           COALESCE((SELECT MAX(e.created_at) FROM monitoring_case_events e WHERE e.case_id=monitoring_cases.id), accepted_at, opened_at) AS "lastActionAt",
+           updated_at AS "updatedAt"
     FROM monitoring_cases
     ORDER BY resident_id, opened_at DESC
   `);
@@ -7249,7 +7253,9 @@ async function monitoringCasePayloadForResident(residentId) {
            resident_response_at AS "residentResponseAt",
            handoff_to_operator_id AS "handoffToOperatorId", handoff_to_operator_name AS "handoffToOperatorName",
            handoff_requested_by_operator_id AS "handoffRequestedByOperatorId", handoff_requested_by_operator_name AS "handoffRequestedByOperatorName",
-           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt", updated_at AS "updatedAt"
+           handoff_reason AS "handoffReason", handoff_requested_at AS "handoffRequestedAt",
+           COALESCE((SELECT MAX(e.created_at) FROM monitoring_case_events e WHERE e.case_id=monitoring_cases.id), accepted_at, opened_at) AS "lastActionAt",
+           updated_at AS "updatedAt"
     FROM monitoring_cases
     WHERE resident_id=$1
     ORDER BY CASE WHEN status IN ('open','accepted','escalated') THEN 0 ELSE 1 END, opened_at DESC
@@ -7263,6 +7269,7 @@ async function monitoringCasePayloadForResident(residentId) {
     FROM monitoring_case_events WHERE case_id=$1 ORDER BY created_at ASC
   `, [incident.id]);
   incident.timeline = events.rows;
+  incident.lastActionAt = events.rows.length ? events.rows[events.rows.length - 1].createdAt : (incident.acceptedAt || incident.openedAt || null);
   return incident;
 }
 
@@ -7344,6 +7351,29 @@ function monitoringPriorityRank(priority) {
   return ({ P1:1, P2:2, P3:3, P4:4, P5:5 })[cleanText(priority).toUpperCase()] || 5;
 }
 
+const MONITORING_CASE_RESPONSE_MINUTES = Object.freeze({ P1:5, P2:15, P3:30, P4:60, P5:120 });
+
+function monitoringCaseAttention(incident, effectivePriority = null) {
+  if (!incident || !['open','accepted','escalated'].includes(cleanText(incident.status).toLowerCase())) return null;
+  const priority = cleanText(effectivePriority || incident.priority || 'P5').toUpperCase() || 'P5';
+  const thresholdMinutes = MONITORING_CASE_RESPONSE_MINUTES[priority] || MONITORING_CASE_RESPONSE_MINUTES.P5;
+  const lastActionRaw = incident.lastActionAt || incident.acceptedAt || incident.openedAt;
+  const lastActionMs = new Date(lastActionRaw || 0).getTime();
+  if (!Number.isFinite(lastActionMs) || lastActionMs <= 0) return { priority, thresholdMinutes, overdue:false, supervisorAttention:false, elapsedMinutes:0, overdueMinutes:0, minutesRemaining:thresholdMinutes, lastActionAt:lastActionRaw || null };
+  const elapsedMinutes = Math.max(0, (Date.now() - lastActionMs) / 60000);
+  const overdue = elapsedMinutes >= thresholdMinutes;
+  return {
+    priority,
+    thresholdMinutes,
+    overdue,
+    supervisorAttention: overdue && (priority === 'P1' || priority === 'P2'),
+    elapsedMinutes: Math.floor(elapsedMinutes),
+    overdueMinutes: overdue ? Math.floor(elapsedMinutes - thresholdMinutes) : 0,
+    minutesRemaining: overdue ? 0 : Math.max(0, Math.ceil(thresholdMinutes - elapsedMinutes)),
+    lastActionAt: lastActionRaw || null
+  };
+}
+
 function monitoringOperationalCaseState(resident, activeCase, latestCase) {
   const underlyingPriority = cleanText(resident?.priority || 'P5').toUpperCase() || 'P5';
   if (activeCase) {
@@ -7388,13 +7418,14 @@ app.get("/monitoring/api/dashboard", async (req, res) => {
       }
       const operational = monitoringOperationalCaseState(resident, resident.activeCase, resident.latestCase);
       Object.assign(resident, operational);
+      resident.caseAttention = monitoringCaseAttention(resident.activeCase, resident.queuePriority);
     }
     if (resolvedCasesToMarkCleared.length) {
       await pool.query(`UPDATE monitoring_cases SET signal_cleared_at=COALESCE(signal_cleared_at,NOW()),updated_at=NOW() WHERE id = ANY($1::uuid[])`, [resolvedCasesToMarkCleared]);
     }
     const order = { P1:1, P2:2, P3:3, P4:4, RESOLVED:5, P5:6 };
-    residents.sort((a,b) => ((order[a.queuePriority] || 99)-(order[b.queuePriority] || 99)) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
-    const counts = residents.reduce((acc,row)=>{ const key=row.queuePriority || row.priority || 'P5'; acc[key]=(acc[key]||0)+1; return acc; }, {P1:0,P2:0,P3:0,P4:0,P5:0,RESOLVED:0});
+    residents.sort((a,b) => ((order[a.queuePriority] || 99)-(order[b.queuePriority] || 99)) || (Number(Boolean(b.caseAttention?.overdue))-Number(Boolean(a.caseAttention?.overdue))) || cleanText(a.residentName).localeCompare(cleanText(b.residentName)));
+    const counts = residents.reduce((acc,row)=>{ const key=row.queuePriority || row.priority || 'P5'; acc[key]=(acc[key]||0)+1; if (row.caseAttention?.overdue) acc.OVERDUE=(acc.OVERDUE||0)+1; return acc; }, {P1:0,P2:0,P3:0,P4:0,P5:0,RESOLVED:0,OVERDUE:0});
     return res.json({ success:true, generatedAt:summary.generatedAt, operator:{id:operator.id,displayName:operator.displayName,role:operator.role}, counts, residents });
   } catch (error) {
     console.error("Monitoring dashboard failed:", error);
@@ -7421,6 +7452,8 @@ app.get("/monitoring/api/residents/:residentId", async (req, res) => {
     }
     const operational = monitoringOperationalCaseState(payload, activeCase, incident);
     Object.assign(payload, operational);
+    if (activeCase) activeCase.caseAttention = monitoringCaseAttention(activeCase, operational.queuePriority);
+    if (incident && activeCase && String(incident.id) === String(activeCase.id)) incident.caseAttention = activeCase.caseAttention;
     const currentIncident = incident?.status === 'resolved' && !operational.operationalResolved ? null : incident;
     return res.json({ success:true, generatedAt:summary.generatedAt, resident:{ ...payload, accessCode:accessCodeResult.rows[0]?.accessCode || null, incident:currentIncident, latestResolvedCase:incident?.status === 'resolved' ? incident : null } });
   } catch (error) {

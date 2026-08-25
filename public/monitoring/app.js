@@ -368,12 +368,32 @@ function renderMetrics() {
     ['P3 Technical', c.P3 || 0, 'p3'],
     ['P4 Observe', c.P4 || 0, 'p4'],
     ['Resolved', c.RESOLVED || 0, 'resolved'],
+    ['Overdue', c.OVERDUE || 0, 'overdue'],
     ['P5 Normal / Info', c.P5 || 0, 'p5'],
     ['Residents', total, ''],
   ];
   $('#metrics').innerHTML = items.map(([k, v, cl]) =>
     `<div class="metric"><div class="k">${k}</div><div class="v ${cl}">${v}</div></div>`
   ).join('');
+}
+
+function caseAttentionBadge(attention, compact = false) {
+  if (!attention) return '';
+  if (attention.overdue) {
+    const label = attention.supervisorAttention ? 'SUPERVISOR ATTENTION' : 'OVERDUE';
+    const detail = attention.overdueMinutes > 0 ? ` · ${attention.overdueMinutes}m` : '';
+    return `<span class="case-attention overdue${compact ? ' compact' : ''}">${label}${detail}</span>`;
+  }
+  return compact ? '' : `<span class="case-attention current">Next action due in ${Math.max(0, Number(attention.minutesRemaining || 0))}m</span>`;
+}
+
+function responseClockMarkup(attention) {
+  if (!attention) return '';
+  const last = attention.lastActionAt ? fmtDate(attention.lastActionAt) : '—';
+  if (attention.overdue) {
+    return `<div class="response-clock overdue"><div><div class="response-clock-label">Unattended case protection</div><strong>${attention.supervisorAttention ? 'Supervisor attention required' : 'Response action overdue'}</strong><div class="small">No meaningful case action for ${Number(attention.elapsedMinutes || 0)} min. ${escapeHtml(attention.priority || '')} response interval: ${Number(attention.thresholdMinutes || 0)} min.</div></div><div class="response-clock-meta">Last action<br><b>${escapeHtml(last)}</b></div></div>`;
+  }
+  return `<div class="response-clock"><div><div class="response-clock-label">Response clock</div><strong>Active — next action due in ${Math.max(0, Number(attention.minutesRemaining || 0))} min</strong><div class="small">${escapeHtml(attention.priority || '')} response interval: ${Number(attention.thresholdMinutes || 0)} min.</div></div><div class="response-clock-meta">Last action<br><b>${escapeHtml(last)}</b></div></div>`;
 }
 
 function renderQueue() {
@@ -385,9 +405,9 @@ function renderQueue() {
   }
 
   $('#queue').innerHTML = rows.map((r) => `
-    <div class="queue-row ${r.residentId === state.selectedId ? 'active' : ''}" data-id="${escapeHtml(r.residentId)}">
+    <div class="queue-row ${r.residentId === state.selectedId ? 'active' : ''} ${r.caseAttention?.overdue ? 'case-overdue-row' : ''}" data-id="${escapeHtml(r.residentId)}">
       <div>${r.operationalResolved ? `<span class="priority resolved-priority">RES</span>` : `<span class="priority ${String(r.queuePriority || r.priority || 'P5').toLowerCase()}">${escapeHtml(r.queuePriority || r.priority || 'P5')}</span>`}</div>
-      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div>${!r.operationalResolved && r.activeCase && r.queuePriority && r.underlyingPriority && r.queuePriority !== r.underlyingPriority ? `<div class="small"><strong>Response ${escapeHtml(r.queuePriority)}</strong> · Underlying ${escapeHtml(r.underlyingPriority)}</div>` : ''}${r.accessCode ? `<div class="access-code-inline">Access code <strong>${escapeHtml(r.accessCode)}</strong></div>` : ''}${r.activeCase ? `<div class="case-badge">${escapeHtml(r.activeCase.assignedOperatorName ? `Assigned: ${r.activeCase.assignedOperatorName}` : 'Open case')}</div>` : (r.operationalResolved ? `<div class="case-badge case-badge-resolved">${escapeHtml(r.latestCase?.resolvedByOperatorName ? `Resolved: ${r.latestCase.resolvedByOperatorName}` : 'Resolved')}</div>` : '')}</div>
+      <div><div class="resident-name">${escapeHtml(r.residentName)}</div><div class="small">${escapeHtml(r.location || 'Location not set')}</div>${!r.operationalResolved && r.activeCase && r.queuePriority && r.underlyingPriority && r.queuePriority !== r.underlyingPriority ? `<div class="small"><strong>Response ${escapeHtml(r.queuePriority)}</strong> · Underlying ${escapeHtml(r.underlyingPriority)}</div>` : ''}${r.accessCode ? `<div class="access-code-inline">Access code <strong>${escapeHtml(r.accessCode)}</strong></div>` : ''}${r.activeCase ? `<div class="case-badge">${escapeHtml(r.activeCase.assignedOperatorName ? `Assigned: ${r.activeCase.assignedOperatorName}` : 'Open case')}</div>${caseAttentionBadge(r.caseAttention, true)}` : (r.operationalResolved ? `<div class="case-badge case-badge-resolved">${escapeHtml(r.latestCase?.resolvedByOperatorName ? `Resolved: ${r.latestCase.resolvedByOperatorName}` : 'Resolved')}</div>` : '')}</div>
       <div><div class="status-title">${escapeHtml(r.operationalResolved ? 'Resolved' : (r.activeCase?.residentResponseLabel || r.actionTitle || r.aiStatus || 'Monitoring'))}</div><div class="status-summary">${escapeHtml(r.operationalResolved ? `Operator case closed. Underlying ${r.underlyingPriority || r.priority || 'monitoring'} signal remains visible for reference.` : (r.activeCase?.residentResponseCode === 'need_help' ? 'Resident responded to a Good Shepherd check-in and requested help. Immediate operator action is required.' : r.activeCase?.residentResponseCode === 'call_me' ? 'Resident responded to a Good Shepherd check-in and requested a call from staff.' : (r.actionSummary || r.aiExplanation || r.patternExplanation || 'No additional explanation')))}</div></div>
       <div class="sensor-pill">${r.onlineSensorCount || 0}/${r.sensorCount || 0} online<div class="small">${escapeHtml(r.coverageStatus || '')}</div></div>
       <div class="last-col small">${r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity'}</div>
@@ -636,12 +656,13 @@ function renderResident(r) {
   const protocolGuidance = activeCase ? latestProtocolGuidance(incident) : null;
   const supervisorEscalated = activeCase && caseHasEvent(incident, 'supervisor_escalation');
   const canSupervisorDisposition = supervisorEscalated && ['supervisor','admin'].includes(state.operator?.role);
+  const caseAttention = activeCase ? (incident.caseAttention || null) : null;
 
   panel.innerHTML = `
     <div class="resident-sticky-header">
       <div class="resident-head compact-head">
         <div class="resident-title-line">${resolvedCase ? `<span class="priority resolved-priority">RES</span>` : `<span class="priority ${String(r.queuePriority || r.priority || 'P5').toLowerCase()}">${escapeHtml(r.queuePriority || r.priority || 'P5')}</span>`}<div><h2>${escapeHtml(r.residentName)}</h2><div class="location">${escapeHtml(r.location || 'Location not set')}${resolvedCase ? ` · Underlying ${escapeHtml(r.underlyingPriority || r.priority || '')}` : (activeCase && r.queuePriority && r.underlyingPriority && r.queuePriority !== r.underlyingPriority ? ` · Response ${escapeHtml(r.queuePriority)} · Underlying ${escapeHtml(r.underlyingPriority)}` : '')}</div></div></div>
-        <div class="sticky-facts"><span><b>${escapeHtml(caseState)}</b>${activeCase && incident.assignedOperatorName ? ` · ${escapeHtml(incident.assignedOperatorName)}` : (resolvedCase && incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : '')}</span>${r.accessCode ? `<span class="access-code-pill"><b>Access code</b> ${escapeHtml(r.accessCode)}</span>` : ''}<span>${activeCase ? `Open ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}` : (resolvedCase ? `Closed ${escapeHtml(fmtDate(incident.resolvedAt))}` : '—')}</span><span>${escapeHtml(sensorSummary)}</span><span>Last ${escapeHtml(r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity')}</span></div>
+        <div class="sticky-facts"><span><b>${escapeHtml(caseState)}</b>${activeCase && incident.assignedOperatorName ? ` · ${escapeHtml(incident.assignedOperatorName)}` : (resolvedCase && incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : '')}</span>${activeCase ? caseAttentionBadge(caseAttention, true) : ''}${r.accessCode ? `<span class="access-code-pill"><b>Access code</b> ${escapeHtml(r.accessCode)}</span>` : ''}<span>${activeCase ? `Open ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}` : (resolvedCase ? `Closed ${escapeHtml(fmtDate(incident.resolvedAt))}` : '—')}</span><span>${escapeHtml(sensorSummary)}</span><span>Last ${escapeHtml(r.lastMotionAt ? fmtDate(r.lastMotionAt) : 'No activity')}</span></div>
       </div>
     </div>
     <div class="section">
@@ -664,6 +685,7 @@ function renderResident(r) {
       <h3>Operator case</h3>
       ${!activeCase ? `<div class="case-empty ${resolvedCase ? 'case-resolved-summary' : ''}">${resolvedCase ? `<div><strong>Resolved</strong><div class="small">Closed ${escapeHtml(fmtDate(incident.resolvedAt))}${incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : ''}</div>${incident.resolution ? `<div class="resolution-summary">${escapeHtml(incident.resolution)}</div>` : ''}<div class="notice">The operator case is closed. The underlying live signal is retained for reference but is removed from active P1-P4 response counts until it clears/re-triggers or a new case is accepted.</div></div>` : `<div>No active case is assigned for this resident.</div>`}<button id="acceptCaseBtn" class="primary case-primary" type="button">${resolvedCase ? 'Accept New Case' : 'Accept Case'}</button></div>` : `
         <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)} · ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
+        ${responseClockMarkup(caseAttention)}
         ${incident.handoffToOperatorId ? `<div class="handoff-banner"><div><strong>Handoff pending → ${escapeHtml(incident.handoffToOperatorName || 'receiving staff')}</strong><div class="small">${incident.handoffReason ? `Reason: ${escapeHtml(incident.handoffReason)} · ` : ''}${incident.handoffRequestedAt ? escapeHtml(fmtDate(incident.handoffRequestedAt)) : ''}</div><div class="small">${escapeHtml(incident.assignedOperatorName || 'Current operator')} remains responsible until the handoff is accepted.</div></div><div class="handoff-banner-actions">${String(incident.handoffToOperatorId) === String(state.operator?.id) ? '<button id="acceptHandoffBtn" class="primary" type="button">Accept Handoff</button>' : ''}${mine || ['supervisor','admin'].includes(state.operator?.role) ? '<button id="cancelHandoffBtn" class="ghost" type="button">Cancel Handoff</button>' : ''}</div></div>` : ''}
         ${protocolGuidance ? `<div class="protocol-guidance"><div class="protocol-guidance-label">Required next step</div><strong>${escapeHtml(protocolGuidance.label)}</strong>${protocolGuidance.note ? `<div>${escapeHtml(protocolGuidance.note)}</div>` : ''}</div>` : ''}
         ${canSupervisorDisposition ? `<div class="action-group supervisor-disposition-group"><div class="action-group-title">Supervisor disposition</div><div class="notice">Record the supervisory decision without taking ownership away from the assigned operator.</div><div class="action-grid compact-actions">
