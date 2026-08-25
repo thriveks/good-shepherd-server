@@ -7549,6 +7549,20 @@ app.post("/monitoring/api/cases/:caseId/actions", async (req, res) => {
       guidance = monitoringProtocolGuidance(action, outcome, incident.priority);
       nextPriority = guidance.priority || incident.priority;
       if (guidance.escalate) nextStatus = 'escalated';
+    } else if (action === 'supervisor_escalation') {
+      guidance = {
+        priority: nextPriority,
+        escalate: true,
+        label: `${cleanText(nextPriority || 'P5').toUpperCase()} — Supervisor review required`,
+        note: 'Case escalated to supervisor. Maintain the current priority until a supervisor records the appropriate disposition or emergency response action.'
+      };
+    } else if (action === 'emergency_escalation') {
+      guidance = {
+        priority: nextPriority,
+        escalate: true,
+        label: `${cleanText(nextPriority || 'P5').toUpperCase()} — Emergency response initiated`,
+        note: 'Emergency / 911 escalation has been recorded. Keep the case open and document response details and final disposition.'
+      };
     }
 
     await pool.query(`UPDATE monitoring_cases SET status=$2,priority=$3,updated_at=NOW() WHERE id=$1`, [incident.id,nextStatus,nextPriority]);
