@@ -564,6 +564,31 @@ function openContactOutcomeDialog(action) {
   });
 }
 
+function openSupervisorDispositionDialog(disposition, title, prompt, requireNote = true) {
+  return new Promise((resolve) => {
+    document.getElementById('supervisorDispositionModal')?.remove();
+    const wrap = document.createElement('div');
+    wrap.id = 'supervisorDispositionModal';
+    wrap.className = 'modal-backdrop';
+    wrap.innerHTML = `<form class="contact-outcome-modal">
+      <div class="contact-outcome-head"><div><h2>${escapeHtml(title)}</h2><p>${escapeHtml(prompt)}</p></div><button type="button" class="ghost" data-cancel>Cancel</button></div>
+      <label>Supervisor disposition note ${requireNote ? '' : '<span class="muted">(optional)</span>'}<textarea id="supervisorDispositionNote" placeholder="Document the reason, instructions, or disposition details." ${requireNote ? 'required' : ''}></textarea></label>
+      <div class="contact-outcome-actions"><button type="submit" class="primary">Record Disposition</button></div>
+    </form>`;
+    document.body.appendChild(wrap);
+    const finish = (value) => { wrap.remove(); resolve(value); };
+    wrap.querySelector('[data-cancel]').addEventListener('click', () => finish(null));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) finish(null); });
+    wrap.querySelector('form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const note = wrap.querySelector('#supervisorDispositionNote').value.trim();
+      if (requireNote && !note) return;
+      finish({ disposition, note });
+    });
+    requestAnimationFrame(() => wrap.querySelector('#supervisorDispositionNote')?.focus());
+  });
+}
+
 function elapsedText(openedAt, closedAt) {
   if (!openedAt) return '—';
   const start = new Date(openedAt).getTime();
@@ -604,6 +629,8 @@ function renderResident(r) {
   const resolvedCase = Boolean(r.operationalResolved && incident && incident.status === 'resolved');
   const caseState = activeCase ? String(incident.status || 'open').toUpperCase() : (resolvedCase ? 'RESOLVED' : 'NO ACTIVE CASE');
   const protocolGuidance = activeCase ? latestProtocolGuidance(incident) : null;
+  const supervisorEscalated = activeCase && caseHasEvent(incident, 'supervisor_escalation');
+  const canSupervisorDisposition = supervisorEscalated && ['supervisor','admin'].includes(state.operator?.role);
 
   panel.innerHTML = `
     <div class="resident-sticky-header">
@@ -633,6 +660,13 @@ function renderResident(r) {
       ${!activeCase ? `<div class="case-empty ${resolvedCase ? 'case-resolved-summary' : ''}">${resolvedCase ? `<div><strong>Resolved</strong><div class="small">Closed ${escapeHtml(fmtDate(incident.resolvedAt))}${incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : ''}</div>${incident.resolution ? `<div class="resolution-summary">${escapeHtml(incident.resolution)}</div>` : ''}<div class="notice">The operator case is closed. The underlying live signal is retained for reference but is removed from active P1-P4 response counts until it clears/re-triggers or a new case is accepted.</div></div>` : `<div>No active case is assigned for this resident.</div>`}<button id="acceptCaseBtn" class="primary case-primary" type="button">${resolvedCase ? 'Accept New Case' : 'Accept Case'}</button></div>` : `
         <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)} · ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
         ${protocolGuidance ? `<div class="protocol-guidance"><div class="protocol-guidance-label">Required next step</div><strong>${escapeHtml(protocolGuidance.label)}</strong>${protocolGuidance.note ? `<div>${escapeHtml(protocolGuidance.note)}</div>` : ''}</div>` : ''}
+        ${canSupervisorDisposition ? `<div class="action-group supervisor-disposition-group"><div class="action-group-title">Supervisor disposition</div><div class="notice">Record the supervisory decision without taking ownership away from the assigned operator.</div><div class="action-grid compact-actions">
+          <button type="button" data-supervisor-disposition="continue_monitoring">Continue monitoring / contact attempts</button>
+          <button type="button" data-supervisor-disposition="return_to_operator">Return to operator with instructions</button>
+          <button type="button" data-supervisor-disposition="verified_safe">Resident verified safe</button>
+          <button type="button" data-supervisor-disposition="field_response">Request field response / welfare check</button>
+          ${caseHasEvent(incident, 'emergency_escalation') ? '<button type="button" class="danger-action" disabled>Emergency / 911 escalated ✓</button>' : '<button type="button" class="danger-action" data-supervisor-disposition="emergency_response">Initiate Emergency / 911 response</button>'}
+        </div></div>` : ''}
         ${mine ? `<div class="action-groups">
           <div class="action-group"><div class="action-group-title">Contact</div><div class="action-grid compact-actions">
             <button type="button" data-case-action="resident_call" data-success="Resident call attempt recorded">Call Resident</button>
@@ -707,6 +741,32 @@ function renderResident(r) {
       showCaseNotice('✓ Case accepted and assigned to you.');
     } catch (err) { showCaseNotice(err.message, 'error'); acceptBtn.disabled=false; }
   });
+
+  document.querySelectorAll('[data-supervisor-disposition]').forEach((btn) => btn.addEventListener('click', async () => {
+    const disposition = btn.dataset.supervisorDisposition;
+    const config = {
+      continue_monitoring: ['Continue monitoring / contact attempts', 'Direct the assigned operator to continue contact attempts and monitoring while the case remains open.', false],
+      return_to_operator: ['Return to operator with instructions', 'Enter the specific instructions the assigned operator must complete next.', true],
+      verified_safe: ['Resident verified safe', 'Document how safety was verified. The case will remain open until closure evidence is entered and the case is resolved.', true],
+      field_response: ['Request field response / welfare check', 'Document the field-response or welfare-check decision and any relevant instructions.', true],
+      emergency_response: ['Initiate Emergency / 911 response', 'This records a consequential emergency escalation. Document the reason and response details.', true],
+    }[disposition];
+    if (!config) return;
+    if (disposition === 'emergency_response' && !window.confirm('Record an Emergency / 911 supervisor disposition for this case?')) return;
+    const result = await openSupervisorDispositionDialog(disposition, config[0], config[1], config[2]);
+    if (!result) return;
+    btn.disabled = true;
+    try {
+      rememberPanelScroll();
+      const response = await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/supervisor-disposition`, { method:'POST', body:JSON.stringify(result) });
+      const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
+      state.selectedResident = data.resident;
+      renderResident(data.resident);
+      restorePanelScroll();
+      showCaseNotice(`✓ ${response.protocolGuidance?.label || 'Supervisor disposition recorded'}`);
+      loadDashboard().catch(() => {});
+    } catch (err) { showCaseNotice(err.message, 'error'); btn.disabled = false; }
+  }));
 
   document.querySelectorAll('[data-case-action]').forEach((btn) => btn.addEventListener('click', async () => {
     const action = btn.dataset.caseAction;

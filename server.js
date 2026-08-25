@@ -7262,6 +7262,14 @@ const MONITORING_CASE_ACTIONS = new Map([
   ['note', 'Operator note']
 ]);
 
+const MONITORING_SUPERVISOR_DISPOSITIONS = new Map([
+  ['continue_monitoring', { eventType:'supervisor_continue_monitoring', label:'Supervisor disposition — Continue monitoring', guidanceLabel:'Continue monitoring under supervisor direction', guidanceNote:'Continue resident/contact attempts and monitoring. Keep the case open at the current priority until a documented disposition is reached.' }],
+  ['return_to_operator', { eventType:'supervisor_return_to_operator', label:'Supervisor disposition — Return to operator', guidanceLabel:'Operator follow-up required', guidanceNote:'Supervisor returned the case to the assigned operator with instructions. Complete the directed follow-up and document the outcome.' }],
+  ['verified_safe', { eventType:'supervisor_verified_safe', label:'Supervisor disposition — Resident verified safe', guidanceLabel:'Safety verified — closure documentation required', guidanceNote:'Resident safety has been verified. Document the final disposition and resolve the case when closure evidence is complete.' }],
+  ['field_response', { eventType:'field_response', label:'Supervisor disposition — Field response requested', guidanceLabel:'Field response / welfare check in progress', guidanceNote:'A field response or welfare check has been requested. Keep the case open and document the response and final disposition.' }],
+  ['emergency_response', { eventType:'emergency_escalation', label:'Supervisor disposition — Emergency / 911 response', guidanceLabel:'Emergency response initiated', guidanceNote:'Emergency / 911 response has been initiated. Keep the case open and document response details and final disposition.' }]
+]);
+
 const MONITORING_CONTACT_ACTIONS = new Set(['resident_call', 'contact_1_call', 'contact_2_call']);
 const MONITORING_CONTACT_OUTCOMES = new Map([
   ['answered_safe', 'Answered — resident reported safe'],
@@ -7599,6 +7607,49 @@ app.post("/monitoring/api/cases/:caseId/actions", async (req, res) => {
     await writeMonitoringAudit(operator, req, "case_action", "case", incident.id, { action, label, outcome:outcome || null, note:note || null, nextPriority, nextStatus, protocolGuidance:guidance });
     return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId), protocolGuidance:guidance });
   } catch (error) { console.error("Monitoring case action failed:", error); return res.status(500).json({ success:false, error:"Failed to record case action" }); }
+});
+
+app.post("/monitoring/api/cases/:caseId/supervisor-disposition", async (req, res) => {
+  try {
+    const supervisor = await requireMonitoringSupervisor(req, res); if (!supervisor) return;
+    const disposition = cleanText(req.body?.disposition);
+    const note = cleanText(req.body?.note);
+    const config = MONITORING_SUPERVISOR_DISPOSITIONS.get(disposition);
+    if (!config) return res.status(400).json({ success:false, error:"Unsupported supervisor disposition" });
+    if (['return_to_operator','verified_safe','field_response','emergency_response'].includes(disposition) && !note) {
+      return res.status(400).json({ success:false, error:"A disposition note is required for this supervisor action" });
+    }
+
+    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,priority,assigned_operator_id AS "assignedOperatorId",assigned_operator_name AS "assignedOperatorName" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
+    const incident = found.rows[0];
+    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
+    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
+
+    const supervisorEscalation = await pool.query(`SELECT 1 FROM monitoring_case_events WHERE case_id=$1 AND event_type='supervisor_escalation' LIMIT 1`, [incident.id]);
+    if (!supervisorEscalation.rowCount) return res.status(409).json({ success:false, error:"This case has not been escalated for supervisor review" });
+
+    if (disposition === 'emergency_response') {
+      const duplicateEmergency = await pool.query(`SELECT 1 FROM monitoring_case_events WHERE case_id=$1 AND event_type='emergency_escalation' LIMIT 1`, [incident.id]);
+      if (duplicateEmergency.rowCount) return res.status(409).json({ success:false, error:"Emergency / 911 escalation has already been recorded for this case" });
+    }
+
+    const priority = cleanText(incident.priority || 'P5').toUpperCase() || 'P5';
+    const guidanceLabel = `${priority} — ${config.guidanceLabel}`;
+    await pool.query(`UPDATE monitoring_cases SET status='escalated',updated_at=NOW() WHERE id=$1`, [incident.id]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [
+      randomUUID(), incident.id, supervisor.id, supervisor.displayName, config.eventType, config.label, note || null,
+      JSON.stringify({ supervisorDisposition:disposition, assignedOperatorId:incident.assignedOperatorId || null, assignedOperatorName:incident.assignedOperatorName || null })
+    ]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'protocol_next_step',$5,$6,$7::jsonb)`, [
+      randomUUID(), incident.id, supervisor.id, supervisor.displayName, guidanceLabel, config.guidanceNote,
+      JSON.stringify({ sourceAction:'supervisor_disposition', disposition, priority })
+    ]);
+    await writeMonitoringAudit(supervisor, req, 'supervisor_disposition', 'case', incident.id, { disposition, note:note || null, priority, assignedOperatorId:incident.assignedOperatorId || null });
+    return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId), protocolGuidance:{ label:guidanceLabel, note:config.guidanceNote } });
+  } catch (error) {
+    console.error("Monitoring supervisor disposition failed:", error);
+    return res.status(500).json({ success:false, error:"Failed to record supervisor disposition" });
+  }
 });
 
 app.post("/monitoring/api/cases/:caseId/resolve", async (req, res) => {
