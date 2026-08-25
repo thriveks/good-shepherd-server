@@ -10,6 +10,7 @@ const state = {
   panelScrollTop: 0,
   caseNoticeTimer: null,
   drafts: {},
+  renderedCaseId: null,
 };
 
 const $ = (s) => document.querySelector(s);
@@ -274,31 +275,35 @@ if ($('#priorityFilter') && !Array.from($('#priorityFilter').options).some(o => 
 
 
 
-function draftKey(residentId, fieldId) {
-  return `${residentId || 'none'}:${fieldId}`;
+function draftKey(residentId, fieldId, caseId = null) {
+  // Case documentation belongs to one incident only. AI follow-up remains resident-scoped.
+  const scope = (fieldId === 'caseNote' || fieldId === 'resolutionNote')
+    ? `case:${caseId || 'none'}`
+    : 'resident';
+  return `${residentId || 'none'}:${scope}:${fieldId}`;
 }
 
-function captureResidentDrafts(residentId = state.selectedId) {
+function captureResidentDrafts(residentId = state.selectedId, caseId = state.renderedCaseId) {
   if (!residentId) return;
   ['caseNote', 'resolutionNote', 'followNote'].forEach((fieldId) => {
     const el = document.getElementById(fieldId);
-    if (el) state.drafts[draftKey(residentId, fieldId)] = el.value;
+    if (el) state.drafts[draftKey(residentId, fieldId, caseId)] = el.value;
   });
 }
 
-function restoreResidentDrafts(residentId = state.selectedId) {
+function restoreResidentDrafts(residentId = state.selectedId, caseId = null) {
   if (!residentId) return;
   ['caseNote', 'resolutionNote', 'followNote'].forEach((fieldId) => {
     const el = document.getElementById(fieldId);
     if (!el) return;
-    const key = draftKey(residentId, fieldId);
+    const key = draftKey(residentId, fieldId, caseId);
     if (Object.prototype.hasOwnProperty.call(state.drafts, key)) el.value = state.drafts[key];
     el.addEventListener('input', () => { state.drafts[key] = el.value; });
   });
 }
 
-function clearResidentDraft(residentId, fieldId) {
-  delete state.drafts[draftKey(residentId, fieldId)];
+function clearResidentDraft(residentId, fieldId, caseId = state.renderedCaseId) {
+  delete state.drafts[draftKey(residentId, fieldId, caseId)];
 }
 
 function residentEditorIsActive() {
@@ -718,7 +723,8 @@ function renderResident(r) {
       </form>
     </div>`;
 
-  restoreResidentDrafts(r.residentId);
+  restoreResidentDrafts(r.residentId, activeCase ? incident.id : null);
+  state.renderedCaseId = activeCase ? incident.id : null;
   requestAnimationFrame(() => { panel.scrollTop = priorScroll; });
 
   const takeoverBtn = $('#takeoverCaseBtn');
