@@ -507,8 +507,27 @@ function contactActionTitle(action) {
 
 function latestProtocolGuidance(incident) {
   const rows = Array.isArray(incident?.timeline) ? incident.timeline : [];
+  const priority = String(incident?.priority || 'P5').toUpperCase();
+
+  // Derive the effective workflow state from the most recent event that can
+  // change the required next step. This also repairs older open cases where
+  // a supervisor/emergency escalation was recorded before protocol_next_step
+  // events were introduced.
   for (let i = rows.length - 1; i >= 0; i -= 1) {
-    if (rows[i]?.eventType === 'protocol_next_step') return rows[i];
+    const eventType = rows[i]?.eventType;
+    if (eventType === 'emergency_escalation') {
+      return {
+        label: `${priority} — Emergency response initiated`,
+        note: 'Emergency / 911 escalation has been recorded. Keep the case open and document response details and final disposition.'
+      };
+    }
+    if (eventType === 'supervisor_escalation') {
+      return {
+        label: `${priority} — Supervisor review required`,
+        note: 'Case escalated to supervisor. Maintain the current priority until a supervisor records the appropriate disposition or emergency response action.'
+      };
+    }
+    if (eventType === 'protocol_next_step') return rows[i];
   }
   return null;
 }
