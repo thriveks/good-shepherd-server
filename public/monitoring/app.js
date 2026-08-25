@@ -487,6 +487,59 @@ function confirmCaseAction(action) {
   return prompts[action] ? window.confirm(prompts[action]) : true;
 }
 
+const CONTACT_ACTIONS = new Set(['resident_call','contact_1_call','contact_2_call']);
+
+function contactOutcomeOptions(action) {
+  const shared = [
+    ['answered_safe', action === 'resident_call' ? 'Answered — resident reports safe' : 'Answered — contact confirms resident safe'],
+    ['no_answer', 'No answer'],
+    ['voicemail', 'Voicemail left'],
+    ['unable_to_connect', 'Unable to connect'],
+  ];
+  if (action === 'resident_call') shared.splice(1, 0, ['answered_needs_help', 'Answered — resident needs assistance']);
+  else shared.splice(1, 0, ['answered_assisting', 'Answered — contact is checking on resident']);
+  return shared;
+}
+
+function contactActionTitle(action) {
+  return ({resident_call:'Call Resident',contact_1_call:'Call Contact #1',contact_2_call:'Call Contact #2'})[action] || 'Record Contact Outcome';
+}
+
+function latestProtocolGuidance(incident) {
+  const rows = Array.isArray(incident?.timeline) ? incident.timeline : [];
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    if (rows[i]?.eventType === 'protocol_next_step') return rows[i];
+  }
+  return null;
+}
+
+function openContactOutcomeDialog(action) {
+  return new Promise((resolve) => {
+    document.getElementById('contactOutcomeModal')?.remove();
+    const wrap = document.createElement('div');
+    wrap.id = 'contactOutcomeModal';
+    wrap.className = 'modal-backdrop';
+    const options = contactOutcomeOptions(action).map(([value,label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join('');
+    wrap.innerHTML = `<form class="contact-outcome-modal">
+      <div class="contact-outcome-head"><div><h2>${escapeHtml(contactActionTitle(action))}</h2><p>Record the actual result. Good Shepherd will add the outcome to the incident timeline and show the required next step.</p></div><button type="button" class="ghost" data-cancel>Cancel</button></div>
+      <label>Outcome<select id="contactOutcomeSelect" required><option value="" selected disabled>Select outcome…</option>${options}</select></label>
+      <label>Operator note <span class="muted">(optional)</span><textarea id="contactOutcomeNote" placeholder="What happened? Add details that will help the next operator or supervisor."></textarea></label>
+      <div class="contact-outcome-actions"><button type="submit" class="primary">Record Outcome</button></div>
+    </form>`;
+    document.body.appendChild(wrap);
+    const finish = (value) => { wrap.remove(); resolve(value); };
+    wrap.querySelector('[data-cancel]').addEventListener('click', () => finish(null));
+    wrap.addEventListener('click', (e) => { if (e.target === wrap) finish(null); });
+    wrap.querySelector('form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const outcome = wrap.querySelector('#contactOutcomeSelect').value;
+      if (!outcome) return;
+      finish({ outcome, note: wrap.querySelector('#contactOutcomeNote').value.trim() });
+    });
+    requestAnimationFrame(() => wrap.querySelector('#contactOutcomeSelect')?.focus());
+  });
+}
+
 function elapsedText(openedAt, closedAt) {
   if (!openedAt) return '—';
   const start = new Date(openedAt).getTime();
@@ -526,6 +579,7 @@ function renderResident(r) {
   const sensorSummary = `${r.onlineSensorCount ?? sensors.filter(s => s.isOnline).length}/${r.sensorCount ?? sensors.length} online`;
   const resolvedCase = Boolean(r.operationalResolved && incident && incident.status === 'resolved');
   const caseState = activeCase ? String(incident.status || 'open').toUpperCase() : (resolvedCase ? 'RESOLVED' : 'NO ACTIVE CASE');
+  const protocolGuidance = activeCase ? latestProtocolGuidance(incident) : null;
 
   panel.innerHTML = `
     <div class="resident-sticky-header">
@@ -554,12 +608,13 @@ function renderResident(r) {
       <h3>Operator case</h3>
       ${!activeCase ? `<div class="case-empty ${resolvedCase ? 'case-resolved-summary' : ''}">${resolvedCase ? `<div><strong>Resolved</strong><div class="small">Closed ${escapeHtml(fmtDate(incident.resolvedAt))}${incident.resolvedByOperatorName ? ` · ${escapeHtml(incident.resolvedByOperatorName)}` : ''}</div>${incident.resolution ? `<div class="resolution-summary">${escapeHtml(incident.resolution)}</div>` : ''}<div class="notice">The operator case is closed. The underlying live signal is retained for reference but is removed from active P1-P4 response counts until it clears/re-triggers or a new case is accepted.</div></div>` : `<div>No active case is assigned for this resident.</div>`}<button id="acceptCaseBtn" class="primary case-primary" type="button">${resolvedCase ? 'Accept New Case' : 'Accept Case'}</button></div>` : `
         <div class="case-status"><div><strong>${escapeHtml(String(incident.status).toUpperCase())}</strong><div class="small">Opened ${fmtDate(incident.openedAt)} · ${escapeHtml(elapsedText(incident.openedAt, incident.closedAt))}</div></div><div class="case-owner">${escapeHtml(incident.assignedOperatorName ? `Assigned to ${incident.assignedOperatorName}` : 'Unassigned')}</div></div>
+        ${protocolGuidance ? `<div class="protocol-guidance"><div class="protocol-guidance-label">Required next step</div><strong>${escapeHtml(protocolGuidance.label)}</strong>${protocolGuidance.note ? `<div>${escapeHtml(protocolGuidance.note)}</div>` : ''}</div>` : ''}
         ${mine ? `<div class="action-groups">
           <div class="action-group"><div class="action-group-title">Contact</div><div class="action-grid compact-actions">
-            <button type="button" data-case-action="resident_call" data-success="Resident call attempt recorded">Resident call attempt</button>
+            <button type="button" data-case-action="resident_call" data-success="Resident call attempt recorded">Call Resident</button>
             <button type="button" data-case-action="check_in_sent" data-success="Check-in sent">Send Check-In</button>
-            <button type="button" data-case-action="contact_1_call" data-success="Contact #1 call attempt recorded">Contact #1 call attempt</button>
-            <button type="button" data-case-action="contact_2_call" data-success="Contact #2 call attempt recorded">Contact #2 call attempt</button>
+            <button type="button" data-case-action="contact_1_call" data-success="Contact #1 call attempt recorded">Call Contact #1</button>
+            <button type="button" data-case-action="contact_2_call" data-success="Contact #2 call attempt recorded">Call Contact #2</button>
           </div></div>
           <div class="action-group"><div class="action-group-title">Escalation</div><div class="action-grid compact-actions">
             <button type="button" data-case-action="supervisor_escalation" data-success="Supervisor escalation recorded">Escalate to supervisor</button>
@@ -628,8 +683,15 @@ function renderResident(r) {
   document.querySelectorAll('[data-case-action]').forEach((btn) => btn.addEventListener('click', async () => {
     const action = btn.dataset.caseAction;
     if (!confirmCaseAction(action)) return;
+
+    let contactResult = null;
+    if (CONTACT_ACTIONS.has(action)) {
+      contactResult = await openContactOutcomeDialog(action);
+      if (!contactResult) return;
+    }
+
     btn.disabled = true;
-    const success = btn.dataset.success || 'Action recorded';
+    let success = btn.dataset.success || 'Action recorded';
     try {
       rememberPanelScroll();
       if (action === 'check_in_sent') {
@@ -641,7 +703,11 @@ function renderResident(r) {
           showCaseNotice('⚠ In-app check-in created, but APNs push was not delivered.', 'error');
         }
       } else {
-        await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify({ action, note:'' }) });
+        const body = CONTACT_ACTIONS.has(action)
+          ? { action, outcome:contactResult.outcome, note:contactResult.note }
+          : { action, note:'' };
+        const result = await api(`/monitoring/api/cases/${encodeURIComponent(incident.id)}/actions`, { method:'POST', body:JSON.stringify(body) });
+        if (result.protocolGuidance?.label) success = result.protocolGuidance.label;
       }
       const data = await api(`/monitoring/api/residents/${encodeURIComponent(state.selectedId)}`);
       state.selectedResident = data.resident;

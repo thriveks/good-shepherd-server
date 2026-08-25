@@ -7251,16 +7251,69 @@ async function monitoringCasePayloadForResident(residentId) {
 }
 
 const MONITORING_CASE_ACTIONS = new Map([
-  ['resident_call', 'Resident call attempt'],
+  ['resident_call', 'Resident call'],
   ['check_in_sent', 'Check-in sent'],
-  ['contact_1_call', 'Contact #1 call attempt'],
-  ['contact_2_call', 'Contact #2 call attempt'],
+  ['contact_1_call', 'Contact #1 call'],
+  ['contact_2_call', 'Contact #2 call'],
   ['supervisor_escalation', 'Escalated to supervisor'],
   ['technical_review', 'Technical review'],
   ['field_response', 'Field response requested'],
   ['emergency_escalation', 'Emergency / 911 escalation'],
   ['note', 'Operator note']
 ]);
+
+const MONITORING_CONTACT_ACTIONS = new Set(['resident_call', 'contact_1_call', 'contact_2_call']);
+const MONITORING_CONTACT_OUTCOMES = new Map([
+  ['answered_safe', 'Answered — resident reported safe'],
+  ['answered_needs_help', 'Answered — assistance requested'],
+  ['answered_assisting', 'Answered — contact is checking on resident'],
+  ['no_answer', 'No answer'],
+  ['voicemail', 'Voicemail left'],
+  ['unable_to_connect', 'Unable to connect']
+]);
+
+function monitoringContactOutcomeAllowed(action, outcome) {
+  if (!MONITORING_CONTACT_ACTIONS.has(action)) return false;
+  if (!MONITORING_CONTACT_OUTCOMES.has(outcome)) return false;
+  if (action === 'resident_call' && outcome === 'answered_assisting') return false;
+  if (action !== 'resident_call' && outcome === 'answered_needs_help') return false;
+  return true;
+}
+
+function monitoringProtocolGuidance(action, outcome, priority) {
+  const p = cleanText(priority || 'P5').toUpperCase() || 'P5';
+  if (outcome === 'answered_needs_help') {
+    return { priority:'P1', escalate:true, label:'P1 — Resident needs assistance', note:'Immediate operator response is required. Continue the escalation protocol until a documented disposition is reached.' };
+  }
+  if (outcome === 'answered_safe') {
+    return { priority:p, escalate:false, label:'Resident safety reported', note:'Document closure evidence and resolve the case when the operator is satisfied the current incident is addressed.' };
+  }
+  if (outcome === 'answered_assisting') {
+    return { priority:p, escalate:false, label:'Contact is checking on resident', note:'Keep the case open until the contact reports an outcome or the resident is otherwise reached.' };
+  }
+
+  const unsuccessful = ['no_answer','voicemail','unable_to_connect'].includes(outcome);
+  if (!unsuccessful) return { priority:p, escalate:false, label:'Continue response protocol', note:'Document the outcome and continue according to the resident response plan.' };
+
+  if (action === 'resident_call') {
+    if (p === 'P1') return { priority:'P1', escalate:true, label:'P1 — Resident not reached; contact #1 now', note:'Do not leave the case idle. Attempt Contact #1 immediately and continue escalation if the resident remains unverified.' };
+    if (p === 'P2') return { priority:'P2', escalate:false, label:'P2 — Resident not reached; contact #1 required', note:'Attempt Contact #1 and keep the case active until contact or disposition is documented.' };
+    return { priority:p, escalate:false, label:'Resident not reached; continue contact protocol', note:'Attempt the designated contact if the resident cannot be reached.' };
+  }
+
+  if (action === 'contact_1_call') {
+    if (p === 'P1') return { priority:'P1', escalate:true, label:'P1 — Contact #1 not reached; contact #2 now', note:'Continue immediately to Contact #2. Maintain P1 escalation until the resident is verified or a disposition is reached.' };
+    return { priority:p, escalate:false, label:'Contact #1 not reached; contact #2 required', note:'Attempt Contact #2 and document the result.' };
+  }
+
+  if (action === 'contact_2_call') {
+    if (p === 'P1') return { priority:'P1', escalate:true, label:'P1 — Contact sequence unsuccessful; escalation decision required', note:'Resident and designated contacts were not reached. Supervisor/emergency response decision is required; document the disposition.' };
+    if (p === 'P2') return { priority:'P2', escalate:true, label:'P2 — Contact sequence unsuccessful; supervisor review required', note:'Escalate to a supervisor for disposition because the resident and designated contacts were not reached.' };
+    return { priority:p, escalate:false, label:'Contact sequence unsuccessful', note:'Document the disposition or escalate according to the resident response plan.' };
+  }
+
+  return { priority:p, escalate:false, label:'Continue response protocol', note:'Document the outcome and continue according to the resident response plan.' };
+}
 
 
 function monitoringPriorityRank(priority) {
@@ -7473,18 +7526,46 @@ app.post("/monitoring/api/cases/:caseId/actions", async (req, res) => {
     const operator = await requireMonitoringOperator(req, res); if (!operator) return;
     const action = cleanText(req.body?.action);
     const note = cleanText(req.body?.note);
-    const label = MONITORING_CASE_ACTIONS.get(action);
-    if (!label) return res.status(400).json({ success:false, error:"Unsupported case action" });
-    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
+    const outcome = cleanText(req.body?.outcome);
+    const baseLabel = MONITORING_CASE_ACTIONS.get(action);
+    if (!baseLabel) return res.status(400).json({ success:false, error:"Unsupported case action" });
+    if (MONITORING_CONTACT_ACTIONS.has(action) && !monitoringContactOutcomeAllowed(action, outcome)) {
+      return res.status(400).json({ success:false, error:"A valid contact outcome is required" });
+    }
+    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,priority,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
     const incident = found.rows[0];
     if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
     if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
     if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Accept this case before recording operator actions" });
-    const nextStatus = ['supervisor_escalation','emergency_escalation'].includes(action) ? 'escalated' : incident.status;
-    await pool.query(`UPDATE monitoring_cases SET status=$2,updated_at=NOW() WHERE id=$1`, [incident.id,nextStatus]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,$5,$6,$7)`, [randomUUID(),incident.id,operator.id,operator.displayName,action,label,note || null]);
-    await writeMonitoringAudit(operator, req, "case_action", "case", incident.id, { action, label, note:note || null });
-    return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
+
+    let nextStatus = ['supervisor_escalation','emergency_escalation'].includes(action) ? 'escalated' : incident.status;
+    let nextPriority = incident.priority;
+    let label = baseLabel;
+    let guidance = null;
+
+    if (MONITORING_CONTACT_ACTIONS.has(action)) {
+      const outcomeLabel = MONITORING_CONTACT_OUTCOMES.get(outcome);
+      label = `${baseLabel} — ${outcomeLabel}`;
+      guidance = monitoringProtocolGuidance(action, outcome, incident.priority);
+      nextPriority = guidance.priority || incident.priority;
+      if (guidance.escalate) nextStatus = 'escalated';
+    }
+
+    await pool.query(`UPDATE monitoring_cases SET status=$2,priority=$3,updated_at=NOW() WHERE id=$1`, [incident.id,nextStatus,nextPriority]);
+    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [
+      randomUUID(), incident.id, operator.id, operator.displayName, action, label, note || null,
+      JSON.stringify({ outcome: outcome || null, outcomeLabel: outcome ? MONITORING_CONTACT_OUTCOMES.get(outcome) : null, protocolDriven:Boolean(guidance) })
+    ]);
+
+    if (guidance) {
+      await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'protocol_next_step',$5,$6,$7::jsonb)`, [
+        randomUUID(), incident.id, operator.id, operator.displayName, guidance.label, guidance.note,
+        JSON.stringify({ sourceAction:action, outcome, priority:nextPriority, escalated:guidance.escalate })
+      ]);
+    }
+
+    await writeMonitoringAudit(operator, req, "case_action", "case", incident.id, { action, label, outcome:outcome || null, note:note || null, nextPriority, nextStatus, protocolGuidance:guidance });
+    return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId), protocolGuidance:guidance });
   } catch (error) { console.error("Monitoring case action failed:", error); return res.status(500).json({ success:false, error:"Failed to record case action" }); }
 });
 
