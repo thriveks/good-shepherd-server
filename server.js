@@ -5057,6 +5057,29 @@ async function getLatestHumanPresenceFirmwareRelease() {
   return result.rows[0] || null;
 }
 
+function deviceUsesHumanPresenceFirmware(node, sensor) {
+  const signals = [
+    sensor?.sensorType,
+    sensor?.sourceKey,
+    sensor?.sourceName,
+    node?.softwareVersion,
+    node?.nodeName
+  ]
+    .map((value) => cleanText(value).toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+
+  return signals.includes("human_presence") ||
+    signals.includes("human-presence") ||
+    signals.includes("human presence") ||
+    signals.includes("presence-") ||
+    signals.includes("presence sensor") ||
+    signals.includes("ld2410") ||
+    signals.includes("motion_presence") ||
+    signals.includes("motion-presence") ||
+    signals.includes("motion + presence");
+}
+
 async function upsertNodeFromRegistration({
   nodeId,
   nodeName,
@@ -11638,14 +11661,26 @@ app.post("/firmware/update-node", async (req, res) => {
     let firmwareVersion = explicitFirmwareVersion;
     let firmwareUrl = explicitFirmwareUrl;
     let sha256 = explicitSha256;
+    let firmwareFamily = "explicit";
 
     if (!firmwareVersion || !firmwareUrl) {
-      const latest = await getLatestFirmwareRelease();
+      const sensor = await getExistingSensorForDeviceIdentity({
+        sourceKey: "",
+        nodeId
+      });
+      const useHumanPresenceRelease = deviceUsesHumanPresenceFirmware(node, sensor);
+      const latest = useHumanPresenceRelease
+        ? await getLatestHumanPresenceFirmwareRelease()
+        : await getLatestFirmwareRelease();
+
+      firmwareFamily = useHumanPresenceRelease ? "human_presence" : "motion";
 
       if (!latest) {
         return res.status(404).json({
           success: false,
-          error: "No active firmware release found. Create one first with POST /firmware/releases."
+          error: useHumanPresenceRelease
+            ? "No active human-presence firmware release found. Create one first with POST /firmware/human-presence/releases."
+            : "No active motion firmware release found. Create one first with POST /firmware/releases."
         });
       }
 
@@ -11674,7 +11709,8 @@ app.post("/firmware/update-node", async (req, res) => {
   payload: {
     firmwareVersion,
     firmwareUrl,
-    sha256
+    sha256,
+    firmwareFamily
   },
   requestedBy,
   supersedeExisting: true
