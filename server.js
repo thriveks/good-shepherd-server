@@ -231,6 +231,23 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS firmware_releases_created_at_idx ON firmware_releases (created_at)`);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS human_presence_firmware_releases (
+      id UUID PRIMARY KEY,
+      firmware_version TEXT NOT NULL UNIQUE,
+      firmware_url TEXT NOT NULL,
+      sha256 TEXT,
+      release_notes TEXT,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS human_presence_firmware_releases_is_active_idx ON human_presence_firmware_releases (is_active)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS human_presence_firmware_releases_created_at_idx ON human_presence_firmware_releases (created_at)`);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS device_mappings (
       source_key TEXT PRIMARY KEY,
       source_name TEXT NOT NULL,
@@ -4835,6 +4852,22 @@ function firmwareReleaseSelectSQL() {
   `;
 }
 
+function humanPresenceFirmwareReleaseSelectSQL() {
+  return `
+    SELECT
+      id,
+      firmware_version AS "firmwareVersion",
+      firmware_url AS "firmwareUrl",
+      sha256,
+      release_notes AS "releaseNotes",
+      is_active AS "isActive",
+      created_by AS "createdBy",
+      created_at AS "createdAt",
+      updated_at AS "updatedAt"
+    FROM human_presence_firmware_releases
+  `;
+}
+
 async function getDeviceMapping(sourceKey) {
   const result = await pool.query(
     `
@@ -5002,6 +5035,19 @@ async function getLatestFirmwareRelease() {
   const result = await pool.query(
     `
     ${firmwareReleaseSelectSQL()}
+    WHERE is_active = TRUE
+    ORDER BY created_at DESC
+    LIMIT 1
+    `
+  );
+
+  return result.rows[0] || null;
+}
+
+async function getLatestHumanPresenceFirmwareRelease() {
+  const result = await pool.query(
+    `
+    ${humanPresenceFirmwareReleaseSelectSQL()}
     WHERE is_active = TRUE
     ORDER BY created_at DESC
     LIMIT 1
@@ -6943,6 +6989,10 @@ app.get("/", async (req, res) => {
         "GET /firmware/latest",
         "GET /firmware/download/:releaseTag/:assetName",
         "POST /firmware/update-node",
+        "GET /firmware/human-presence/download/:releaseTag/:assetName",
+        "GET /firmware/human-presence/releases",
+        "POST /firmware/human-presence/releases",
+        "GET /firmware/human-presence/latest",
         "GET /resident-candidates"
       ]
     }
@@ -11257,6 +11307,151 @@ app.get("/firmware/human-presence/download/:releaseTag/:assetName", async (req, 
     }
 
     return res.end();
+  }
+});
+
+app.get("/firmware/human-presence/releases", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const includeInactive = parseBooleanQuery(req.query.includeInactive);
+
+    const result = await pool.query(
+      `
+      ${humanPresenceFirmwareReleaseSelectSQL()}
+      WHERE ($1::boolean = TRUE OR is_active = TRUE)
+      ORDER BY created_at DESC
+      `,
+      [includeInactive]
+    );
+
+    return res.status(200).json({
+      success: true,
+      includeInactive,
+      count: result.rows.length,
+      releases: result.rows
+    });
+  } catch (error) {
+    console.error("Fetch human-presence firmware releases failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/firmware/human-presence/releases", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const firmwareVersion = cleanText(req.body?.firmwareVersion);
+    const firmwareUrl = cleanText(req.body?.firmwareUrl);
+    const sha256 = cleanOptionalText(req.body?.sha256);
+    const releaseNotes = cleanOptionalText(req.body?.releaseNotes);
+    const createdBy = cleanText(req.body?.createdBy) || "Good Shepherd Human Presence Firmware Manager";
+    const isActive = typeof req.body?.isActive === "boolean" ? req.body.isActive : true;
+
+    if (!firmwareVersion) {
+      return res.status(400).json({
+        success: false,
+        error: "firmwareVersion is required"
+      });
+    }
+
+    if (!isValidFirmwareUrl(firmwareUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: "firmwareUrl must be a valid HTTPS URL"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO human_presence_firmware_releases (
+        id,
+        firmware_version,
+        firmware_url,
+        sha256,
+        release_notes,
+        is_active,
+        created_by,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      ON CONFLICT (firmware_version)
+      DO UPDATE SET
+        firmware_url = EXCLUDED.firmware_url,
+        sha256 = EXCLUDED.sha256,
+        release_notes = EXCLUDED.release_notes,
+        is_active = EXCLUDED.is_active,
+        created_by = EXCLUDED.created_by,
+        updated_at = NOW()
+      RETURNING
+        id,
+        firmware_version AS "firmwareVersion",
+        firmware_url AS "firmwareUrl",
+        sha256,
+        release_notes AS "releaseNotes",
+        is_active AS "isActive",
+        created_by AS "createdBy",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      `,
+      [
+        randomUUID(),
+        firmwareVersion,
+        firmwareUrl,
+        sha256,
+        releaseNotes,
+        isActive,
+        createdBy
+      ]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Human-presence firmware release saved",
+      release: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Save human-presence firmware release failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/firmware/human-presence/latest", async (req, res) => {
+  try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
+
+    const latest = await getLatestHumanPresenceFirmwareRelease();
+
+    if (!latest) {
+      return res.status(404).json({
+        success: false,
+        error: "No active human-presence firmware release found"
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      release: latest
+    });
+  } catch (error) {
+    console.error("Fetch latest human-presence firmware release failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
