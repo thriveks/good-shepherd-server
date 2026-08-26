@@ -66,6 +66,7 @@ const ASSIGNMENT_AUTHORITIES = ["never_assigned", "device_bootstrap", "operator_
 const FIRMWARE_GITHUB_OWNER = process.env.FIRMWARE_GITHUB_OWNER || "thriveks";
 const FIRMWARE_GITHUB_REPO = process.env.FIRMWARE_GITHUB_REPO || "good-shepherd-esp32-firmware";
 const FIRMWARE_DOWNLOAD_ASSET_NAME = process.env.FIRMWARE_DOWNLOAD_ASSET_NAME || "good_shepherd_esp32_motion.ino.bin";
+const HUMAN_PRESENCE_FIRMWARE_DOWNLOAD_ASSET_NAME = process.env.HUMAN_PRESENCE_FIRMWARE_DOWNLOAD_ASSET_NAME || "good_shepherd_esp32_human_presence.ino.bin";
 const MAX_FIRMWARE_DOWNLOAD_REDIRECTS = 8;
 const FIRMWARE_DOWNLOAD_TIMEOUT_MS = 120000;
 
@@ -4451,6 +4452,149 @@ function proxyFirmwareDownload(upstreamUrl, res, redirectsRemaining = MAX_FIRMWA
       res.status(502).json({
         success: false,
         error: error.message || "Firmware proxy download failed"
+      });
+    } else {
+      res.destroy(error);
+    }
+  });
+}
+
+function isSafeHumanPresenceFirmwareAssetName(value) {
+  const assetName = cleanText(value);
+  return assetName === HUMAN_PRESENCE_FIRMWARE_DOWNLOAD_ASSET_NAME;
+}
+
+function githubHumanPresenceFirmwareAssetUrl(releaseTag, assetName) {
+  return `https://github.com/${encodeURIComponent(FIRMWARE_GITHUB_OWNER)}/${encodeURIComponent(FIRMWARE_GITHUB_REPO)}/releases/download/${encodeURIComponent(releaseTag)}/${encodeURIComponent(assetName)}`;
+}
+
+function copyHumanPresenceFirmwareDownloadHeaders(upstreamResponse, res) {
+  const contentLength = upstreamResponse.headers["content-length"];
+  const contentType = upstreamResponse.headers["content-type"] || "application/octet-stream";
+  const etag = upstreamResponse.headers.etag;
+  const lastModified = upstreamResponse.headers["last-modified"];
+
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.setHeader("Content-Disposition", `attachment; filename="${HUMAN_PRESENCE_FIRMWARE_DOWNLOAD_ASSET_NAME}"`);
+  res.setHeader("X-Good-Shepherd-Firmware-Proxy", "true");
+  res.setHeader("X-Good-Shepherd-Firmware-Family", "human-presence");
+
+  if (contentLength) {
+    res.setHeader("Content-Length", contentLength);
+  }
+
+  if (etag) {
+    res.setHeader("ETag", etag);
+  }
+
+  if (lastModified) {
+    res.setHeader("Last-Modified", lastModified);
+  }
+}
+
+function proxyHumanPresenceFirmwareDownload(upstreamUrl, res, redirectsRemaining = MAX_FIRMWARE_DOWNLOAD_REDIRECTS) {
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(upstreamUrl);
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: "Invalid upstream human-presence firmware URL"
+      });
+    }
+    return;
+  }
+
+  const client = firmwareDownloadClientForUrl(parsedUrl);
+
+  if (!client) {
+    if (!res.headersSent) {
+      res.status(502).json({
+        success: false,
+        error: "Unsupported upstream human-presence firmware URL protocol"
+      });
+    }
+    return;
+  }
+
+  const request = client.get(
+    parsedUrl,
+    {
+      headers: {
+        "User-Agent": "Good-Shepherd-Human-Presence-Firmware-Proxy/1.0",
+        "Accept": "application/octet-stream,*/*"
+      }
+    },
+    (upstreamResponse) => {
+      const statusCode = upstreamResponse.statusCode || 0;
+      const redirectLocation = upstreamResponse.headers.location;
+
+      if ([301, 302, 303, 307, 308].includes(statusCode) && redirectLocation) {
+        upstreamResponse.resume();
+
+        if (redirectsRemaining <= 0) {
+          if (!res.headersSent) {
+            res.status(502).json({
+              success: false,
+              error: "Human-presence firmware download failed: too many redirects"
+            });
+          }
+          return;
+        }
+
+        const nextUrl = new URL(redirectLocation, parsedUrl).toString();
+        proxyHumanPresenceFirmwareDownload(nextUrl, res, redirectsRemaining - 1);
+        return;
+      }
+
+      if (statusCode < 200 || statusCode >= 300) {
+        const chunks = [];
+        let totalBytes = 0;
+
+        upstreamResponse.on("data", (chunk) => {
+          if (totalBytes < 4096) {
+            chunks.push(chunk);
+            totalBytes += chunk.length;
+          }
+        });
+
+        upstreamResponse.on("end", () => {
+          const bodyPreview = Buffer.concat(chunks).toString("utf8").slice(0, 1000);
+
+          if (!res.headersSent) {
+            res.status(502).json({
+              success: false,
+              error: `Human-presence firmware upstream download failed with HTTP ${statusCode}`,
+              upstreamStatusCode: statusCode,
+              upstreamBodyPreview: bodyPreview
+            });
+          }
+        });
+
+        upstreamResponse.resume();
+        return;
+      }
+
+      copyHumanPresenceFirmwareDownloadHeaders(upstreamResponse, res);
+      res.status(200);
+      upstreamResponse.pipe(res);
+    }
+  );
+
+  request.setTimeout(FIRMWARE_DOWNLOAD_TIMEOUT_MS, () => {
+    request.destroy(new Error("Human-presence firmware upstream download timed out"));
+  });
+
+  request.on("error", (error) => {
+    console.error("Human-presence firmware proxy download failed:", error);
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        success: false,
+        error: error.message || "Human-presence firmware proxy download failed"
       });
     } else {
       res.destroy(error);
@@ -11065,6 +11209,45 @@ app.get("/firmware/download/:releaseTag/:assetName", async (req, res) => {
     return proxyFirmwareDownload(upstreamUrl, res);
   } catch (error) {
     console.error("Firmware download proxy failed:", error);
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+
+    return res.end();
+  }
+});
+
+app.get("/firmware/human-presence/download/:releaseTag/:assetName", async (req, res) => {
+  try {
+    const releaseTag = cleanText(req.params.releaseTag);
+    const assetName = cleanText(req.params.assetName);
+
+    if (!isSafeFirmwareReleaseTag(releaseTag)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid human-presence firmware release tag"
+      });
+    }
+
+    if (!isSafeHumanPresenceFirmwareAssetName(assetName)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid human-presence firmware asset name"
+      });
+    }
+
+    const upstreamUrl = githubHumanPresenceFirmwareAssetUrl(releaseTag, assetName);
+
+    console.log("Human-presence firmware download proxy requested:");
+    console.log(JSON.stringify({ releaseTag, assetName, upstreamUrl }, null, 2));
+
+    return proxyHumanPresenceFirmwareDownload(upstreamUrl, res);
+  } catch (error) {
+    console.error("Human-presence firmware download proxy failed:", error);
 
     if (!res.headersSent) {
       return res.status(500).json({
