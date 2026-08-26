@@ -5080,6 +5080,35 @@ function deviceUsesHumanPresenceFirmware(node, sensor) {
     signals.includes("motion + presence");
 }
 
+async function getLatestFirmwareReleaseForDevice({ nodeId, sourceKey }) {
+  const resolvedNodeId = cleanText(nodeId);
+  const resolvedSourceKey = cleanText(sourceKey);
+
+  let node = null;
+  let sensor = null;
+
+  if (resolvedNodeId) {
+    node = await getNodeById(resolvedNodeId);
+  }
+
+  if (resolvedNodeId || resolvedSourceKey) {
+    sensor = await getExistingSensorForDeviceIdentity({
+      sourceKey: resolvedSourceKey,
+      nodeId: resolvedNodeId
+    });
+  }
+
+  const firmwareFamily = deviceUsesHumanPresenceFirmware(node, sensor)
+    ? "human_presence"
+    : "motion";
+
+  const release = firmwareFamily === "human_presence"
+    ? await getLatestHumanPresenceFirmwareRelease()
+    : await getLatestFirmwareRelease();
+
+  return { firmwareFamily, release, node, sensor };
+}
+
 async function upsertNodeFromRegistration({
   nodeId,
   nodeName,
@@ -11601,18 +11630,49 @@ app.get("/firmware/latest", async (req, res) => {
       return;
     }
 
-    const latest = await getLatestFirmwareRelease();
+    const nodeId = cleanText(req.query?.nodeId);
+    const sourceKey = cleanText(req.query?.sourceKey);
 
-    if (!latest) {
+    // Backward compatibility: callers that do not identify a device continue
+    // to receive the motion release lane exactly as before. Device-aware callers
+    // are routed to the correct firmware family without requiring a UI-side
+    // hard-coded firmware decision.
+    if (!nodeId && !sourceKey) {
+      const latest = await getLatestFirmwareRelease();
+
+      if (!latest) {
+        return res.status(404).json({
+          success: false,
+          error: "No active firmware release found"
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        firmwareFamily: "motion",
+        release: latest
+      });
+    }
+
+    const { firmwareFamily, release } = await getLatestFirmwareReleaseForDevice({
+      nodeId,
+      sourceKey
+    });
+
+    if (!release) {
       return res.status(404).json({
         success: false,
-        error: "No active firmware release found"
+        firmwareFamily,
+        error: firmwareFamily === "human_presence"
+          ? "No active human-presence firmware release found"
+          : "No active motion firmware release found"
       });
     }
 
     return res.status(200).json({
       success: true,
-      release: latest
+      firmwareFamily,
+      release
     });
   } catch (error) {
     console.error("Fetch latest firmware release failed:", error);
@@ -11664,21 +11724,18 @@ app.post("/firmware/update-node", async (req, res) => {
     let firmwareFamily = "explicit";
 
     if (!firmwareVersion || !firmwareUrl) {
-      const sensor = await getExistingSensorForDeviceIdentity({
-        sourceKey: "",
-        nodeId
+      const resolved = await getLatestFirmwareReleaseForDevice({
+        nodeId,
+        sourceKey: ""
       });
-      const useHumanPresenceRelease = deviceUsesHumanPresenceFirmware(node, sensor);
-      const latest = useHumanPresenceRelease
-        ? await getLatestHumanPresenceFirmwareRelease()
-        : await getLatestFirmwareRelease();
-
-      firmwareFamily = useHumanPresenceRelease ? "human_presence" : "motion";
+      const latest = resolved.release;
+      firmwareFamily = resolved.firmwareFamily;
 
       if (!latest) {
         return res.status(404).json({
           success: false,
-          error: useHumanPresenceRelease
+          firmwareFamily,
+          error: firmwareFamily === "human_presence"
             ? "No active human-presence firmware release found. Create one first with POST /firmware/human-presence/releases."
             : "No active motion firmware release found. Create one first with POST /firmware/releases."
         });
