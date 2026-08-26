@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Good Shepherd Command Center</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Good Shepherd Command Center</h1>
+      <p id="statusText">Connecting to Render…</p>
+    </div>
+    <div class="top-actions">
+      <span id="liveDot" class="dot waiting"></span>
+      <span id="modeBadge" class="mode-badge live">LIVE</span>
+      <button id="resumeLiveButton" type="button" class="hidden">Resume live monitoring</button>
+      <a class="header-link" href="inventory.html">Inventory</a>
+      <button id="newResidentButton" type="button">New resident</button>
+      <button id="refreshButton" type="button">Refresh now</button>
+      <button id="settingsButton" type="button">Connection</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="metrics">
+      <article><span>Residents</span><strong id="residentCount">—</strong></article>
+      <article><span>Sensors</span><strong id="sensorCount">—</strong></article>
+      <article><span>Online</span><strong id="onlineCount">—</strong></article>
+      <article><span>Offline</span><strong id="offlineCount">—</strong></article>
+      <article><span>Unassigned</span><strong id="unassignedCount">—</strong></article>
+      <article><span>Updates</span><strong id="updateCount">—</strong></article>
+      <article><span>Archived</span><strong id="archivedCount">—</strong></article>
+    </section>
+
+    <section class="toolbar">
+      <label>Search
+        <input id="searchInput" type="search" placeholder="Resident, room, node, source key…">
+      </label>
+      <label>Show
+        <select id="filterSelect">
+          <option value="all">Everything</option>
+          <option value="assigned">Assigned only</option>
+          <option value="unassigned">Unassigned only</option>
+          <option value="online">Online only</option>
+          <option value="offline">Offline only</option>
+          <option value="updates">Updates available</option>
+        </select>
+      </label>
+      <label>View
+        <select id="viewSelect">
+          <option value="residents">Resident tree</option>
+          <option value="inventory">All sensors</option>
+        </select>
+      </label>
+      <button id="expandAllButton" type="button">Expand all</button>
+    </section>
+
+    <section id="messageBox" class="message hidden" role="status"></section>
+
+    <section class="layout">
+      <div class="tree-panel">
+        <h2 id="treeHeading">Resident → Room → Sensor</h2>
+        <div id="tree" class="tree" aria-live="polite"></div>
+      </div>
+      <aside>
+        <h2>Selected details and controls</h2>
+        <div id="details" class="details muted">Select a resident, room, or sensor.</div>
+      </aside>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" class="dialog-card">
+      <h2>Connection</h2>
+      <p>The webhook secret is kept only in this browser tab and is never saved.</p>
+      <label>Render server URL
+        <input id="apiBaseInput" type="url" value="https://good-shepherd-server-j06f.onrender.com">
+      </label>
+      <label>WEBHOOK_SECRET
+        <input id="secretInput" type="password" autocomplete="off" placeholder="Paste secret">
+      </label>
+      <label>Refresh interval
+        <select id="intervalInput">
+          <option value="3000">3 seconds</option>
+          <option value="5000" selected>5 seconds</option>
+          <option value="10000">10 seconds</option>
+          <option value="30000">30 seconds</option>
+        </select>
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel">Cancel</button>
+        <button id="connectButton" value="default">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
+
+  <dialog id="residentDialog">
+    <form id="residentForm" class="dialog-card">
+      <h2>Create resident</h2>
+      <label>Name
+        <input id="residentNameInput" required autocomplete="off">
+      </label>
+      <label>Location
+        <input id="residentLocationInput" required autocomplete="off" placeholder="Office, home, facility…">
+      </label>
+      <label>Alert level
+        <select id="residentAlertInput">
+          <option value="Normal">Normal</option>
+          <option value="Caution">Caution</option>
+          <option value="Critical">Critical</option>
+        </select>
+      </label>
+      <div class="dialog-actions">
+        <button id="cancelResidentButton" type="button">Cancel</button>
+        <button type="submit">Create resident</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="assignmentDialog">
+    <form id="assignmentForm" class="dialog-card">
+      <h2>Assign sensor</h2>
+      <p id="assignmentSensorLabel" class="muted"></p>
+      <label>Resident
+        <select id="assignmentResidentSelect" required></select>
+      </label>
+      <label>Location
+        <input id="assignmentLocationInput" required>
+      </label>
+      <label>Room
+        <input id="assignmentRoomInput" placeholder="Bedroom, kitchen, room 4…">
+      </label>
+      <div id="assignmentStatus" class="dialog-status muted">Ready to save.</div>
+      <div class="dialog-actions">
+        <button id="cancelAssignmentButton" type="button">Cancel</button>
+        <button id="saveAssignmentButton" type="submit">Save assignment</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="script.js"></script>
+</body>
+</html>
