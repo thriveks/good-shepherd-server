@@ -3,3 +3,6 @@ node_modules
 .DS_Store     
 # Local historical backups and snapshots
 _LOCAL_ARCHIVE/
+
+# Production firmware source may contain embedded device credentials
+firmware/production/**/good_shepherd_esp32_motion/
