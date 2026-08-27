@@ -10948,7 +10948,50 @@ app.post("/sensor-commands/:nodeId/cleanup", async (req, res) => {
     await client.query("BEGIN");
     didBegin = true;
 
-    const cleanup = await failStaleSensorCommands(client, nodeId);
+    // Manual cleanup must clear the active queue immediately. Automatic
+    // expiration remains handled separately by failStaleSensorCommands().
+    const cleanupResult = await client.query(
+      `
+      WITH active AS (
+        SELECT
+          command_id,
+          status AS previous_status
+        FROM node_commands
+        WHERE node_id = $1
+          AND command_type IN (
+            'reconfigure',
+            'factory_reset',
+            'reboot',
+            'ping',
+            'identify',
+            'locate',
+            'update_firmware'
+          )
+          AND status IN ('pending', 'running')
+        FOR UPDATE
+      ),
+      cleared AS (
+        UPDATE node_commands AS c
+        SET
+          status = 'failed',
+          completed_at = NOW(),
+          error = 'Manually cleared from sensor command queue'
+        FROM active
+        WHERE c.command_id = active.command_id
+        RETURNING active.previous_status
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE previous_status = 'pending')::int AS "expiredPendingCount",
+        COUNT(*) FILTER (WHERE previous_status = 'running')::int AS "expiredRunningCount"
+      FROM cleared
+      `,
+      [nodeId]
+    );
+
+    const cleanup = cleanupResult.rows[0] || {
+      expiredPendingCount: 0,
+      expiredRunningCount: 0
+    };
 
     const activeResult = await client.query(
       `
@@ -10981,8 +11024,8 @@ app.post("/sensor-commands/:nodeId/cleanup", async (req, res) => {
     return res.status(200).json({
       success: true,
       message: expiredTotal > 0
-        ? `Cleaned ${expiredTotal} stale sensor command(s).`
-        : "No stale sensor commands needed cleanup.",
+        ? `Cleared ${expiredTotal} active sensor command(s).`
+        : "No active sensor commands needed clearing.",
       nodeId,
       expiredPendingCount,
       expiredRunningCount,
