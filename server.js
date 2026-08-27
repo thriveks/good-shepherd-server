@@ -57,6 +57,7 @@ const AI_DASHBOARD_REFRESH_DEBOUNCE_MS = 2000;
 const SENSOR_COMMAND_EXPIRATION_MINUTES = 5;
 const SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES = 5;
 const SENSOR_COMMAND_OTA_EXECUTION_TIMEOUT_MINUTES = 30;
+const SENSOR_COMMAND_OTA_PENDING_EXPIRATION_MINUTES = 1440;
 const SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES = 2;
 const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
 const MONITOR_COMMAND_TYPES = ["ping", "ffmpeg_check", "diagnostic_report", "reload_cameras", "sync_cameras_from_cloud", "restart_monitors", "clear_last_error", "rtsp_test"];
@@ -6817,10 +6818,16 @@ async function failStaleSensorCommands(client, nodeId) {
     WHERE node_id = $1
       AND command_type IN ('reconfigure', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
       AND status = 'pending'
-      AND requested_at < NOW() - ($2::int * INTERVAL '1 minute')
+      AND (
+        (command_type = 'update_firmware'
+          AND requested_at < NOW() - ($2::int * INTERVAL '1 minute'))
+        OR
+        (command_type <> 'update_firmware'
+          AND requested_at < NOW() - ($3::int * INTERVAL '1 minute'))
+      )
     RETURNING command_id
     `,
-    [nodeId, SENSOR_COMMAND_EXPIRATION_MINUTES]
+    [nodeId, SENSOR_COMMAND_OTA_PENDING_EXPIRATION_MINUTES, SENSOR_COMMAND_EXPIRATION_MINUTES]
   );
 
   const runningResult = await client.query(
@@ -7008,6 +7015,7 @@ app.get("/", async (req, res) => {
       sensorCommandExpirationMinutes: SENSOR_COMMAND_EXPIRATION_MINUTES,
       sensorCommandExecutionTimeoutMinutes: SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES,
       sensorCommandOtaExecutionTimeoutMinutes: SENSOR_COMMAND_OTA_EXECUTION_TIMEOUT_MINUTES,
+      sensorCommandOtaPendingExpirationMinutes: SENSOR_COMMAND_OTA_PENDING_EXPIRATION_MINUTES,
       sensorCommandIdentifyExecutionTimeoutMinutes: SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES,
       endpoints: [
         "GET /nodes",
@@ -12147,6 +12155,28 @@ function mqttBridgeIsConnected() {
   return Boolean(mqttBridgeClient && mqttBridgeClient.connected);
 }
 
+async function mqttV2NodeIsOnline(nodeId) {
+  const resolvedNodeId = cleanText(nodeId);
+  if (!resolvedNodeId) return false;
+
+  const result = await pool.query(
+    `
+    SELECT
+      CASE
+        WHEN LOWER(COALESCE(monitor_status, '')) = 'offline' THEN FALSE
+        WHEN checked_in_at >= NOW() - ($2::int * INTERVAL '1 second') THEN TRUE
+        ELSE FALSE
+      END AS "isOnline"
+    FROM node_health
+    WHERE node_id = $1
+    LIMIT 1
+    `,
+    [resolvedNodeId, NODE_OFFLINE_AFTER_SECONDS]
+  );
+
+  return result.rows[0]?.isOnline === true;
+}
+
 async function publishMqttV2SensorCommand(command) {
   const commandId = cleanText(command?.commandId);
   const nodeId = cleanText(command?.nodeId);
@@ -12154,6 +12184,15 @@ async function publishMqttV2SensorCommand(command) {
 
   if (!commandId || !nodeId || !commandType || !isEsp32NodeId(nodeId)) {
     return { published: false, reason: "invalid_command" };
+  }
+
+  if (commandType === "update_firmware" && !(await mqttV2NodeIsOnline(nodeId))) {
+    console.log("MQTT V2 OTA command left pending: target node is offline", {
+      commandId,
+      nodeId,
+      commandType
+    });
+    return { published: false, reason: "node_offline" };
   }
 
   if (!mqttBridgeIsConnected()) {
@@ -12252,8 +12291,10 @@ async function publishMqttV2SensorCommand(command) {
   }
 }
 
-async function dispatchPendingMqttV2SensorCommands(limit = 100) {
+async function dispatchPendingMqttV2SensorCommands(limit = 100, targetNodeId = "") {
   if (!mqttBridgeIsConnected()) return 0;
+
+  const resolvedTargetNodeId = cleanText(targetNodeId);
 
   const result = await pool.query(
     `
@@ -12273,11 +12314,24 @@ async function dispatchPendingMqttV2SensorCommands(limit = 100) {
     WHERE status = 'pending'
       AND node_id LIKE 'esp32-%'
       AND command_type = ANY($1::text[])
-      AND requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
+      AND ($2::text = '' OR node_id = $2)
+      AND (
+        (command_type = 'update_firmware'
+          AND requested_at >= NOW() - ($3::int * INTERVAL '1 minute'))
+        OR
+        (command_type <> 'update_firmware'
+          AND requested_at >= NOW() - ($4::int * INTERVAL '1 minute'))
+      )
     ORDER BY requested_at ASC
-    LIMIT $3
+    LIMIT $5
     `,
-    [ESP32_SENSOR_COMMAND_TYPES, SENSOR_COMMAND_EXPIRATION_MINUTES, limit]
+    [
+      ESP32_SENSOR_COMMAND_TYPES,
+      resolvedTargetNodeId,
+      SENSOR_COMMAND_OTA_PENDING_EXPIRATION_MINUTES,
+      SENSOR_COMMAND_EXPIRATION_MINUTES,
+      limit
+    ]
   );
 
   let publishedCount = 0;
@@ -12345,6 +12399,12 @@ async function ingestMqttV2Status(nodeId, payload) {
     });
 
     console.log("MQTT V2 status ingested:", nodeId, "online");
+
+    // A device-specific online status is the authoritative delivery trigger for
+    // durable commands queued while that ESP32 was offline. In particular, OTA
+    // commands remain pending until this point instead of being falsely marked
+    // running merely because the server is connected to the MQTT broker.
+    await dispatchPendingMqttV2SensorCommands(25, nodeId);
     return;
   }
 
