@@ -12400,6 +12400,69 @@ function normalizeMqttCommandResultStatus(value) {
   return "";
 }
 
+
+async function reconcileSuccessfulMqttV2Ota(nodeId, reportedSoftwareVersion) {
+  const resolvedNodeId = cleanText(nodeId);
+  const resolvedVersion = cleanText(reportedSoftwareVersion);
+
+  if (!resolvedNodeId || !resolvedVersion) {
+    return null;
+  }
+
+  // OTA success is authoritative only after the device reconnects and reports
+  // the exact firmware version requested by the running OTA command.
+  const result = await pool.query(
+    `
+    WITH target AS (
+      SELECT command_id
+      FROM node_commands
+      WHERE node_id = $1
+        AND command_type = 'update_firmware'
+        AND status = 'running'
+        AND COALESCE(payload->>'firmwareVersion', '') = $2
+      ORDER BY requested_at DESC
+      LIMIT 1
+    )
+    UPDATE node_commands AS c
+    SET
+      status = 'success',
+      completed_at = NOW(),
+      error = NULL,
+      result = COALESCE(c.result, '{}'::jsonb) ||
+        jsonb_build_object(
+          'transport', 'mqtt-status-verification',
+          'nodeId', $1::text,
+          'commandType', 'update_firmware',
+          'message', 'Firmware update verified after reboot.',
+          'reportedFirmwareVersion', $2::text,
+          'verifiedAt', NOW()
+        )
+    FROM target
+    WHERE c.command_id = target.command_id
+    RETURNING
+      c.command_id AS "commandId",
+      c.node_id AS "nodeId",
+      c.status,
+      c.completed_at AS "completedAt",
+      c.payload,
+      c.result
+    `,
+    [resolvedNodeId, resolvedVersion]
+  );
+
+  const reconciled = result.rows[0] || null;
+
+  if (reconciled) {
+    console.log("MQTT V2 OTA verified after reboot:", {
+      nodeId: resolvedNodeId,
+      commandId: reconciled.commandId,
+      firmwareVersion: resolvedVersion
+    });
+  }
+
+  return reconciled;
+}
+
 async function ingestMqttV2Status(nodeId, payload) {
   await postLocalV2Route("/nodes/register", {
     nodeId,
@@ -12442,6 +12505,11 @@ async function ingestMqttV2Status(nodeId, payload) {
     });
 
     console.log("MQTT V2 status ingested:", nodeId, "online");
+
+    // A successful OTA is finalized only after the ESP32 has rebooted,
+    // reconnected, and reported the exact firmware version requested by the
+    // currently running update_firmware command.
+    await reconcileSuccessfulMqttV2Ota(nodeId, payload.softwareVersion);
 
     // A device-specific online status is the authoritative delivery trigger for
     // durable commands queued while that ESP32 was offline. In particular, OTA
