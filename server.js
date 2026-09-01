@@ -20,6 +20,11 @@ const {
   HUMAN_PRESENCE_INTERPRETATION_TABLE_SQL,
   HUMAN_PRESENCE_INTERPRETATION_INSERT_SQL
 } = require("./lib/human_presence_interpretation_persistence_v1");
+
+const {
+  ensureHumanPresenceDecisionReadinessTableV1,
+  buildAndPersistHumanPresenceDecisionReadinessV1
+} = require("./lib/human_presence_decision_readiness_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -205,6 +210,9 @@ async function initializeDatabase() {
 
   // Human Presence Interpretation v1 analytical persistence.
   await pool.query(HUMAN_PRESENCE_INTERPRETATION_TABLE_SQL);
+
+  // Human Presence Decision Readiness v1 analytical persistence.
+  await ensureHumanPresenceDecisionReadinessTableV1(pool);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
@@ -12776,6 +12784,45 @@ async function interpretAndPersistHumanPresenceCandidateV1(nodeId, payload) {
     authority.status
   );
 
+  // Decision Readiness v1 consumes the exact persisted Interpretation v1
+  // analytical row. Do not reconstruct assignment, resident, room, or
+  // interpretation provenance from firmware payload data.
+  const persistedInterpretationResult = await pool.query(
+    `
+      SELECT
+        evidence_event_id,
+        interpretation_version,
+        node_id,
+        source_key,
+        authoritative_sensor_id,
+        authoritative_resident_id,
+        authoritative_resident_name,
+        authoritative_room_or_location,
+        assignment_authority,
+        authority_resolution_status,
+        interpretation_payload,
+        evidence_received_at,
+        interpreted_at
+      FROM human_presence_candidate_interpretations
+      WHERE evidence_event_id = $1
+        AND interpretation_version = $2
+      LIMIT 1
+    `,
+    [
+      evidence.eventId,
+      HUMAN_PRESENCE_PERSISTENCE_VERSION
+    ]
+  );
+
+  const persistedInterpretation =
+    persistedInterpretationResult.rows[0] || null;
+
+  if (!persistedInterpretation) {
+    throw new Error(
+      `Decision Readiness v1 cannot locate persisted interpretation ${evidence.eventId}`
+    );
+  }
+
   return {
     inserted: result.rowCount > 0,
     eventId: evidence.eventId,
@@ -12784,7 +12831,8 @@ async function interpretAndPersistHumanPresenceCandidateV1(nodeId, payload) {
     engineInterpretationVersion:
       interpretation.interpretationVersion,
     authorityResolutionStatus:
-      authority.status
+      authority.status,
+    persistedInterpretation
   };
 }
 
@@ -12923,7 +12971,23 @@ async function ingestMqttV2Event(nodeId, payload) {
   if (eventType === "candidate_history_evidence") {
     const evidenceResult =
       await ingestMqttV2CandidateHistoryEvidence(nodeId, payload);
+
+    const interpretationResult =
       await interpretAndPersistHumanPresenceCandidateV1(nodeId, payload);
+
+    const decisionReadinessResult =
+      await buildAndPersistHumanPresenceDecisionReadinessV1(
+        pool,
+        interpretationResult.persistedInterpretation
+      );
+
+    console.log(
+      "Human Presence Decision Readiness v1:",
+      evidenceResult.eventId,
+      decisionReadinessResult.persistence.inserted
+        ? "persisted"
+        : "already_exists"
+    );
 
     console.log(
       evidenceResult.inserted
