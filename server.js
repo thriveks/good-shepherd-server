@@ -25,6 +25,11 @@ const {
   ensureHumanPresenceDecisionReadinessTableV1,
   buildAndPersistHumanPresenceDecisionReadinessV1
 } = require("./lib/human_presence_decision_readiness_persistence_v1");
+
+const {
+  ensureHumanPresenceBehavioralObservationTableV1,
+  buildAndPersistHumanPresenceBehavioralObservationV1
+} = require("./lib/human_presence_behavioral_observation_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -213,6 +218,9 @@ async function initializeDatabase() {
 
   // Human Presence Decision Readiness v1 analytical persistence.
   await ensureHumanPresenceDecisionReadinessTableV1(pool);
+
+  // Human Presence Behavioral Observation v1 analytical persistence.
+  await ensureHumanPresenceBehavioralObservationTableV1(pool);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
@@ -12985,6 +12993,44 @@ async function ingestMqttV2Event(nodeId, payload) {
       "Human Presence Decision Readiness v1:",
       evidenceResult.eventId,
       decisionReadinessResult.persistence.inserted
+        ? "persisted"
+        : "already_exists"
+    );
+
+    const persistedDecisionReadinessResult =
+      await pool.query(
+        `SELECT *
+         FROM human_presence_decision_readiness
+         WHERE evidence_event_id = $1
+           AND interpretation_version = $2
+           AND decision_readiness_version = $3
+         LIMIT 1`,
+        [
+          interpretationResult.persistedInterpretation.evidence_event_id,
+          interpretationResult.persistedInterpretation.interpretation_version,
+          "human_presence_decision_readiness_v1"
+        ]
+      );
+
+    const persistedDecisionReadiness =
+      persistedDecisionReadinessResult.rows[0] || null;
+
+    if (!persistedDecisionReadiness) {
+      throw new Error(
+        `Human Presence Behavioral Observation v1 parent Decision Readiness row missing for ${evidenceResult.eventId}`
+      );
+    }
+
+    const behavioralObservationResult =
+      await buildAndPersistHumanPresenceBehavioralObservationV1(
+        pool,
+        persistedDecisionReadiness
+      );
+
+    console.log(
+      "Human Presence Behavioral Observation v1:",
+      evidenceResult.eventId,
+      behavioralObservationResult.persistence.inserted
         ? "persisted"
         : "already_exists"
     );
