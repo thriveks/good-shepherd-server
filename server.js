@@ -30,6 +30,11 @@ const {
   ensureHumanPresenceBehavioralObservationTableV1,
   buildAndPersistHumanPresenceBehavioralObservationV1
 } = require("./lib/human_presence_behavioral_observation_persistence_v1");
+
+const {
+  ensureHumanPresenceBehavioralPatternAnalysisTableV1,
+  buildAndPersistHumanPresenceBehavioralPatternAnalysisV1
+} = require("./lib/human_presence_behavioral_pattern_analysis_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -221,6 +226,9 @@ async function initializeDatabase() {
 
   // Human Presence Behavioral Observation v1 analytical persistence.
   await ensureHumanPresenceBehavioralObservationTableV1(pool);
+
+  // Human Presence Behavioral Pattern Analysis v1 analytical persistence.
+  await ensureHumanPresenceBehavioralPatternAnalysisTableV1(pool);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
@@ -13031,6 +13039,45 @@ async function ingestMqttV2Event(nodeId, payload) {
       "Human Presence Behavioral Observation v1:",
       evidenceResult.eventId,
       behavioralObservationResult.persistence.inserted
+        ? "persisted"
+        : "already_exists"
+    );
+
+    const persistedBehavioralObservationResult = await pool.query(
+      `
+        SELECT *
+        FROM human_presence_behavioral_observations
+        WHERE evidence_event_id = $1
+          AND interpretation_version =
+              'human_presence_candidate_interpretation_v1'
+          AND decision_readiness_version =
+              'human_presence_decision_readiness_v1'
+          AND behavioral_observation_version =
+              'human_presence_behavioral_observation_v1'
+        LIMIT 1
+      `,
+      [evidenceResult.eventId]
+    );
+
+    const persistedBehavioralObservation =
+      persistedBehavioralObservationResult.rows[0] || null;
+
+    if (!persistedBehavioralObservation) {
+      throw new Error(
+        `Behavioral Observation v1 persisted row missing for ${evidenceResult.eventId}`
+      );
+    }
+
+    const behavioralPatternAnalysisResult =
+      await buildAndPersistHumanPresenceBehavioralPatternAnalysisV1(
+        pool,
+        persistedBehavioralObservation
+      );
+
+    console.log(
+      "Human Presence Behavioral Pattern Analysis v1:",
+      evidenceResult.eventId,
+      behavioralPatternAnalysisResult.persistence.inserted
         ? "persisted"
         : "already_exists"
     );
