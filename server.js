@@ -140,6 +140,45 @@ async function initializeDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS webhook_events_event_type_timestamp_idx ON webhook_events (event_type, timestamp DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS webhook_events_source_key_event_type_timestamp_idx ON webhook_events (source_key, event_type, timestamp DESC)`);
 
+
+  // Human Presence candidate-history evidence is descriptive analytical
+  // evidence, not an operational alert. Keep it isolated from webhook_events
+  // so it cannot become a presence alert, monitoring case, or call-center item
+  // merely because the firmware emitted evidence.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS candidate_history_evidence_events (
+      event_id TEXT PRIMARY KEY,
+      node_id TEXT NOT NULL,
+      source_key TEXT,
+      source_name TEXT,
+      resident_name TEXT,
+      location_name TEXT,
+      software_version TEXT,
+      protocol_version TEXT NOT NULL,
+      evidence_schema_version TEXT NOT NULL,
+      episode_id BIGINT NOT NULL,
+      history_count INTEGER NOT NULL,
+      prior_count INTEGER NOT NULL,
+      dimensions INTEGER NOT NULL,
+      event_payload JSONB NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      candidate_history_evidence_node_received_idx
+    ON candidate_history_evidence_events
+      (node_id, received_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS
+      candidate_history_evidence_source_received_idx
+    ON candidate_history_evidence_events
+      (source_key, received_at DESC)
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
       node_id TEXT PRIMARY KEY,
@@ -12528,7 +12567,164 @@ async function ingestMqttV2Status(nodeId, payload) {
   console.log("MQTT V2 status ingested:", nodeId, "status-without-online-flag");
 }
 
+
+function candidateHistoryEvidenceInteger(value) {
+  const number = Number(value);
+
+  if (!Number.isInteger(number) || number < 0) {
+    return null;
+  }
+
+  return number;
+}
+
+async function ingestMqttV2CandidateHistoryEvidence(nodeId, payload) {
+  const normalizedPayload = normalizeJsonObject(payload);
+  const eventType = cleanText(normalizedPayload.eventType).toLowerCase();
+
+  if (eventType !== "candidate_history_evidence") {
+    throw new Error(
+      `Unexpected candidate-history evidence event type: ${eventType || "missing"}`
+    );
+  }
+
+  const eventId = cleanText(normalizedPayload.eventId);
+  const resolvedNodeId = cleanText(nodeId || normalizedPayload.nodeId);
+  const protocolVersion = cleanText(normalizedPayload.protocolVersion);
+  const evidenceSchemaVersion = cleanText(
+    normalizedPayload.evidenceSchemaVersion
+  );
+
+  const episodeId = candidateHistoryEvidenceInteger(
+    normalizedPayload.episodeId
+  );
+
+  const historyCount = candidateHistoryEvidenceInteger(
+    normalizedPayload.historyCount
+  );
+
+  const priorCount = candidateHistoryEvidenceInteger(
+    normalizedPayload.priorCount
+  );
+
+  const dimensions = candidateHistoryEvidenceInteger(
+    normalizedPayload.dimensions
+  );
+
+  if (!eventId) {
+    throw new Error("candidate_history_evidence missing eventId");
+  }
+
+  if (!resolvedNodeId) {
+    throw new Error("candidate_history_evidence missing nodeId");
+  }
+
+  if (protocolVersion !== "2.0") {
+    throw new Error(
+      `candidate_history_evidence unsupported protocolVersion: ${
+        protocolVersion || "missing"
+      }`
+    );
+  }
+
+  if (evidenceSchemaVersion !== "1.0") {
+    throw new Error(
+      `candidate_history_evidence unsupported evidenceSchemaVersion: ${
+        evidenceSchemaVersion || "missing"
+      }`
+    );
+  }
+
+  if (episodeId === null) {
+    throw new Error("candidate_history_evidence invalid episodeId");
+  }
+
+  if (historyCount === null || historyCount < 3) {
+    throw new Error("candidate_history_evidence invalid historyCount");
+  }
+
+  if (priorCount === null || priorCount < 2) {
+    throw new Error("candidate_history_evidence invalid priorCount");
+  }
+
+  if (dimensions !== 10) {
+    throw new Error(
+      `candidate_history_evidence dimensions must equal 10; received ${
+        dimensions === null ? "invalid" : dimensions
+      }`
+    );
+  }
+
+  const result = await pool.query(
+    `
+    INSERT INTO candidate_history_evidence_events (
+      event_id,
+      node_id,
+      source_key,
+      source_name,
+      resident_name,
+      location_name,
+      software_version,
+      protocol_version,
+      evidence_schema_version,
+      episode_id,
+      history_count,
+      prior_count,
+      dimensions,
+      event_payload,
+      received_at
+    )
+    VALUES (
+      $1, $2, $3, $4, $5, $6, $7,
+      $8, $9, $10, $11, $12, $13,
+      $14::jsonb, NOW()
+    )
+    ON CONFLICT (event_id)
+    DO NOTHING
+    RETURNING event_id
+    `,
+    [
+      eventId,
+      resolvedNodeId,
+      cleanText(normalizedPayload.sourceKey) || null,
+      cleanText(normalizedPayload.sourceName) || null,
+      cleanText(normalizedPayload.residentName) || null,
+      cleanText(normalizedPayload.locationName) || null,
+      cleanText(normalizedPayload.softwareVersion) || null,
+      protocolVersion,
+      evidenceSchemaVersion,
+      episodeId,
+      historyCount,
+      priorCount,
+      dimensions,
+      JSON.stringify(normalizedPayload)
+    ]
+  );
+
+  return {
+    eventId,
+    inserted: result.rowCount === 1
+  };
+}
+
 async function ingestMqttV2Event(nodeId, payload) {
+  const eventType = cleanText(payload?.eventType).toLowerCase();
+
+  if (eventType === "candidate_history_evidence") {
+    const evidenceResult =
+      await ingestMqttV2CandidateHistoryEvidence(nodeId, payload);
+
+    console.log(
+      evidenceResult.inserted
+        ? "MQTT V2 candidate history evidence stored:"
+        : "MQTT V2 candidate history evidence duplicate ignored:",
+      nodeId,
+      evidenceResult.eventId
+    );
+
+    return;
+  }
+
   await postLocalV2Route("/webhook", {
     ...payload,
     nodeId
