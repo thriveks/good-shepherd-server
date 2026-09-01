@@ -1,0 +1,23 @@
+GOOD SHEPHERD HUMAN PRESENCE LEARNING STATUS v1
+LOCAL CHECKPOINT
+
+Parent commit: bc45f057743d783c56d549df69166fe73989ab5d
+Integrated server.js SHA256: d593840111d333f84ff894bb39659fc1701dfeb8220028d2dffc409044f8f498
+Rollback server.js SHA256: cb350e6639438df73a436438ab2af6d0a28f9f50a05aa03ec794488920473ce2
+
+Purpose:
+Expose existing Human Presence empirical-calibration progress to the application.
+
+Read-only endpoint:
+GET /ai/human-presence-learning
+
+Requirements represented:
+30 persisted Pattern Analysis observations
+48 hours observation span
+3 distinct America/Chicago calendar dates
+
+These are engineering data-sufficiency gates only.
+They are not behavioral, risk, fall, emergency, medical, or alert thresholds.
+
+LOCAL SERVER VALIDATION: PASS
+PRODUCTION DEPLOYMENT: PENDING
