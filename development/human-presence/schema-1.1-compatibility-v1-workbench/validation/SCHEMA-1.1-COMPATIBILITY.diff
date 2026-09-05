@@ -1,0 +1,29 @@
+diff --git a/lib/human_presence_interpretation_v1.js b/lib/human_presence_interpretation_v1.js
+index 2958b74..8b04a76 100644
+--- a/lib/human_presence_interpretation_v1.js
++++ b/lib/human_presence_interpretation_v1.js
+@@ -47,7 +47,10 @@ function interpretHumanPresenceCandidateEvidenceV1(payload) {
+     throw new Error("Unsupported protocolVersion");
+   }
+ 
+-  if (String(payload.evidenceSchemaVersion || "") !== "1.0") {
++  const evidenceSchemaVersion =
++    String(payload.evidenceSchemaVersion || "");
++
++  if (!["1.0", "1.1"].includes(evidenceSchemaVersion)) {
+     throw new Error("Unsupported evidenceSchemaVersion");
+   }
+ 
+diff --git a/server.js b/server.js
+index 1423472..e3214cf 100644
+--- a/server.js
++++ b/server.js
+@@ -13006,7 +13006,7 @@ async function ingestMqttV2CandidateHistoryEvidence(nodeId, payload) {
+     );
+   }
+ 
+-  if (evidenceSchemaVersion !== "1.0") {
++  if (!["1.0", "1.1"].includes(evidenceSchemaVersion)) {
+     throw new Error(
+       `candidate_history_evidence unsupported evidenceSchemaVersion: ${
+         evidenceSchemaVersion || "missing"

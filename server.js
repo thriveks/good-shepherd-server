@@ -13006,7 +13006,7 @@ async function ingestMqttV2CandidateHistoryEvidence(nodeId, payload) {
     );
   }
 
-  if (evidenceSchemaVersion !== "1.0") {
+  if (!["1.0", "1.1"].includes(evidenceSchemaVersion)) {
     throw new Error(
       `candidate_history_evidence unsupported evidenceSchemaVersion: ${
         evidenceSchemaVersion || "missing"

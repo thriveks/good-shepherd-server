@@ -1,0 +1,32 @@
+Good Shepherd Human Presence
+Schema 1.1 Compatibility v1
+
+Date: 2026-09-05
+Parent commit: 728f84c795f6647431d91b69538ba55d908bcf4a
+
+Purpose:
+Allow additive Human Presence candidate-history evidence Schema 1.1
+while retaining full Schema 1.0 compatibility.
+
+Validated behavior:
+- Schema 1.0 accepted
+- Schema 1.1 accepted
+- Schema 1.2 rejected
+- protocolVersion remains 2.0
+- dimensions remains 10
+- Interpretation v1 analytical outputs unchanged
+- episodeProfile remains additive descriptive evidence
+- raw event payload continues to persist as JSONB
+- no database migration
+- no alert, fall, emergency, classification, threshold, or policy changes
+
+Files changed:
+- lib/human_presence_interpretation_v1.js
+- server.js
+
+SHA256:
+9fc58879c6efe08c60b068736de1fc2624d1b68cbe941bfb9d483a59b19d1b4d  lib/human_presence_interpretation_v1.js
+e9068cf456acabca2e7f42098ac38fd1b39fe7e3ec9e60fbc616cef1fde282b2  server.js
+
+Sensor deployment:
+NONE
