@@ -1,0 +1,8 @@
+PASS: 12-dimensional profile contract
+PASS: zero-history behavior
+PASS: descriptive history statistics
+PASS: normalized profile delta
+PASS: invalid evidence rejection
+PASS: operational fields absent
+PASS: Episode Profile Analysis v1 pure module
+PASS: strict numeric evidence contract

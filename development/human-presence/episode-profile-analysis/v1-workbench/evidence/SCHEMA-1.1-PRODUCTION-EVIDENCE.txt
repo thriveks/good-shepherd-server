@@ -1,0 +1,20 @@
+===== SCHEMA 1.1 PRODUCTION COVERAGE =====
+ schema11_events | nodes | dates |          first_event          |         latest_event          
+-----------------+-------+-------+-------------------------------+-------------------------------
+              16 |     1 |     2 | 2026-09-05 23:33:46.738203+00 | 2026-09-06 00:00:15.736725+00
+(1 row)
+
+
+===== SCHEMA 1.1 EVENTS BY NODE =====
+      node_id       | events |          first_event          |         latest_event          
+--------------------+--------+-------------------------------+-------------------------------
+ esp32-a02dbcabc31c |     16 | 2026-09-05 23:33:46.738203+00 | 2026-09-06 00:00:15.736725+00
+(1 row)
+
+
+===== SENSOR 9 PROFILE AGGREGATE =====
+ episodes | moving_min | moving_mean | moving_max | stationary_mean | target2_mean | target3_mean | transitions_mean | moving_distance_mean_cm | moving_iqr_mean_cm | stationary_distance_mean_cm | stationary_iqr_mean_cm | detection_distance_mean_cm | moving_energy_mean | stationary_energy_mean 
+----------+------------+-------------+------------+-----------------+--------------+--------------+------------------+-------------------------+--------------------+-----------------------------+------------------------+----------------------------+--------------------+------------------------
+       16 |      0.000 |      50.628 |    100.000 |          98.952 |       48.765 |       49.675 |            5.819 |                 214.688 |             78.923 |                     198.968 |                 94.818 |                     85.000 |             45.999 |                 96.275
+(1 row)
+

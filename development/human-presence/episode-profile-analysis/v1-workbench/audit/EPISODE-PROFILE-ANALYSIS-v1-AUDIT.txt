@@ -1,0 +1,146 @@
+===== EXISTING HUMAN PRESENCE ANALYTICS FILES =====
+./_LOCAL_ARCHIVE/Server-Backups/server.js.backup-before-human-presence-sensor-type-fix-20260709-171705
+./checkpoints/human-presence/CHECKPOINT-HUMAN-PRESENCE-BEHAVIORAL-OBSERVATION-v1-PRODUCTION-VALIDATED.txt
+./checkpoints/human-presence/CHECKPOINT-HUMAN-PRESENCE-BEHAVIORAL-PATTERN-ANALYSIS-v1-PRODUCTION-VALIDATED.txt
+./checkpoints/human-presence/CHECKPOINT-HUMAN-PRESENCE-DECISION-READINESS-v1-PRODUCTION-VALIDATED.txt
+./checkpoints/human-presence/CHECKPOINT-HUMAN-PRESENCE-INTERPRETATION-v1-PRODUCTION-VALIDATED.txt
+./checkpoints/human-presence/CHECKPOINT-HUMAN-PRESENCE-LEARNING-STATUS-v1-LOCAL-VALIDATED.txt
+./lib/human_presence_behavioral_observation_persistence_v1.js
+./lib/human_presence_behavioral_observation_v1.js
+./lib/human_presence_behavioral_pattern_analysis_persistence_v1.js
+./lib/human_presence_behavioral_pattern_analysis_v1.js
+./lib/human_presence_decision_readiness_persistence_v1.js
+./lib/human_presence_decision_readiness_v1.js
+./lib/human_presence_interpretation_authority_v1.js
+./lib/human_presence_interpretation_persistence_v1.js
+./lib/human_presence_interpretation_v1.js
+
+===== EXISTING ANALYTICS REFERENCES =====
+lib/human_presence_decision_readiness_v1.js:3:const HUMAN_PRESENCE_DECISION_READINESS_VERSION =
+lib/human_presence_decision_readiness_v1.js:4:  'human_presence_decision_readiness_v1';
+lib/human_presence_decision_readiness_v1.js:245:      HUMAN_PRESENCE_DECISION_READINESS_VERSION,
+lib/human_presence_decision_readiness_v1.js:369:  HUMAN_PRESENCE_DECISION_READINESS_VERSION,
+lib/human_presence_decision_readiness_persistence_v1.js:4:  HUMAN_PRESENCE_DECISION_READINESS_VERSION,
+lib/human_presence_decision_readiness_persistence_v1.js:6:} = require('./human_presence_decision_readiness_v1');
+lib/human_presence_decision_readiness_persistence_v1.js:8:const HUMAN_PRESENCE_DECISION_READINESS_PERSISTENCE_VERSION =
+lib/human_presence_decision_readiness_persistence_v1.js:9:  'human_presence_decision_readiness_v1';
+lib/human_presence_decision_readiness_persistence_v1.js:16:    CREATE TABLE IF NOT EXISTS human_presence_decision_readiness (
+lib/human_presence_decision_readiness_persistence_v1.js:45:      human_presence_decision_readiness_resident_time_idx
+lib/human_presence_decision_readiness_persistence_v1.js:46:    ON human_presence_decision_readiness
+lib/human_presence_decision_readiness_persistence_v1.js:52:      human_presence_decision_readiness_sensor_time_idx
+lib/human_presence_decision_readiness_persistence_v1.js:53:    ON human_presence_decision_readiness
+lib/human_presence_decision_readiness_persistence_v1.js:198:    HUMAN_PRESENCE_DECISION_READINESS_VERSION
+lib/human_presence_decision_readiness_persistence_v1.js:224:      INSERT INTO human_presence_decision_readiness (
+lib/human_presence_decision_readiness_persistence_v1.js:263:      HUMAN_PRESENCE_DECISION_READINESS_PERSISTENCE_VERSION,
+lib/human_presence_decision_readiness_persistence_v1.js:287:      HUMAN_PRESENCE_DECISION_READINESS_PERSISTENCE_VERSION
+lib/human_presence_decision_readiness_persistence_v1.js:327:  HUMAN_PRESENCE_DECISION_READINESS_PERSISTENCE_VERSION,
+lib/human_presence_interpretation_persistence_v1.js:5:CREATE TABLE IF NOT EXISTS human_presence_candidate_interpretations (
+lib/human_presence_interpretation_persistence_v1.js:28:  human_presence_candidate_interpretations_node_time_idx
+lib/human_presence_interpretation_persistence_v1.js:29:ON human_presence_candidate_interpretations
+lib/human_presence_interpretation_persistence_v1.js:33:  human_presence_candidate_interpretations_resident_time_idx
+lib/human_presence_interpretation_persistence_v1.js:34:ON human_presence_candidate_interpretations
+lib/human_presence_interpretation_persistence_v1.js:39:INSERT INTO human_presence_candidate_interpretations (
+lib/human_presence_behavioral_observation_v1.js:3:const VERSION = "human_presence_behavioral_observation_v1";
+lib/human_presence_behavioral_observation_v1.js:4:const DECISION_VERSION = "human_presence_decision_readiness_v1";
+lib/human_presence_behavioral_observation_persistence_v1.js:6:} = require("./human_presence_behavioral_observation_v1");
+lib/human_presence_behavioral_observation_persistence_v1.js:8:const DECISION_VERSION = "human_presence_decision_readiness_v1";
+lib/human_presence_behavioral_observation_persistence_v1.js:15:    CREATE TABLE IF NOT EXISTS human_presence_behavioral_observations (
+lib/human_presence_behavioral_observation_persistence_v1.js:19:      behavioral_observation_version TEXT NOT NULL,
+lib/human_presence_behavioral_observation_persistence_v1.js:26:      behavioral_observation_payload JSONB NOT NULL,
+lib/human_presence_behavioral_observation_persistence_v1.js:30:      behavioral_observation_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+lib/human_presence_behavioral_observation_persistence_v1.js:35:        behavioral_observation_version
+lib/human_presence_behavioral_observation_persistence_v1.js:40:    CREATE INDEX IF NOT EXISTS idx_hp_behavioral_observations_resident_room_time
+lib/human_presence_behavioral_observation_persistence_v1.js:41:    ON human_presence_behavioral_observations (
+lib/human_presence_behavioral_observation_persistence_v1.js:68:    FROM human_presence_decision_readiness
+lib/human_presence_behavioral_observation_persistence_v1.js:90:    INSERT INTO human_presence_behavioral_observations (
+lib/human_presence_behavioral_observation_persistence_v1.js:94:      behavioral_observation_version,
+lib/human_presence_behavioral_observation_persistence_v1.js:101:      behavioral_observation_payload,
+lib/human_presence_behavioral_observation_persistence_v1.js:105:      behavioral_observation_at
+lib/human_presence_behavioral_observation_persistence_v1.js:113:      behavioral_observation_version
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:4:  HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_VERSION,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:6:} = require("./human_presence_behavioral_pattern_analysis_v1");
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:11:const HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_TABLE_SQL = `
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:12:  CREATE TABLE IF NOT EXISTS human_presence_behavioral_pattern_analyses (
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:16:    behavioral_observation_version TEXT NOT NULL,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:17:    behavioral_pattern_analysis_version TEXT NOT NULL,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:26:    behavioral_pattern_analysis_payload JSONB NOT NULL,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:31:    behavioral_observation_at TIMESTAMPTZ NOT NULL,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:32:    behavioral_pattern_analysis_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:38:      behavioral_observation_version,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:39:      behavioral_pattern_analysis_version
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:44:    human_presence_behavioral_pattern_resident_room_time_idx
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:45:  ON human_presence_behavioral_pattern_analyses (
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:48:    behavioral_observation_at DESC
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:54:    throw new Error("behavioral observation current row required");
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:63:    current.behavioral_observation_version !==
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:64:    "human_presence_behavioral_observation_v1"
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:66:    throw new Error("unsupported behavioral observation parent version");
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:75:  await db.query(HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_TABLE_SQL);
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:84:      FROM human_presence_behavioral_observations
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:87:        AND behavioral_observation_version =
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:88:            'human_presence_behavioral_observation_v1'
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:89:        AND behavioral_observation_at < $3
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:90:        AND behavioral_observation_at >=
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:92:      ORDER BY behavioral_observation_at DESC
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:98:      current.behavioral_observation_at
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:114:      INSERT INTO human_presence_behavioral_pattern_analyses (
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:118:        behavioral_observation_version,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:119:        behavioral_pattern_analysis_version,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:128:        behavioral_pattern_analysis_payload,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:133:        behavioral_observation_at,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:134:        behavioral_pattern_analysis_at
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:146:        behavioral_observation_version,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:147:        behavioral_pattern_analysis_version
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:150:      RETURNING behavioral_pattern_analysis_at
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:156:      current.behavioral_observation_version,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:157:      HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_VERSION,
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:171:      current.behavioral_observation_at
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:178:      HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_VERSION
+lib/human_presence_behavioral_pattern_analysis_persistence_v1.js:211:  HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_TABLE_SQL,
+lib/human_presence_behavioral_pattern_analysis_v1.js:3:const HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_VERSION =
+lib/human_presence_behavioral_pattern_analysis_v1.js:4:  "human_presence_behavioral_pattern_analysis_v1";
+lib/human_presence_behavioral_pattern_analysis_v1.js:43:    row?.behavioral_observation_version ||
+lib/human_presence_behavioral_pattern_analysis_v1.js:45:    row?.behavioral_observation_payload?.behavioralObservationVersion ||
+lib/human_presence_behavioral_pattern_analysis_v1.js:51:  return row?.behavioral_observation_payload || row?.behavioralObservationPayload || {};
+lib/human_presence_behavioral_pattern_analysis_v1.js:71:  return row?.behavioral_observation_at || row?.behavioralObservationAt || null;
+lib/human_presence_behavioral_pattern_analysis_v1.js:80:    throw new Error("behavioral pattern analysis current row required");
+lib/human_presence_behavioral_pattern_analysis_v1.js:85:    "human_presence_behavioral_observation_v1"
+lib/human_presence_behavioral_pattern_analysis_v1.js:87:    throw new Error("unsupported behavioral observation parent version");
+lib/human_presence_behavioral_pattern_analysis_v1.js:103:    throw new Error("valid behavioral observation timestamp required");
+lib/human_presence_behavioral_pattern_analysis_v1.js:109:    throw new Error("parent behavioral observation must be descriptive only");
+lib/human_presence_behavioral_pattern_analysis_v1.js:135:        "human_presence_behavioral_observation_v1"
+lib/human_presence_behavioral_pattern_analysis_v1.js:343:      HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_VERSION,
+lib/human_presence_behavioral_pattern_analysis_v1.js:401:  HUMAN_PRESENCE_BEHAVIORAL_PATTERN_ANALYSIS_VERSION,
+server.js:27:} = require("./lib/human_presence_decision_readiness_persistence_v1");
+server.js:32:} = require("./lib/human_presence_behavioral_observation_persistence_v1");
+server.js:37:} = require("./lib/human_presence_behavioral_pattern_analysis_persistence_v1");
+server.js:188:    CREATE TABLE IF NOT EXISTS candidate_history_evidence_events (
+server.js:210:    ON candidate_history_evidence_events
+server.js:217:    ON candidate_history_evidence_events
+server.js:227:  // Human Presence Behavioral Observation v1 analytical persistence.
+server.js:230:  // Human Presence Behavioral Pattern Analysis v1 analytical persistence.
+server.js:8203:        FROM human_presence_behavioral_pattern_analyses
+server.js:8216:                  MAX(behavioral_pattern_analysis_at) -
+server.js:8217:                  MIN(behavioral_pattern_analysis_at)
+server.js:8225:              behavioral_pattern_analysis_at
+server.js:8229:          MIN(behavioral_pattern_analysis_at) AS "firstObservationAt",
+server.js:8230:          MAX(behavioral_pattern_analysis_at) AS "lastObservationAt"
+server.js:12758:      FROM candidate_history_evidence_events
+server.js:12927:      FROM human_presence_candidate_interpretations
+server.js:13039:    INSERT INTO candidate_history_evidence_events (
+server.js:13116:         FROM human_presence_decision_readiness
+server.js:13124:          "human_presence_decision_readiness_v1"
+server.js:13133:        `Human Presence Behavioral Observation v1 parent Decision Readiness row missing for ${evidenceResult.eventId}`
+server.js:13144:      "Human Presence Behavioral Observation v1:",
+server.js:13154:        FROM human_presence_behavioral_observations
+server.js:13159:              'human_presence_decision_readiness_v1'
+server.js:13160:          AND behavioral_observation_version =
+server.js:13161:              'human_presence_behavioral_observation_v1'
+server.js:13172:        `Behavioral Observation v1 persisted row missing for ${evidenceResult.eventId}`
+server.js:13183:      "Human Presence Behavioral Pattern Analysis v1:",
+
+===== SCHEMA 1.1 PRODUCTION COVERAGE =====
+
+===== SCHEMA 1.1 EVENTS BY NODE =====
+
+===== SENSOR 9 PROFILE AGGREGATE =====

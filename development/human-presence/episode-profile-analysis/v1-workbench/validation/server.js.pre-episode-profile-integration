@@ -35,11 +35,6 @@ const {
   ensureHumanPresenceBehavioralPatternAnalysisTableV1,
   buildAndPersistHumanPresenceBehavioralPatternAnalysisV1
 } = require("./lib/human_presence_behavioral_pattern_analysis_persistence_v1");
-
-const {
-  ensureHumanPresenceEpisodeProfileAnalysisTableV1,
-  buildAndPersistHumanPresenceEpisodeProfileAnalysisV1
-} = require("./lib/human_presence_episode_profile_analysis_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -234,10 +229,6 @@ async function initializeDatabase() {
 
   // Human Presence Behavioral Pattern Analysis v1 analytical persistence.
   await ensureHumanPresenceBehavioralPatternAnalysisTableV1(pool);
-
-  // Human Presence Episode Profile Analysis v1 analytical persistence.
-  // Observer-only Schema 1.1 physical episode-profile analytics.
-  await ensureHumanPresenceEpisodeProfileAnalysisTableV1(pool);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nodes (
@@ -13195,56 +13186,6 @@ async function ingestMqttV2Event(nodeId, payload) {
         ? "persisted"
         : "already_exists"
     );
-
-    if (
-      String(payload?.evidenceSchemaVersion || "") === "1.1" &&
-      payload?.episodeProfile
-    ) {
-      const persistedEvidenceResult = await pool.query(
-        `
-          SELECT
-            e.*,
-            i.authoritative_sensor_id,
-            i.authoritative_resident_id,
-            i.authoritative_resident_name,
-            i.authoritative_room_or_location,
-            i.authority_resolution_status,
-            i.assignment_authority,
-            e.received_at AS evidence_received_at
-          FROM candidate_history_evidence_events e
-          JOIN human_presence_candidate_interpretations i
-            ON i.evidence_event_id = e.event_id
-           AND i.interpretation_version =
-               'human_presence_candidate_interpretation_v1'
-          WHERE e.event_id = $1
-          LIMIT 1
-        `,
-        [evidenceResult.eventId]
-      );
-
-      const persistedEvidence =
-        persistedEvidenceResult.rows[0] || null;
-
-      if (!persistedEvidence) {
-        throw new Error(
-          `Episode Profile Analysis v1 evidence/authority row missing for ${evidenceResult.eventId}`
-        );
-      }
-
-      const episodeProfileAnalysisResult =
-        await buildAndPersistHumanPresenceEpisodeProfileAnalysisV1(
-          pool,
-          persistedEvidence
-        );
-
-      console.log(
-        "Human Presence Episode Profile Analysis v1:",
-        evidenceResult.eventId,
-        episodeProfileAnalysisResult.persistence.inserted
-          ? "persisted"
-          : "already_exists"
-      );
-    }
 
     console.log(
       evidenceResult.inserted

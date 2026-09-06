@@ -1,0 +1,5 @@
+ schema11_profiles | residents | locations | complete_12_dimension_profiles | minimum_prior_history | maximum_prior_history | historical_comparisons_exercised |         first_profile         |        latest_profile         | result 
+-------------------+-----------+-----------+--------------------------------+-----------------------+-----------------------+----------------------------------+-------------------------------+-------------------------------+--------
+                24 |         1 |         1 |                             24 |                     0 |                    23 |                               23 | 2026-09-05 23:33:46.738203+00 | 2026-09-06 00:19:05.850926+00 | PASS
+(1 row)
+
