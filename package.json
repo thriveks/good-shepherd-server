@@ -4,7 +4,8 @@
   "description": "Simple webhook server for Good Shepherd Home Monitoring System",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate": "node scripts/migrate.js"
   },
   "dependencies": {
     "express": "^4.21.2",
