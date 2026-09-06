@@ -13200,6 +13200,7 @@ async function ingestMqttV2Event(nodeId, payload) {
       `
         SELECT
           e.*,
+          e.event_id AS evidence_event_id,
           i.authoritative_sensor_id,
           i.authoritative_resident_id,
           i.authoritative_resident_name,
