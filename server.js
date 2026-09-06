@@ -13196,54 +13196,36 @@ async function ingestMqttV2Event(nodeId, payload) {
         : "already_exists"
     );
 
-    const episodeProfileActivationResult = await pool.query(
-      `SELECT evidence_schema_version, event_payload
-       FROM candidate_history_evidence_events
-       WHERE event_id = $1
-       LIMIT 1`,
+    const persistedEvidenceResult = await pool.query(
+      `
+        SELECT
+          e.*,
+          i.authoritative_sensor_id,
+          i.authoritative_resident_id,
+          i.authoritative_resident_name,
+          i.authoritative_room_or_location,
+          i.authority_resolution_status,
+          i.assignment_authority,
+          e.received_at AS evidence_received_at
+        FROM candidate_history_evidence_events e
+        JOIN human_presence_candidate_interpretations i
+          ON i.evidence_event_id = e.event_id
+         AND i.interpretation_version =
+             'human_presence_candidate_interpretation_v1'
+        WHERE e.event_id = $1
+        LIMIT 1
+      `,
       [evidenceResult.eventId]
     );
 
-    const episodeProfileActivationEvidence =
-      episodeProfileActivationResult.rows[0] || null;
+    const persistedEvidence =
+      persistedEvidenceResult.rows[0] || null;
 
     if (
-      String(
-        episodeProfileActivationEvidence?.evidence_schema_version || ""
-      ) === "1.1" &&
-      episodeProfileActivationEvidence?.event_payload?.episodeProfile
+      persistedEvidence &&
+      String(persistedEvidence.evidence_schema_version || "") === "1.1" &&
+      persistedEvidence.event_payload?.episodeProfile
     ) {
-      const persistedEvidenceResult = await pool.query(
-        `
-          SELECT
-            e.*,
-            i.authoritative_sensor_id,
-            i.authoritative_resident_id,
-            i.authoritative_resident_name,
-            i.authoritative_room_or_location,
-            i.authority_resolution_status,
-            i.assignment_authority,
-            e.received_at AS evidence_received_at
-          FROM candidate_history_evidence_events e
-          JOIN human_presence_candidate_interpretations i
-            ON i.evidence_event_id = e.event_id
-           AND i.interpretation_version =
-               'human_presence_candidate_interpretation_v1'
-          WHERE e.event_id = $1
-          LIMIT 1
-        `,
-        [evidenceResult.eventId]
-      );
-
-      const persistedEvidence =
-        persistedEvidenceResult.rows[0] || null;
-
-      if (!persistedEvidence) {
-        throw new Error(
-          `Episode Profile Analysis v1 evidence/authority row missing for ${evidenceResult.eventId}`
-        );
-      }
-
       const episodeProfileAnalysisResult =
         await buildAndPersistHumanPresenceEpisodeProfileAnalysisV1(
           pool,
