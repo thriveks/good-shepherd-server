@@ -13196,9 +13196,22 @@ async function ingestMqttV2Event(nodeId, payload) {
         : "already_exists"
     );
 
+    const episodeProfileActivationResult = await pool.query(
+      `SELECT evidence_schema_version, event_payload
+       FROM candidate_history_evidence_events
+       WHERE event_id = $1
+       LIMIT 1`,
+      [evidenceResult.eventId]
+    );
+
+    const episodeProfileActivationEvidence =
+      episodeProfileActivationResult.rows[0] || null;
+
     if (
-      String(payload?.evidenceSchemaVersion || "") === "1.1" &&
-      payload?.episodeProfile
+      String(
+        episodeProfileActivationEvidence?.evidence_schema_version || ""
+      ) === "1.1" &&
+      episodeProfileActivationEvidence?.event_payload?.episodeProfile
     ) {
       const persistedEvidenceResult = await pool.query(
         `
