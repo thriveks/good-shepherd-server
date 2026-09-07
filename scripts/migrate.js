@@ -9,6 +9,9 @@ const {
   REQUIRED_INDEXES
 } = require("./migrations/schema_requirements");
 
+const episodeProfilePatternAnalysisV1Migration =
+  require("./migrations/2026-09-07-human-presence-episode-profile-pattern-analysis-v1");
+
 if (!process.env.DATABASE_URL) {
   console.error(
     "Good Shepherd database migration failed: DATABASE_URL is required"
@@ -110,6 +113,64 @@ async function verifyExistingProductionSchema(client) {
   };
 }
 
+async function applyVersionedMigration(
+  client,
+  migration
+) {
+  const existing = await client.query(
+    `
+      SELECT version
+      FROM schema_migrations
+      WHERE version = $1
+      LIMIT 1
+    `,
+    [migration.VERSION]
+  );
+
+  if (existing.rowCount === 1) {
+    console.log(
+      `Migration ${migration.VERSION} already applied.`
+    );
+    return;
+  }
+
+  console.log(
+    `Applying migration ${migration.VERSION}.`
+  );
+
+  await client.query("BEGIN");
+
+  try {
+    await migration.up(client);
+
+    await client.query(
+      `
+        INSERT INTO schema_migrations (
+          version,
+          description
+        )
+        VALUES ($1, $2)
+      `,
+      [
+        migration.VERSION,
+        migration.DESCRIPTION
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    console.log(
+      `Applied migration ${migration.VERSION}.`
+    );
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    throw error;
+  }
+}
+
 async function runMigrations() {
   const client = await pool.connect();
 
@@ -177,6 +238,11 @@ async function runMigrations() {
         `Schema baseline ${SCHEMA_BASELINE_VERSION} already applied.`
       );
     }
+
+    await applyVersionedMigration(
+      client,
+      episodeProfilePatternAnalysisV1Migration
+    );
 
     /*
      * Future schema changes belong here as explicit,
