@@ -344,21 +344,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
       `
         WITH eligible AS (
           SELECT
-            e.event_id
-
-          FROM candidate_history_evidence_events e
-
-          JOIN human_presence_candidate_interpretations i
-            ON i.evidence_event_id = e.event_id
-           AND i.interpretation_version = $1
-
-          WHERE
-            e.evidence_schema_version = '1.1'
-
-            AND e.event_payload ? 'episodeProfile'
-
-            AND i.authority_resolution_status =
-                'resolved_assigned_sensor'
+            unnest($6::text[]) AS event_id
         ),
 
         temporal_eligible AS (
@@ -429,7 +415,8 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
         PROFILE_VERSION,
         PATTERN_VERSION,
         TEMPORAL_VERSION,
-        SUFFICIENCY_VERSION
+        SUFFICIENCY_VERSION,
+        eligible.map((row) => row.evidence_event_id)
       ]
     );
 
