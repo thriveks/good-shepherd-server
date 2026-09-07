@@ -337,14 +337,31 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
   /*
    * Phase 4:
-   * Hard validation.
+   * Hard validation against the exact recovery snapshot.
+   *
+   * Raw evidence may continue arriving while this transaction runs.
+   * Analytical-table writes are blocked by the transaction lock, so
+   * those later events are intentionally outside this recovery run
+   * and will be handled by the normal live pipeline after commit.
+   *
+   * Parameter contract:
+   *   $1 snapshot evidence event ids
+   *   $2 Episode Profile Analysis version
+   *   $3 Episode Profile Pattern Analysis version
+   *   $4 Temporal Context Analysis version
+   *   $5 Temporal Context Data Sufficiency version
    */
+  const snapshotEventIds =
+    eligible.map(
+      (row) => row.evidence_event_id
+    );
+
   const validation =
     await db.query(
       `
         WITH eligible AS (
           SELECT
-            unnest($5::text[]) AS event_id
+            unnest($1::text[]) AS event_id
         ),
 
         temporal_eligible AS (
@@ -355,7 +372,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
           JOIN human_presence_episode_profile_analyses p
             ON p.evidence_event_id = e.event_id
-           AND p.episode_profile_analysis_version = $1
+           AND p.episode_profile_analysis_version = $2
 
           WHERE
             jsonb_typeof(
@@ -365,57 +382,62 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
         )
 
         SELECT
-          (SELECT COUNT(*) FROM eligible)::int
-            AS eligible,
+          (
+            SELECT COUNT(*)
+            FROM eligible
+          )::int AS eligible,
 
           (
             SELECT COUNT(*)
+
             FROM eligible e
+
             JOIN human_presence_episode_profile_analyses p
               ON p.evidence_event_id = e.event_id
              AND p.episode_profile_analysis_version = $2
-          )::int
-            AS profile,
+          )::int AS profile,
 
           (
             SELECT COUNT(*)
+
             FROM eligible e
+
             JOIN human_presence_episode_profile_pattern_analyses q
               ON q.evidence_event_id = e.event_id
-             AND q.episode_profile_pattern_analysis_version = $2
-          )::int
-            AS pattern,
+             AND q.episode_profile_pattern_analysis_version = $3
+          )::int AS pattern,
 
           (
             SELECT COUNT(*)
             FROM temporal_eligible
-          )::int
-            AS temporal_eligible,
+          )::int AS temporal_eligible,
 
           (
             SELECT COUNT(*)
+
             FROM temporal_eligible e
+
             JOIN human_presence_episode_profile_temporal_context_analyses t
               ON t.evidence_event_id = e.event_id
-             AND t.episode_profile_temporal_context_analysis_version = $3
-          )::int
-            AS temporal,
+             AND t.episode_profile_temporal_context_analysis_version = $4
+          )::int AS temporal,
 
           (
             SELECT COUNT(*)
+
             FROM temporal_eligible e
+
             JOIN human_presence_temporal_context_data_sufficiency_analyses s
               ON s.evidence_event_id = e.event_id
-             AND s.temporal_context_data_sufficiency_version = $4
-          )::int
-            AS sufficiency
+             AND s.temporal_context_data_sufficiency_version = $5
+          )::int AS sufficiency
       `,
       [
+        snapshotEventIds,
         PROFILE_VERSION,
         PATTERN_VERSION,
         TEMPORAL_VERSION,
-        SUFFICIENCY_VERSION,
-        eligible.map((row) => row.evidence_event_id)
+        SUFFICIENCY_VERSION
       ]
     );
 
@@ -437,19 +459,31 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
   const duplicates =
     await db.query(
       `
+        WITH eligible AS (
+          SELECT
+            unnest($1::text[]) AS event_id
+        )
+
         SELECT
           (
             SELECT COUNT(*)
+
             FROM (
               SELECT
-                evidence_event_id,
-                episode_profile_analysis_version
+                p.evidence_event_id,
+                p.episode_profile_analysis_version
 
-              FROM human_presence_episode_profile_analyses
+              FROM human_presence_episode_profile_analyses p
+
+              JOIN eligible e
+                ON e.event_id = p.evidence_event_id
+
+              WHERE
+                p.episode_profile_analysis_version = $2
 
               GROUP BY
-                evidence_event_id,
-                episode_profile_analysis_version
+                p.evidence_event_id,
+                p.episode_profile_analysis_version
 
               HAVING COUNT(*) > 1
             ) d
@@ -457,16 +491,23 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
           (
             SELECT COUNT(*)
+
             FROM (
               SELECT
-                evidence_event_id,
-                episode_profile_pattern_analysis_version
+                q.evidence_event_id,
+                q.episode_profile_pattern_analysis_version
 
-              FROM human_presence_episode_profile_pattern_analyses
+              FROM human_presence_episode_profile_pattern_analyses q
+
+              JOIN eligible e
+                ON e.event_id = q.evidence_event_id
+
+              WHERE
+                q.episode_profile_pattern_analysis_version = $3
 
               GROUP BY
-                evidence_event_id,
-                episode_profile_pattern_analysis_version
+                q.evidence_event_id,
+                q.episode_profile_pattern_analysis_version
 
               HAVING COUNT(*) > 1
             ) d
@@ -474,16 +515,23 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
           (
             SELECT COUNT(*)
+
             FROM (
               SELECT
-                evidence_event_id,
-                episode_profile_temporal_context_analysis_version
+                t.evidence_event_id,
+                t.episode_profile_temporal_context_analysis_version
 
-              FROM human_presence_episode_profile_temporal_context_analyses
+              FROM human_presence_episode_profile_temporal_context_analyses t
+
+              JOIN eligible e
+                ON e.event_id = t.evidence_event_id
+
+              WHERE
+                t.episode_profile_temporal_context_analysis_version = $4
 
               GROUP BY
-                evidence_event_id,
-                episode_profile_temporal_context_analysis_version
+                t.evidence_event_id,
+                t.episode_profile_temporal_context_analysis_version
 
               HAVING COUNT(*) > 1
             ) d
@@ -491,21 +539,35 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
           (
             SELECT COUNT(*)
+
             FROM (
               SELECT
-                evidence_event_id,
-                temporal_context_data_sufficiency_version
+                s.evidence_event_id,
+                s.temporal_context_data_sufficiency_version
 
-              FROM human_presence_temporal_context_data_sufficiency_analyses
+              FROM human_presence_temporal_context_data_sufficiency_analyses s
+
+              JOIN eligible e
+                ON e.event_id = s.evidence_event_id
+
+              WHERE
+                s.temporal_context_data_sufficiency_version = $5
 
               GROUP BY
-                evidence_event_id,
-                temporal_context_data_sufficiency_version
+                s.evidence_event_id,
+                s.temporal_context_data_sufficiency_version
 
               HAVING COUNT(*) > 1
             ) d
           )::int AS sufficiency_duplicates
-      `
+      `,
+      [
+        snapshotEventIds,
+        PROFILE_VERSION,
+        PATTERN_VERSION,
+        TEMPORAL_VERSION,
+        SUFFICIENCY_VERSION
+      ]
     );
 
   const duplicateCounts =
@@ -526,13 +588,16 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
   const boundary =
     await db.query(
       `
-        SELECT COUNT(*)::int AS violations
+        SELECT
+          COUNT(*)::int AS violations
 
         FROM
           human_presence_temporal_context_data_sufficiency_analyses
 
         WHERE
-          temporal_context_data_sufficiency_version = $1
+          evidence_event_id = ANY($1::text[])
+
+          AND temporal_context_data_sufficiency_version = $2
 
           AND (
             COALESCE(
@@ -564,7 +629,10 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
                  IS NOT NULL
           )
       `,
-      [SUFFICIENCY_VERSION]
+      [
+        snapshotEventIds,
+        SUFFICIENCY_VERSION
+      ]
     );
 
   if (boundary.rows[0].violations !== 0) {
@@ -587,6 +655,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
     patternInserted,
     temporalInserted,
+    temporalIneligible,
     sufficiencyInserted,
 
     finalCoverage: {
