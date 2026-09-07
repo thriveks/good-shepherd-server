@@ -344,7 +344,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
       `
         WITH eligible AS (
           SELECT
-            unnest($6::text[]) AS event_id
+            unnest($5::text[]) AS event_id
         ),
 
         temporal_eligible AS (
@@ -355,7 +355,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
           JOIN human_presence_episode_profile_analyses p
             ON p.evidence_event_id = e.event_id
-           AND p.episode_profile_analysis_version = $2
+           AND p.episode_profile_analysis_version = $1
 
           WHERE
             jsonb_typeof(
@@ -382,7 +382,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
             FROM eligible e
             JOIN human_presence_episode_profile_pattern_analyses q
               ON q.evidence_event_id = e.event_id
-             AND q.episode_profile_pattern_analysis_version = $3
+             AND q.episode_profile_pattern_analysis_version = $2
           )::int
             AS pattern,
 
@@ -397,7 +397,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
             FROM temporal_eligible e
             JOIN human_presence_episode_profile_temporal_context_analyses t
               ON t.evidence_event_id = e.event_id
-             AND t.episode_profile_temporal_context_analysis_version = $4
+             AND t.episode_profile_temporal_context_analysis_version = $3
           )::int
             AS temporal,
 
@@ -406,12 +406,11 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
             FROM temporal_eligible e
             JOIN human_presence_temporal_context_data_sufficiency_analyses s
               ON s.evidence_event_id = e.event_id
-             AND s.temporal_context_data_sufficiency_version = $5
+             AND s.temporal_context_data_sufficiency_version = $4
           )::int
             AS sufficiency
       `,
       [
-        INTERPRETATION_VERSION,
         PROFILE_VERSION,
         PATTERN_VERSION,
         TEMPORAL_VERSION,
