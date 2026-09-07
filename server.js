@@ -44,6 +44,10 @@ const {
 const {
   buildAndPersistHumanPresenceEpisodeProfilePatternAnalysisV1
 } = require("./lib/human_presence_episode_profile_pattern_analysis_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceEpisodeProfileTemporalContextAnalysisV1
+} = require("./lib/human_presence_episode_profile_temporal_context_analysis_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -12767,6 +12771,20 @@ async function ingestMqttV2Event(nodeId, payload) {
         "Human Presence Episode Profile Pattern Analysis v1:",
         evidenceResult.eventId,
         episodeProfilePatternAnalysisResult.persistence.inserted
+          ? "persisted"
+          : "already_exists"
+      );
+
+      const episodeProfileTemporalContextAnalysisResult =
+        await buildAndPersistHumanPresenceEpisodeProfileTemporalContextAnalysisV1(
+          pool,
+          evidenceResult.eventId
+        );
+
+      console.log(
+        "Human Presence Episode Profile Temporal Context Analysis v1:",
+        evidenceResult.eventId,
+        episodeProfileTemporalContextAnalysisResult.persistence.inserted
           ? "persisted"
           : "already_exists"
       );
