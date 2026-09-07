@@ -18,6 +18,9 @@ const episodeProfilePatternBackfillV1Migration =
 const episodeProfileTemporalContextAnalysisV1Migration =
   require("./migrations/2026-09-07-human-presence-episode-profile-temporal-context-analysis-v1");
 
+const episodeProfileTemporalContextBackfillV1Migration =
+  require("./migrations/2026-09-07-human-presence-episode-profile-temporal-context-backfill-v1");
+
 if (!process.env.DATABASE_URL) {
   console.error(
     "Good Shepherd database migration failed: DATABASE_URL is required"
@@ -258,6 +261,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       episodeProfileTemporalContextAnalysisV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      episodeProfileTemporalContextBackfillV1Migration
     );
 
     /*
