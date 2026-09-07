@@ -48,6 +48,10 @@ const {
 const {
   buildAndPersistHumanPresenceEpisodeProfileTemporalContextAnalysisV1
 } = require("./lib/human_presence_episode_profile_temporal_context_analysis_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceTemporalContextDataSufficiencyV1
+} = require("./lib/human_presence_temporal_context_data_sufficiency_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -12787,6 +12791,23 @@ async function ingestMqttV2Event(nodeId, payload) {
         episodeProfileTemporalContextAnalysisResult.persistence.inserted
           ? "persisted"
           : "already_exists"
+      );
+
+      const temporalContextDataSufficiencyResult =
+        await buildAndPersistHumanPresenceTemporalContextDataSufficiencyV1(
+          pool,
+          evidenceResult.eventId
+        );
+
+      console.log(
+        "Human Presence Temporal Context Data Sufficiency v1:",
+        evidenceResult.eventId,
+        temporalContextDataSufficiencyResult.persistence.inserted
+          ? "persisted"
+          : "already_exists",
+        temporalContextDataSufficiencyResult
+          .temporalContextDataSufficiencyAnalysis
+          .empiricalCalibrationStatus
       );
     }
 
