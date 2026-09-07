@@ -1,5 +1,10 @@
 "use strict";
 
+const candidateInterpretationRulesV1Migration =
+  require(
+    "./migrations/2026-09-07-human-presence-candidate-interpretation-rules-v1"
+  );
+
 const { Pool } = require("pg");
 
 const {
@@ -290,6 +295,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       episodeProfileChainRecoveryV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      candidateInterpretationRulesV1Migration
     );
 
     /*

@@ -52,6 +52,10 @@ const {
 const {
   buildAndPersistHumanPresenceTemporalContextDataSufficiencyV1
 } = require("./lib/human_presence_temporal_context_data_sufficiency_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceCandidateInterpretationRulesV1
+} = require("./lib/human_presence_candidate_interpretation_rules_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -12808,6 +12812,20 @@ async function ingestMqttV2Event(nodeId, payload) {
         temporalContextDataSufficiencyResult
           .temporalContextDataSufficiencyAnalysis
           .empiricalCalibrationStatus
+      );
+
+      const candidateInterpretationRulesResult =
+        await buildAndPersistHumanPresenceCandidateInterpretationRulesV1(
+          pool,
+          evidenceResult.eventId
+        );
+
+      console.log(
+        "Human Presence Candidate Interpretation Rules v1:",
+        evidenceResult.eventId,
+        candidateInterpretationRulesResult.persistence.inserted
+          ? "persisted"
+          : "already_exists"
       );
     }
 
