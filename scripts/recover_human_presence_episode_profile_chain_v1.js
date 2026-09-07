@@ -244,6 +244,43 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
   let patternInserted = 0;
   let temporalInserted = 0;
   let sufficiencyInserted = 0;
+  let temporalIneligible = 0;
+
+  /*
+   * Temporal Context v1 requires a finite parent
+   * profileMeanRelativeDelta.
+   *
+   * The first valid Episode Profile in a resident/location cohort
+   * legitimately has no prior Episode Profile history, so its
+   * profileMeanRelativeDelta is null under the frozen Profile v1
+   * contract. That row remains valid for Profile and Pattern, but is
+   * structurally ineligible for Temporal Context and Sufficiency.
+   */
+  const temporalEligibility =
+    await db.query(
+      `
+        SELECT
+          evidence_event_id
+
+        FROM human_presence_episode_profile_analyses
+
+        WHERE
+          episode_profile_analysis_version = $1
+
+          AND jsonb_typeof(
+                episode_profile_analysis_payload
+                  -> 'profileMeanRelativeDelta'
+              ) = 'number'
+      `,
+      [PROFILE_VERSION]
+    );
+
+  const temporalEligibleEventIds =
+    new Set(
+      temporalEligibility.rows.map(
+        (row) => row.evidence_event_id
+      )
+    );
 
   for (const row of eligible) {
     const pattern =
@@ -259,6 +296,15 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
     }
 
     patternInserted += 1;
+
+    if (
+      !temporalEligibleEventIds.has(
+        row.evidence_event_id
+      )
+    ) {
+      temporalIneligible += 1;
+      continue;
+    }
 
     const temporal =
       await buildAndPersistHumanPresenceEpisodeProfileTemporalContextAnalysisV1(
@@ -313,6 +359,23 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
             AND i.authority_resolution_status =
                 'resolved_assigned_sensor'
+        ),
+
+        temporal_eligible AS (
+          SELECT
+            e.event_id
+
+          FROM eligible e
+
+          JOIN human_presence_episode_profile_analyses p
+            ON p.evidence_event_id = e.event_id
+           AND p.episode_profile_analysis_version = $2
+
+          WHERE
+            jsonb_typeof(
+              p.episode_profile_analysis_payload
+                -> 'profileMeanRelativeDelta'
+            ) = 'number'
         )
 
         SELECT
@@ -339,7 +402,13 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
           (
             SELECT COUNT(*)
-            FROM eligible e
+            FROM temporal_eligible
+          )::int
+            AS temporal_eligible,
+
+          (
+            SELECT COUNT(*)
+            FROM temporal_eligible e
             JOIN human_presence_episode_profile_temporal_context_analyses t
               ON t.evidence_event_id = e.event_id
              AND t.episode_profile_temporal_context_analysis_version = $4
@@ -348,7 +417,7 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
 
           (
             SELECT COUNT(*)
-            FROM eligible e
+            FROM temporal_eligible e
             JOIN human_presence_temporal_context_data_sufficiency_analyses s
               ON s.evidence_event_id = e.event_id
              AND s.temporal_context_data_sufficiency_version = $5
@@ -370,8 +439,8 @@ async function recoverHumanPresenceEpisodeProfileChainV1(
   if (
     counts.eligible !== counts.profile ||
     counts.eligible !== counts.pattern ||
-    counts.eligible !== counts.temporal ||
-    counts.eligible !== counts.sufficiency
+    counts.temporal_eligible !== counts.temporal ||
+    counts.temporal_eligible !== counts.sufficiency
   ) {
     throw new Error(
       "Recovery validation failed: " +
