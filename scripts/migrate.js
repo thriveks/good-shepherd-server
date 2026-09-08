@@ -1,5 +1,10 @@
 "use strict";
 
+const labeledEventCaptureV1Migration =
+  require(
+    "./migrations/2026-09-08-human-presence-labeled-event-capture-v1"
+  );
+
 const longitudinalInterpretationValidationV1Migration =
   require(
     "./migrations/2026-09-08-human-presence-longitudinal-interpretation-validation-v1"
@@ -320,6 +325,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       longitudinalInterpretationValidationV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      labeledEventCaptureV1Migration
     );
 
     /*
