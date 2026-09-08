@@ -7,6 +7,9 @@ const {
 const VERSION =
   "2026-09-08-human-presence-labeled-event-matching-validation-v1";
 
+const DESCRIPTION =
+  "Persist descriptive human presence labeled-event matching validation v1";
+
 async function up(client) {
   await client.query(`
     CREATE TABLE IF NOT EXISTS
@@ -94,6 +97,7 @@ async function up(client) {
 }
 
 module.exports = {
-  version: VERSION,
+  VERSION,
+  DESCRIPTION,
   up
 };
