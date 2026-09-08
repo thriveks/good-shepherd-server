@@ -1,5 +1,10 @@
 "use strict";
 
+const nonOperationalInterpretationV1Migration =
+  require(
+    "./migrations/2026-09-08-human-presence-non-operational-interpretation-v1"
+  );
+
 const candidateInterpretationRulesV1Migration =
   require(
     "./migrations/2026-09-07-human-presence-candidate-interpretation-rules-v1"
@@ -300,6 +305,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       candidateInterpretationRulesV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      nonOperationalInterpretationV1Migration
     );
 
     /*

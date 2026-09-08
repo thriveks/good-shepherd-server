@@ -56,6 +56,10 @@ const {
 const {
   buildAndPersistHumanPresenceCandidateInterpretationRulesV1
 } = require("./lib/human_presence_candidate_interpretation_rules_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceNonOperationalInterpretationV1
+} = require("./lib/human_presence_non_operational_interpretation_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -12824,6 +12828,20 @@ async function ingestMqttV2Event(nodeId, payload) {
         "Human Presence Candidate Interpretation Rules v1:",
         evidenceResult.eventId,
         candidateInterpretationRulesResult.persistence.inserted
+          ? "persisted"
+          : "already_exists"
+      );
+
+      const nonOperationalInterpretationResult =
+        await buildAndPersistHumanPresenceNonOperationalInterpretationV1(
+          pool,
+          evidenceResult.eventId
+        );
+
+      console.log(
+        "Human Presence Non-Operational Interpretation v1:",
+        evidenceResult.eventId,
+        nonOperationalInterpretationResult.persistence.inserted
           ? "persisted"
           : "already_exists"
       );
