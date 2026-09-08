@@ -60,6 +60,10 @@ const {
 const {
   buildAndPersistHumanPresenceNonOperationalInterpretationV1
 } = require("./lib/human_presence_non_operational_interpretation_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceLongitudinalInterpretationValidationV1
+} = require("./lib/human_presence_longitudinal_interpretation_validation_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -12842,6 +12846,20 @@ async function ingestMqttV2Event(nodeId, payload) {
         "Human Presence Non-Operational Interpretation v1:",
         evidenceResult.eventId,
         nonOperationalInterpretationResult.persistence.inserted
+          ? "persisted"
+          : "already_exists"
+      );
+
+      const longitudinalInterpretationValidationResult =
+        await buildAndPersistHumanPresenceLongitudinalInterpretationValidationV1(
+          pool,
+          evidenceResult.eventId
+        );
+
+      console.log(
+        "Human Presence Longitudinal Interpretation Validation v1:",
+        evidenceResult.eventId,
+        longitudinalInterpretationValidationResult.persistence.inserted
           ? "persisted"
           : "already_exists"
       );
