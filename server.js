@@ -12743,6 +12743,73 @@ function validateHighResolutionActivityEvidenceV1(nodeId, payload) {
   };
 }
 
+
+async function persistHighResolutionActivityEvidenceV1(payload) {
+  const eventId = randomUUID();
+  const receivedAt = new Date().toISOString();
+
+  const resolvedNodeId = cleanText(payload?.nodeId);
+  const resolvedLocationName = cleanText(payload?.locationName) || null;
+  const resolvedSourceKey = cleanText(payload?.sourceKey) || null;
+  const resolvedResidentName =
+    cleanText(payload?.residentName) || "Unassigned";
+
+  const sourceName = "LD2410 High Resolution Observer";
+  const message = "High-resolution activity evidence batch";
+  const alertLevel = "observer_only";
+  const timeText = "Development Observer Evidence";
+
+  await pool.query(
+    `
+      INSERT INTO webhook_events (
+        id,
+        node_id,
+        location_name,
+        source_key,
+        source_name,
+        resident_name,
+        message,
+        alert_level,
+        time_text,
+        timestamp,
+        event_type,
+        sensor_type,
+        event_payload,
+        acknowledged,
+        acknowledged_at,
+        resolution_note
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8,
+        $9, $10, $11, $12, $13::jsonb,
+        TRUE, $10,
+        'Development-only observer evidence; not an operational alert'
+      )
+    `,
+    [
+      eventId,
+      resolvedNodeId || null,
+      resolvedLocationName,
+      resolvedSourceKey,
+      sourceName,
+      resolvedResidentName,
+      message,
+      alertLevel,
+      timeText,
+      receivedAt,
+      "high_resolution_activity_evidence",
+      "human_presence",
+      JSON.stringify(payload)
+    ]
+  );
+
+  return {
+    eventId,
+    receivedAt
+  };
+}
+
+
 async function ingestMqttV2Event(nodeId, payload) {
   const eventType = cleanText(payload?.eventType).toLowerCase();
 
@@ -12750,13 +12817,17 @@ async function ingestMqttV2Event(nodeId, payload) {
     const validatedPayload =
       validateHighResolutionActivityEvidenceV1(nodeId, payload);
 
-    await postLocalV2Route("/webhook", validatedPayload);
+    const persistence =
+      await persistHighResolutionActivityEvidenceV1(
+        validatedPayload
+      );
 
     console.log(
       "MQTT V2 high-resolution activity evidence ingested:",
       validatedPayload.nodeId,
       validatedPayload.batchSequence,
-      validatedPayload.sampleCount
+      validatedPayload.sampleCount,
+      persistence.eventId
     );
 
     return;
