@@ -12631,8 +12631,136 @@ async function ingestMqttV2CandidateHistoryEvidence(nodeId, payload) {
   };
 }
 
+
+function validateHighResolutionActivityEvidenceV1(nodeId, payload) {
+  const normalizedPayload = normalizeJsonObject(payload);
+  const eventType = cleanText(normalizedPayload.eventType).toLowerCase();
+
+  if (eventType !== "high_resolution_activity_evidence") {
+    throw new Error(
+      `Unexpected high-resolution activity evidence event type: ${
+        eventType || "missing"
+      }`
+    );
+  }
+
+  const resolvedNodeId =
+    cleanText(nodeId || normalizedPayload.nodeId);
+
+  if (!resolvedNodeId) {
+    throw new Error(
+      "high_resolution_activity_evidence missing nodeId"
+    );
+  }
+
+  if (cleanText(normalizedPayload.protocolVersion) !== "2.0") {
+    throw new Error(
+      "high_resolution_activity_evidence unsupported protocolVersion"
+    );
+  }
+
+  if (
+    cleanText(normalizedPayload.evidenceSchemaVersion) !== "1.0"
+  ) {
+    throw new Error(
+      "high_resolution_activity_evidence unsupported evidenceSchemaVersion"
+    );
+  }
+
+  if (normalizedPayload.observerOnly !== true) {
+    throw new Error(
+      "high_resolution_activity_evidence requires observerOnly=true"
+    );
+  }
+
+  if (normalizedPayload.developmentOnly !== true) {
+    throw new Error(
+      "high_resolution_activity_evidence requires developmentOnly=true"
+    );
+  }
+
+  if (
+    cleanText(normalizedPayload.sampleEncoding) !==
+    "compact-array-v1"
+  ) {
+    throw new Error(
+      "high_resolution_activity_evidence unsupported sampleEncoding"
+    );
+  }
+
+  const samples = normalizedPayload.samples;
+
+  if (!Array.isArray(samples)) {
+    throw new Error(
+      "high_resolution_activity_evidence samples must be an array"
+    );
+  }
+
+  if (samples.length < 1 || samples.length > 12) {
+    throw new Error(
+      `high_resolution_activity_evidence sample count out of range: ${
+        samples.length
+      }`
+    );
+  }
+
+  const declaredSampleCount =
+    Number(normalizedPayload.sampleCount);
+
+  if (
+    !Number.isInteger(declaredSampleCount) ||
+    declaredSampleCount !== samples.length
+  ) {
+    throw new Error(
+      "high_resolution_activity_evidence sampleCount mismatch"
+    );
+  }
+
+  for (let i = 0; i < samples.length; i += 1) {
+    const sample = samples[i];
+
+    if (!Array.isArray(sample) || sample.length !== 12) {
+      throw new Error(
+        `high_resolution_activity_evidence invalid sample at index ${i}`
+      );
+    }
+
+    for (let j = 0; j < sample.length; j += 1) {
+      if (
+        typeof sample[j] !== "number" ||
+        !Number.isFinite(sample[j])
+      ) {
+        throw new Error(
+          `high_resolution_activity_evidence non-numeric sample value at ${i}:${j}`
+        );
+      }
+    }
+  }
+
+  return {
+    ...normalizedPayload,
+    nodeId: resolvedNodeId
+  };
+}
+
 async function ingestMqttV2Event(nodeId, payload) {
   const eventType = cleanText(payload?.eventType).toLowerCase();
+
+  if (eventType === "high_resolution_activity_evidence") {
+    const validatedPayload =
+      validateHighResolutionActivityEvidenceV1(nodeId, payload);
+
+    await postLocalV2Route("/webhook", validatedPayload);
+
+    console.log(
+      "MQTT V2 high-resolution activity evidence ingested:",
+      validatedPayload.nodeId,
+      validatedPayload.batchSequence,
+      validatedPayload.sampleCount
+    );
+
+    return;
+  }
 
   if (eventType === "candidate_history_evidence") {
     const evidenceResult =
