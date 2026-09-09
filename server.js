@@ -127,7 +127,7 @@ const SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES = 5;
 const SENSOR_COMMAND_OTA_EXECUTION_TIMEOUT_MINUTES = 30;
 const SENSOR_COMMAND_OTA_PENDING_EXPIRATION_MINUTES = 1440;
 const SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES = 2;
-const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"];
+const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset", "high_res_enable", "high_res_disable"];
 const MONITOR_COMMAND_TYPES = ["ping", "ffmpeg_check", "diagnostic_report", "reload_cameras", "sync_cameras_from_cloud", "restart_monitors", "clear_last_error", "rtsp_test"];
 const WATCHDOG_COMMAND_TYPES = ["watchdog_ping", "watchdog_health", "start_local_monitor", "stop_local_monitor", "restart_local_monitor"];
 let acceptedWebhookCountSinceStart = 0;
@@ -6451,7 +6451,7 @@ async function failStaleSensorCommands(client, nodeId) {
       completed_at = NOW(),
       error = 'Expired pending sensor command'
     WHERE node_id = $1
-      AND command_type IN ('reconfigure', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
+      AND command_type IN ('reconfigure', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable')
       AND status = 'pending'
       AND (
         (command_type = 'update_firmware'
@@ -10475,15 +10475,7 @@ app.post("/sensor-commands", async (req, res) => {
       return res.status(400).json({
         success: false,
         error: "Invalid or missing commandType",
-        allowedCommandTypes: [
-          "reconfigure",
-          "update_firmware",
-          "identify",
-          "locate",
-          "ping",
-          "reboot",
-          "factory_reset"
-        ]
+        allowedCommandTypes: ESP32_SENSOR_COMMAND_TYPES
       });
     }
 
@@ -10494,19 +10486,11 @@ app.post("/sensor-commands", async (req, res) => {
       });
     }
 
-    if (!["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset"].includes(commandType)) {
+    if (!ESP32_SENSOR_COMMAND_TYPES.includes(commandType)) {
       return res.status(400).json({
         success: false,
-        error: "ESP32 sensor firmware supports reconfigure, update_firmware, identify, locate, ping, reboot, and factory_reset.",
-        allowedCommandTypes: [
-          "reconfigure",
-          "update_firmware",
-          "identify",
-          "locate",
-          "ping",
-          "reboot",
-          "factory_reset"
-        ]
+        error: "Unsupported ESP32 sensor command type.",
+        allowedCommandTypes: ESP32_SENSOR_COMMAND_TYPES
       });
     }
 
@@ -10825,7 +10809,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
       FROM node_commands
       WHERE node_id = $1
         AND status = 'pending'
-        AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset')
+        AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset', 'high_res_enable', 'high_res_disable')
         AND (
           command_type = 'factory_reset'
           OR requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
