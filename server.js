@@ -2277,6 +2277,192 @@ function buildAIStatusForResident({
   };
 }
 
+
+function buildResidentServerDrivenPresentationV1({
+  resident,
+  aiStatus,
+  actionGuidance,
+  longitudinalIntelligence,
+  presenceIntelligence
+}) {
+  const sections = [];
+
+  const residentName = cleanText(resident?.name) || "the resident";
+  const residentAlertLevel = cleanText(resident?.alertLevel).toLowerCase();
+
+  let heroState = "normal";
+  let heroHeadline = "Everything looks normal";
+  let heroDetail = `${residentName} is being monitored and no urgent changes currently require attention.`;
+  let heroBadge = "Normal monitoring";
+  let heroSystemImage = "sparkles";
+  let heroBadgeImage = "checkmark.circle.fill";
+
+  if (residentAlertLevel === "critical") {
+    heroState = "critical";
+    heroHeadline = "Immediate attention is needed";
+    heroDetail =
+      cleanText(actionGuidance?.actionSummary) ||
+      cleanText(aiStatus?.aiExplanation) ||
+      `Good Shepherd detected a significant change for ${residentName}. Review the latest alert now.`;
+    heroBadge = "Immediate attention";
+    heroSystemImage = "exclamationmark.octagon.fill";
+    heroBadgeImage = "exclamationmark.triangle.fill";
+  } else if (residentAlertLevel === "caution") {
+    heroState = "caution";
+    heroHeadline = "A change may need review";
+    heroDetail =
+      cleanText(actionGuidance?.actionSummary) ||
+      cleanText(aiStatus?.aiExplanation) ||
+      `Good Shepherd noticed something outside the usual pattern for ${residentName}.`;
+    heroBadge = "Review recommended";
+    heroSystemImage = "sparkles";
+    heroBadgeImage = "exclamationmark.triangle.fill";
+  }
+
+  sections.push({
+    id: "overall-status",
+    type: "hero",
+    title: "Good Shepherd AI",
+    headline: heroHeadline,
+    detail: heroDetail,
+    state: heroState,
+    systemImage: heroSystemImage,
+    badge: heroBadge,
+    badgeImage: heroBadgeImage,
+    sortOrder: 0
+  });
+
+  const presenceSensorCount = Number(presenceIntelligence?.presenceSensorCount || 0);
+  const presenceStatus = cleanText(presenceIntelligence?.presenceStatus);
+  const presenceExplanation = cleanText(presenceIntelligence?.presenceExplanation);
+
+  if (presenceSensorCount > 0 && presenceStatus && presenceStatus !== "No Presence Sensor") {
+    let presenceState = "normal";
+    const normalizedPresence = presenceStatus.toLowerCase();
+
+    if (
+      normalizedPresence.includes("very long") ||
+      normalizedPresence.includes("active long")
+    ) {
+      presenceState = "observe";
+    } else if (
+      normalizedPresence.includes("unknown")
+    ) {
+      presenceState = "informational";
+    }
+
+    sections.push({
+      id: "human-presence",
+      type: "status",
+      title: "Human Presence",
+      headline: presenceStatus,
+      detail: presenceExplanation || "Human-presence monitoring is active.",
+      state: presenceState,
+      systemImage: "dot.radiowaves.left.and.right",
+      sortOrder: 10
+    });
+  }
+
+  const milestones = Array.isArray(longitudinalIntelligence?.routineMilestones)
+    ? longitudinalIntelligence.routineMilestones
+    : [];
+
+  const firstActivity = milestones.find(
+    (milestone) => cleanText(milestone?.key) === "first_daytime_activity"
+  );
+
+  if (firstActivity) {
+    const status = cleanText(firstActivity.status) || "Morning activity";
+    const normalizedStatus = status.toLowerCase();
+
+    let state = "informational";
+    if (normalizedStatus.includes("within")) {
+      state = "normal";
+    } else if (
+      normalizedStatus.includes("earlier") ||
+      normalizedStatus.includes("later")
+    ) {
+      state = "observe";
+    }
+
+    sections.push({
+      id: "first-daytime-activity",
+      type: "observation",
+      title: "Morning Activity",
+      headline: status,
+      detail:
+        cleanText(firstActivity.detail) ||
+        "Good Shepherd is comparing today's first activity with the resident's usual routine.",
+      state,
+      systemImage: "sunrise.fill",
+      sortOrder: 20
+    });
+  }
+
+  const overnightActivity = milestones.find(
+    (milestone) => cleanText(milestone?.key) === "overnight_activity"
+  );
+
+  if (overnightActivity) {
+    const status = cleanText(overnightActivity.status) || "Overnight activity";
+    const normalizedStatus = status.toLowerCase();
+
+    let state = "informational";
+    if (normalizedStatus.includes("above")) {
+      state = "observe";
+    } else if (normalizedStatus.includes("usual")) {
+      state = "normal";
+    }
+
+    sections.push({
+      id: "overnight-activity",
+      type: "observation",
+      title: "Overnight Activity",
+      headline: status,
+      detail:
+        cleanText(overnightActivity.detail) ||
+        "Good Shepherd is comparing overnight activity with the resident's established routine.",
+      state,
+      systemImage: "moon.stars.fill",
+      sortOrder: 30
+    });
+  }
+
+  const rawRoutineConsistencyScore =
+    longitudinalIntelligence?.routineConsistencyScore;
+  const routineConsistencyScore =
+    rawRoutineConsistencyScore === null ||
+    rawRoutineConsistencyScore === undefined
+      ? null
+      : Number(rawRoutineConsistencyScore);
+
+  if (Number.isFinite(routineConsistencyScore)) {
+    const label =
+      cleanText(longitudinalIntelligence?.routineConsistencyLabel) ||
+      "Learning";
+
+    const normalizedLabel = label.toLowerCase();
+
+    sections.push({
+      id: "routine-consistency",
+      type: "metric",
+      title: "Daily Routine",
+      headline: label,
+      detail: `Routine consistency is ${label.toLowerCase()} (${routineConsistencyScore}/100) based on recent monitored activity.`,
+      state: normalizedLabel.includes("learning")
+        ? "learning"
+        : "informational",
+      systemImage: "waveform.path.ecg",
+      sortOrder: 40
+    });
+  }
+
+  return {
+    presentationVersion: 1,
+    sections
+  };
+}
+
 async function buildAIMotionSummary() {
   const now = new Date();
   const currentLocalHour = localHourFromDate(now) ?? 0;
@@ -2732,6 +2918,13 @@ async function buildAIMotionSummary() {
       aiConfidence: aiConfidence.aiConfidence,
       aiConfidenceScore: aiConfidence.aiConfidenceScore,
       aiConfidenceExplanation: aiConfidence.aiConfidenceExplanation,
+      presentation: buildResidentServerDrivenPresentationV1({
+        resident,
+        aiStatus,
+        actionGuidance,
+        longitudinalIntelligence,
+        presenceIntelligence
+      }),
       behaviorInsights,
       openAlertCount: openAlerts.length,
       recentOpenAlertCount: recentOpenAlerts.length,
