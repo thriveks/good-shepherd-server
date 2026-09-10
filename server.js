@@ -10426,7 +10426,7 @@ app.get("/sensor-commands/:nodeId", async (req, res) => {
       `
       ${nodeCommandSelectSQL()}
       WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable')
         AND ($2::boolean = FALSE OR status IN ('pending', 'running'))
       ORDER BY requested_at DESC
       LIMIT 50
@@ -10724,7 +10724,7 @@ app.post("/sensor-commands/:nodeId/cleanup", async (req, res) => {
         COUNT(*) FILTER (WHERE status = 'running')::int AS "runningCount"
       FROM node_commands
       WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware')
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable')
         AND status IN ('pending', 'running')
       `,
       [nodeId]
