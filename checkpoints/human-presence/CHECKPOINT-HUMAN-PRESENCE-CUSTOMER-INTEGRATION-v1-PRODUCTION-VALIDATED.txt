@@ -1,0 +1,104 @@
+GOOD SHEPHERD HOME MONITORING SYSTEM
+HUMAN PRESENCE CUSTOMER INTEGRATION v1
+PRODUCTION VALIDATED
+
+Validation date: 2026-09-10
+
+STATUS
+PASS — Human Presence Sensor 9 is functioning end-to-end in production.
+
+VALIDATED SENSOR
+Node ID: esp32-a02dbcabc31c
+Device type: human_presence
+Sensor: Human Presence Sensor - 9
+Resident: Good shepherd office
+Location: Office
+Room: mmWave prototype
+Hardware: LD2410
+
+SERVER FIX
+Production commit:
+4dc0378b35989d67457385a61e0822ccd220cd36
+
+Commit message:
+Fix human presence status persistence
+
+Verified repair:
+1. MQTT v2 status ingestion now persists the firmware boolean occupancy field:
+   diagnostics.presence
+
+2. Resident presence intelligence now reads boolean occupancy from:
+   health.diagnostics.presence
+
+The categorical event field presenceState remains separate and is not used as boolean occupancy.
+
+PRODUCTION DEPLOYMENT
+Render service:
+srv-d7h5hkhf9bms739m317g
+
+Validated deployment:
+dep-dahd1dajnfac738foj8g
+
+Deployment result:
+SUCCEEDED
+
+DATABASE VALIDATION
+Production node_health for esp32-a02dbcabc31c returned:
+
+monitor_status: Online
+diagnostics.presence: true
+transport: mqtt
+mqttProtocolVersion: 2.0
+roomName: mmWave prototype
+locationName: Office
+residentName: Good shepherd office
+
+Heartbeat was fresh at validation time.
+
+AI VALIDATION
+Production /ai/dashboard resolved the assigned human-presence sensor as:
+
+presenceSensorCount: 1
+latestPresenceState: true
+currentPresenceRooms: ["mmWave prototype"]
+presenceStatus: Presence Active
+presenceExplanation:
+Human presence is currently active in mmWave prototype.
+
+The previous customer-facing condition:
+Presence Unknown
+missing presence diagnostic
+
+was no longer present.
+
+IOS CUSTOMER VALIDATION
+Physical iPhone Customer View displayed:
+
+Human Presence
+Presence Active
+Current state: Present
+Current area: mmWave prototype
+Active duration: 1 minutes
+Last presence: 9/10/26, 10:48 AM
+Presence sensors: 1
+
+END-TO-END PATH VALIDATED
+LD2410
+→ ESP32 human_presence firmware
+→ MQTT
+→ server MQTT status ingestion
+→ node_health diagnostics
+→ resident AI presence intelligence
+→ production API
+→ iOS Customer View
+
+BOUNDARIES
+No firmware reflash was required.
+No iOS code change was required for this repair.
+No database schema change was required.
+Deprecated motion_presence was not reintroduced.
+Fall detection is not part of this validation.
+High-resolution mmWave research remains outside this production checkpoint.
+
+RESULT
+PRODUCTION VALIDATED — PASS
