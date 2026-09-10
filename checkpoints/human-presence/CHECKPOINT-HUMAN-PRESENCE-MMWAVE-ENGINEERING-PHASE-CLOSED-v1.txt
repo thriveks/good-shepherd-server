@@ -1,0 +1,257 @@
+GOOD SHEPHERD HOME MONITORING SYSTEM
+HUMAN PRESENCE / MMWAVE ENGINEERING PHASE CLOSED
+Version: v1
+Date: 2026-09-10
+
+STATUS
+======
+
+MMWAVE_ENGINEERING_PHASE=CLOSED
+PHYSICAL_TESTING=COMPLETE
+HIGH_RES_CAPTURE=VALIDATED
+RUNTIME_CONTROL=VALIDATED
+FEATURE_EVALUATION=COMPLETE
+PRODUCTION_CLEANUP=COMPLETE
+
+FALL_DETECTION=NOT_ESTABLISHED
+CLASSIFICATION_THRESHOLDS=NONE
+
+No fall-detection capability is claimed by this checkpoint.
+
+CURRENT HARDWARE
+================
+
+Sensor class:
+Human Presence / mmWave
+
+Radar:
+LD2410
+
+Validated device type:
+human_presence
+
+Deprecated combined device type:
+motion_presence
+
+The existing hardware remains unchanged.
+
+VALIDATED CAPABILITIES
+======================
+
+The Human Presence / mmWave development work established:
+
+1. Normal human-presence sensing remains operational.
+
+2. A separate high-resolution observer-only evidence channel was implemented
+   and validated without replacing normal mmWave operation.
+
+3. Approximate local acquisition cadence:
+   ~10 samples per second.
+
+4. Approximate development evidence transport cadence:
+   one compact batch approximately once per second while explicitly enabled.
+
+5. Runtime controls were implemented and production validated:
+   high_res_enable
+   high_res_disable
+
+6. High-resolution mode defaults OFF after reboot.
+
+7. Disabling high-resolution mode clears pending development evidence batches.
+
+8. Normal mmWave operation remains available while high-resolution development
+   capture is disabled.
+
+9. ESP32 uptime-based sensor-clock reconstruction was validated and removes
+   server receipt jitter from temporal sample spacing.
+
+10. Controlled labeled activity testing was completed.
+
+11. Normalized moving-distance temporal shape was supported as the strongest
+    evaluated temporal activity feature.
+
+12. Stationary spatial dispersion showed useful repeatability.
+
+13. Posture-transition direction showed repeatability for the tested geometry:
+    stand-up generally toward radar
+    sit-down generally away from radar
+
+14. Entry/exit directional behavior showed strong repeatability in the tested
+    geometry.
+
+15. General walking direction was rejected as a semantic activity classifier.
+
+16. movingTarget was rejected as a semantic walking/activity classifier.
+
+17. stationaryEnergy was rejected as a primary temporal feature because it was
+    effectively saturated during the controlled evidence set.
+
+18. radarPresence was rejected as a discriminative feature because it was
+    saturated during the controlled evidence set.
+
+19. stationaryTarget was rejected as a discriminative feature because it was
+    saturated during the controlled evidence set.
+
+20. targetState did not establish independent discriminative evidence.
+
+21. stablePresenceState did not establish independent discriminative evidence.
+
+22. Adding moving-energy temporal shape to normalized moving-distance temporal
+    shape did not improve the v1 evidence separation and was rejected from the
+    v1 combination.
+
+FALL-DETECTION BOUNDARY
+=======================
+
+Fall detection was NOT established.
+
+The controlled work did not justify:
+
+- a fall classifier
+- a fall probability score
+- a fall threshold
+- an emergency classification
+- a medical inference
+- automatic emergency escalation based on mmWave evidence
+- a claim that LD2410 movingTarget represents semantic human movement
+- a claim that distance trajectory alone distinguishes a fall from all
+  intentional activities
+
+Intentional lie-down and rise-from-lying tests were completed.
+
+Whole-event direction was not sufficiently repeatable to establish a
+fall-detection model.
+
+Temporal moving-distance structure was observed, but distance-only
+classification was not supported.
+
+Therefore future Good Shepherd product behavior must not label an mmWave event
+as a confirmed fall based on this engineering phase.
+
+PRODUCT-SAFE INTERPRETATION
+===========================
+
+The validated mmWave work may support product features concerning:
+
+- presence
+- room occupancy
+- activity/routine evidence
+- stationary-versus-spatially-dispersed behavior
+- longitudinal behavioral patterns
+- unusual activity observations
+- room entry/exit context where supported by broader system evidence
+- observer-only research/development activity characterization
+
+Any future customer-facing or operator-facing interpretation must preserve the
+difference between:
+
+A. measured sensor evidence
+B. behavioral interpretation
+C. operational alert policy
+
+No unsupported medical or emergency conclusion should be presented as sensor
+fact.
+
+HIGH-RESOLUTION DEVELOPMENT EVIDENCE
+====================================
+
+Production high-resolution evidence capture used:
+
+event_type:
+high_resolution_activity_evidence
+
+Node:
+esp32-a02dbcabc31c
+
+Source key:
+presence-a02dbcabc31c
+
+Captured rows:
+18987
+
+Capture window:
+2026-09-09 13:55:55.224+00
+through
+2026-09-09 20:31:58.919+00
+
+Capture span:
+06:36:03.695
+
+The complete development dataset was exported before deletion from the
+production webhook_events table.
+
+Archive:
+human-presence-high-resolution-evidence-2026-09-09.jsonl.gz
+
+Uncompressed JSONL SHA-256:
+2ad7c4a42a1c87a626dab8f0c273123ef5e7d6b61c3fcda9c700629f26a92861
+
+Production cleanup validation:
+PRODUCTION_HIGH_RES_ROWS_REMAINING=0
+
+Normal webhook history remained preserved.
+
+FROZEN REFERENCES
+=================
+
+Human Presence firmware checkpoint:
+0fa33bf0c5dbf64addb93a7a1abfab7a40d80037
+
+High-resolution evidence server/evidence checkpoint:
+d8583034d1003a0f50d974c4f4737bb29254bc83
+
+Production server commit:
+7530ed72638dd42183221418b97585575b86cbd7
+
+Production Render deployment:
+dep-daha0f142hec73fefvbg
+
+Final v2.4.4 firmware source SHA-256:
+2458762f4f68791d5306ea22e493cb984ea0ab6e820b4efdbaa91bfa56ea0635
+
+FINAL ENGINEERING DECISION
+==========================
+
+The current mmWave engineering phase is complete.
+
+Do not continue collecting generic physical test sessions.
+
+Do not create fall-detection thresholds from the current dataset.
+
+Do not modify or reflash the frozen v2.4.4 firmware merely to continue this
+phase.
+
+Do not enable continuous high-resolution evidence capture in normal production
+operation.
+
+Future work may use the validated evidence architecture deliberately if a new,
+defined research question requires it.
+
+The next project phase is product integration:
+
+Define how validated Human Presence / mmWave information is represented in:
+
+- customer iOS application
+- AI Dashboard
+- resident detail
+- sensor/device detail
+- monitoring-center/operator workflow
+
+without exposing unsupported engineering internals or implying fall detection.
+
+FINAL GATE
+==========
+
+MMWAVE_ENGINEERING_PHASE=CLOSED
+PHYSICAL_TESTING=COMPLETE
+FEATURE_EVALUATION=COMPLETE
+HIGH_RES_CAPTURE_RUNTIME=VALIDATED
+HIGH_RES_PRODUCTION_ROWS=REMOVED_AFTER_VERIFIED_ARCHIVE
+NORMAL_MMWAVE_OPERATION=PRESERVED
+FALL_DETECTION=NOT_ESTABLISHED
+CLASSIFICATION_THRESHOLDS=NONE
+PRODUCTION_CODE_CHANGE=NO
+DEPLOY=NO
+FIRMWARE_CHANGE=NO
+REFLASH=NO
+NEXT_PHASE=IOS_AND_PRODUCT_INTEGRATION
