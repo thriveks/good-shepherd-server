@@ -1,0 +1,539 @@
+GOOD SHEPHERD HOME MONITORING SYSTEM
+HUMAN PRESENCE / LD2410 mmWAVE
+
+HIGH-RESOLUTION ACTIVITY EVIDENCE v1
+PRODUCTION VALIDATED CHECKPOINT
+
+STATUS
+VALIDATED / FROZEN
+
+DATE
+2026-09-10
+
+PURPOSE
+
+This checkpoint preserves the completed Human Presence high-resolution
+mmWave evidence work, including:
+
+- passive server ingestion
+- controlled runtime enable/disable
+- production command lifecycle support
+- controlled physical activity evidence collection
+- temporal feature evaluation
+- final analytical boundaries
+- validated v2.4.4 firmware state
+
+This system remains observer-only.
+
+It does not establish fall detection, emergency detection, medical
+inference, or an operational activity classifier.
+
+
+============================================================
+FIRMWARE
+============================================================
+
+Firmware version:
+esp32-good-shepherd-human-presence-v2.4.4-controlled-high-resolution-evidence
+
+Firmware repository checkpoint:
+0fa33bf0c5dbf64addb93a7a1abfab7a40d80037
+
+Exact firmware source SHA-256:
+2458762f4f68791d5306ea22e493cb984ea0ab6e820b4efdbaa91bfa56ea0635
+
+Validated application SHA-256:
+1e10e4e255a2fab61bc3ce458284f0d87547b57665f62dfedac0376a7d1d534e
+
+Validated partition binary SHA-256:
+0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7
+
+Validated bootloader SHA-256:
+427f96e10c620c4f062dab15da54fc45494d897e8397ae6f3aecc98c42d7e379
+
+Validated boot_app0 SHA-256:
+f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0
+
+High-resolution boot default:
+OFF
+
+Runtime enable command:
+high_res_enable
+
+Runtime disable command:
+high_res_disable
+
+Runtime state persisted:
+NO
+
+Reboot behavior:
+Returns high-resolution evidence to OFF.
+
+Disabling:
+Clears pending high-resolution batch.
+
+Normal LD2410 operation:
+PRESERVED
+
+GPIO21 presence authority:
+PRESERVED
+
+Baseline processing:
+PRESERVED
+
+Candidate processing:
+PRESERVED
+
+Episode processing:
+PRESERVED
+
+BLE:
+PRESERVED
+
+OTA transport:
+PRESERVED
+
+Firmware compile:
+PASS
+
+Segmented flash:
+PASS
+
+Sensor9:
+esp32-a02dbcabc31c
+
+Reflash required:
+NO
+
+
+============================================================
+HIGH-RESOLUTION EVIDENCE TRANSPORT
+============================================================
+
+Local LD2410 sample cadence:
+Approximately 10 samples/second.
+
+Network persistence cadence:
+Approximately one compact batch/second when enabled.
+
+Event type:
+high_resolution_activity_evidence
+
+Sensor type:
+human_presence
+
+Observer-only:
+YES
+
+Development-only:
+YES
+
+Compact sample field order:
+
+0  frameSequence
+1  uptimeMs
+2  targetState
+3  radarPresence
+4  movingTarget
+5  movingDistanceCm
+6  movingEnergy
+7  stationaryTarget
+8  stationaryDistanceCm
+9  stationaryEnergy
+10 detectionDistanceCm
+11 stablePresenceState
+
+High-resolution evidence does not enter:
+
+- motion history
+- daily activity
+- normal sensor upsert path
+- candidate alert logic
+- operational alert processing
+
+
+============================================================
+SERVER IMPLEMENTATION
+============================================================
+
+Initial high-resolution ingestion:
+b40a38642d9df6e407d5097be59d229b6086a6c7
+
+Passive webhook_events persistence fix:
+6276458fd3e4ed0c398e522b61a77adea41eb916
+
+Runtime command support development checkpoint:
+8209b7590a232f9190bb71c133bc1dde635bd1b7
+
+Runtime command production commit:
+dca19db97384d2237fdac9f6a1720037d3ae22f4
+
+Command lifecycle/history development checkpoint:
+a6e6ea38ccd3ff3f64147bdd5e77f751518fafde
+
+Final production server commit:
+7530ed72638dd42183221418b97585575b86cbd7
+
+Final production Render deploy:
+dep-daha0f142hec73fefvbg
+
+Production service:
+good-shepherd-server
+
+Final command-history visibility:
+PASS
+
+high_res_enable visible:
+YES
+
+high_res_disable visible:
+YES
+
+
+============================================================
+RUNTIME VALIDATION
+============================================================
+
+Boot default OFF:
+PASS
+
+Normal mmWave traffic while high-resolution evidence OFF:
+PASS
+
+Enable command ID:
+6d952195-c3ce-4e6a-ab16-c1be51b8e786
+
+Enable command result:
+SUCCESS
+
+High-resolution rows observed after enable:
+PASS
+
+Disable command ID:
+3783139d-b89c-411c-8a3b-ecc7f0b9b755
+
+Disable command result:
+SUCCESS
+
+Post-disable high-resolution watermark remained unchanged:
+PASS
+
+High-resolution stream OFF after disable:
+PASS
+
+Normal mmWave events continued after lifecycle test:
+PASS
+
+Normal Human Presence path preserved:
+PASS
+
+OFF -> ON -> OFF lifecycle:
+PASS
+
+
+============================================================
+CONTROLLED PHYSICAL EVIDENCE
+============================================================
+
+Generic controlled sessions:
+3
+
+Each generic session included:
+
+- walk_within_room
+- seated_stationary
+- stand_up
+- standing_stationary
+- sit_down
+- walk_through_room
+- exit_room
+- enter_room
+
+Additional targeted sessions:
+3
+
+Targeted labeled activities:
+
+- intentional_lie_down
+- intentional_rise_from_lying
+
+Total targeted lie/rise events:
+6
+
+High-resolution temporal resolution:
+Approximately 10 Hz
+
+Additional physical trials required for this evidence phase:
+NO
+
+
+============================================================
+EMPIRICAL FEATURE FINDINGS
+============================================================
+
+PRIMARY SUPPORTED TEMPORAL SIGNAL
+
+Normalized moving-distance temporal shape:
+SUPPORTED
+
+Distance within-activity mean Pearson correlation:
+0.585
+
+Distance between-activity mean Pearson correlation:
+0.027
+
+Distance-only activity classification:
+NOT SUPPORTED
+
+
+POSTURE TRANSITIONS
+
+Across the three generic controlled sessions:
+
+stand_up:
+direction consistently toward sensor in the recorded geometry
+
+sit_down:
+direction consistently away from sensor in the recorded geometry
+
+These directional observations are geometry dependent.
+
+
+ROOM BOUNDARY TRANSITIONS
+
+exit_room:
+strongly repeatable away direction in the recorded geometry
+
+enter_room:
+strongly repeatable toward direction in the recorded geometry
+
+
+GENERAL WALKING
+
+Walking direction alone:
+REJECTED AS SEMANTIC FEATURE
+
+LD2410 movingTarget:
+REJECTED AS SEMANTIC WALKING CLASSIFIER
+
+
+INTENTIONAL LIE-DOWN / RISE
+
+Simple whole-event direction:
+NOT REPEATABLE ENOUGH AS PRIMARY FEATURE
+
+intentional_rise_from_lying:
+showed repeatable temporal-shape behavior in the three targeted trials
+
+intentional_lie_down:
+showed more variable temporal shape
+
+Fall inference:
+NOT ESTABLISHED
+
+
+============================================================
+NORMALIZED TEMPORAL SHAPE FINDINGS
+============================================================
+
+sit_down:
+clearest repeatable normalized moving-distance pattern in the tested set
+
+intentional_rise_from_lying:
+consistently showed a low middle trough followed by higher late distance
+
+intentional_lie_down:
+also showed a middle trough in multiple trials
+
+Therefore:
+
+A middle distance trough alone cannot distinguish lie-down from rise.
+
+Cross-room absolute centimeter magnitudes must not be treated as
+classification proof because generic posture trials and targeted lie/rise
+trials were performed with different physical sensor geometry.
+
+Normalized within-event shape is safer than absolute cross-room distance
+magnitude for continued analytical work.
+
+
+============================================================
+OTHER LD2410 FEATURE EVALUATION
+============================================================
+
+MOVING ENERGY
+
+Within-activity mean correlation:
+0.462
+
+Between-activity mean correlation:
+0.147
+
+Moving energy:
+SECONDARY DESCRIPTIVE SIGNAL
+
+Adding moving energy to the normalized moving-distance signature:
+REJECTED FOR v1
+
+Reason:
+The combined representation reduced same-activity repeatability and
+reduced empirical within-vs-between separation.
+
+
+STATIONARY ENERGY
+
+Observed saturation:
+CONFIRMED
+
+11 of 12 evaluated events were effectively flat at 100.
+
+Stationary energy temporal signal:
+NOT USEFUL IN CURRENT RECORDINGS
+
+
+RADAR PRESENCE
+
+Observed:
+100 percent throughout evaluated events
+
+Discriminative value in current recordings:
+REJECTED
+
+
+STATIONARY TARGET
+
+Observed:
+Essentially saturated throughout evaluated events
+
+Discriminative value in current recordings:
+REJECTED
+
+
+MOVING TARGET TEMPORAL SHAPE
+
+Within-activity mean correlation:
+0.028
+
+Between-activity mean correlation:
+0.028
+
+Result:
+REJECTED
+
+
+TARGET STATE
+
+Independent discriminative evidence:
+NOT ESTABLISHED
+
+
+STABLE PRESENCE STATE
+
+Independent discriminative evidence:
+NOT ESTABLISHED
+
+
+============================================================
+CLOCK / TEMPORAL ALIGNMENT
+============================================================
+
+Server receipt timestamps were found unsuitable for precise sample
+spacing because of receipt jitter.
+
+Validated temporal reconstruction uses:
+
+- bootSessionId
+- ESP32 uptimeMs
+- median boot-origin estimate per bootSessionId
+
+Sensor-clock alignment:
+PASS
+
+Clock source:
+ESP32 uptime
+
+Server receipt jitter removed from sample spacing:
+PASS
+
+
+============================================================
+FINAL ANALYTICAL BOUNDARIES
+============================================================
+
+High-resolution capture:
+PASS
+
+ESP32 uptime clock alignment:
+PASS
+
+Primary temporal feature:
+NORMALIZED MOVING DISTANCE SHAPE
+
+Normalized distance temporal signal:
+SUPPORTED
+
+Distance-only classification:
+NOT SUPPORTED
+
+Moving energy:
+SECONDARY ONLY / REJECTED FROM v1 COMBINED SIGNATURE
+
+movingTarget temporal shape:
+REJECTED
+
+stationaryEnergy:
+REJECTED DUE TO SATURATION
+
+radarPresence:
+REJECTED DUE TO SATURATION
+
+stationaryTarget:
+REJECTED DUE TO SATURATION
+
+targetState:
+NO INDEPENDENT EVIDENCE
+
+stablePresenceState:
+NO INDEPENDENT EVIDENCE
+
+Classification thresholds:
+NONE
+
+Fall detection:
+NOT ESTABLISHED
+
+Emergency inference:
+NOT ESTABLISHED
+
+Medical inference:
+NOT ESTABLISHED
+
+Operational alert policy change:
+NONE
+
+
+============================================================
+FINAL SYSTEM STATUS
+============================================================
+
+HIGH_RES_CAPTURE=PASS
+CONTROLLED_RUNTIME_ENABLE=PASS
+CONTROLLED_RUNTIME_DISABLE=PASS
+BOOT_DEFAULT_OFF=PASS
+NORMAL_MMWAVE_PATH=PRESERVED
+PASSIVE_SERVER_INGESTION=PASS
+COMMAND_LIFECYCLE=PASS
+PRODUCTION_DEPLOY=PASS
+PHYSICAL_EVIDENCE_COLLECTION=COMPLETE
+TEMPORAL_FEATURE_EVALUATION=COMPLETE
+FIRMWARE_CHECKPOINT=PASS
+FIRMWARE_REFLASH=NO
+ADDITIONAL_PHYSICAL_TRIALS=NO
+CLASSIFICATION_THRESHOLDS=NONE
+FALL_DETECTION=NOT_ESTABLISHED
+OPERATIONAL_ALERT_CHANGE=NONE
+MMWAVE_HIGH_RESOLUTION_EVIDENCE_PHASE=FROZEN
+
+Remaining administrative item:
+Review retention/export strategy for accumulated development-only
+high-resolution webhook_events before deleting any evidence.
