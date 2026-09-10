@@ -1450,7 +1450,7 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
     !Number.isNaN(healthDate.getTime()) &&
     healthDate.getTime() >= Date.now() - (NODE_OFFLINE_AFTER_SECONDS * 1000)
   );
-  const diagnosticState = readPayloadBoolean(normalizeJsonObject(health?.diagnostics), "presenceState");
+  const diagnosticState = readPayloadBoolean(normalizeJsonObject(health?.diagnostics), "presence");
   const presenceIsFresh = Boolean(
     latestPresenceEvent &&
     healthIsFresh &&
@@ -12417,7 +12417,8 @@ async function ingestMqttV2Status(nodeId, payload) {
       uptimeSeconds: payload.uptimeSeconds,
       diagnostics: {
         transport: "mqtt",
-        mqttProtocolVersion: payload.protocolVersion || "2.0"
+        mqttProtocolVersion: payload.protocolVersion || "2.0",
+        presence: readPayloadBoolean(payload, "presence")
       }
     });
 
