@@ -70,6 +70,10 @@ const {
 // Good Shepherd webhook and AI backend
 //
 // s
+const {
+  buildHumanPresenceRichSectionsV2
+} = require("./lib/human_presence_presentation_v2");
+
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
 // Safe cleanup plus AI v2 fields for ESP32 motion and simple human-presence sensors.
@@ -1525,6 +1529,30 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
   return {
     presenceSensorCount: presenceSensors.length,
     presenceEventCount: residentPresenceEvents.length,
+    presenceIsFresh,
+    presenceFreshnessReason,
+    recentPresenceTimeline: residentPresenceEvents
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(b?.timestamp || 0).getTime() -
+          new Date(a?.timestamp || 0).getTime()
+      )
+      .slice(0, 12)
+      .map((event, index) => {
+        const sensor = presenceSensors.find((candidate) =>
+          sensorMatchesMotionEvent(candidate, event)
+        );
+
+        return {
+          id:
+            cleanText(event?.id || event?.eventId || event?.event_id) ||
+            `presence-${index}-${event?.timestamp || "event"}`,
+          timestamp: event?.timestamp || null,
+          active: presenceEventIsActive(event),
+          room: presenceEventRoomName(event, sensor) || null
+        };
+      }),
     latestPresenceAt,
     latestPresenceState,
     lastKnownPresenceState,
@@ -2283,7 +2311,10 @@ function buildResidentServerDrivenPresentationV1({
   aiStatus,
   actionGuidance,
   longitudinalIntelligence,
-  presenceIntelligence
+  presenceIntelligence,
+  humanPresenceLearning = [],
+  humanPresenceInterpretation = null,
+  humanPresenceLongitudinal = null
 }) {
   const sections = [];
 
@@ -2456,6 +2487,16 @@ function buildResidentServerDrivenPresentationV1({
       sortOrder: 40
     });
   }
+
+  sections.push(
+    ...buildHumanPresenceRichSectionsV2({
+      resident,
+      presenceIntelligence,
+      learningLocations: humanPresenceLearning,
+      nonOperationalInterpretation: humanPresenceInterpretation,
+      longitudinalValidation: humanPresenceLongitudinal
+    })
+  );
 
   return {
     presentationVersion: 1,
@@ -2680,6 +2721,146 @@ async function buildAIMotionSummary() {
   const sensorGroups = groupByResident(sensors);
   const eventGroups = groupByResident(events, 'residentId', 'residentName');
   const presenceGroups = groupByResident(presenceEvents, 'residentId', 'residentName');
+
+  let humanPresenceLearningRows = [];
+  let humanPresenceInterpretationRows = [];
+  let humanPresenceLongitudinalRows = [];
+
+  try {
+    const [
+      humanPresenceLearningResult,
+      humanPresenceInterpretationResult,
+      humanPresenceLongitudinalResult
+    ] = await Promise.all([
+      pool.query(`
+        SELECT
+          authoritative_resident_id::text AS "residentId",
+          authoritative_resident_name AS "residentName",
+          authoritative_room_or_location AS "roomOrLocation",
+          COUNT(*)::int AS "observations",
+          ROUND(
+            (
+              EXTRACT(
+                EPOCH FROM (
+                  MAX(behavioral_pattern_analysis_at) -
+                  MIN(behavioral_pattern_analysis_at)
+                )
+              ) / 3600.0
+            )::numeric,
+            2
+          )::float8 AS "hoursObserved",
+          COUNT(
+            DISTINCT (
+              behavioral_pattern_analysis_at
+              AT TIME ZONE 'America/Chicago'
+            )::date
+          )::int AS "daysObserved",
+          MIN(behavioral_pattern_analysis_at) AS "firstObservationAt",
+          MAX(behavioral_pattern_analysis_at) AS "lastObservationAt"
+        FROM human_presence_behavioral_pattern_analyses
+        WHERE authoritative_resident_id IS NOT NULL
+        GROUP BY
+          authoritative_resident_id,
+          authoritative_resident_name,
+          authoritative_room_or_location
+      `),
+
+      pool.query(`
+        SELECT DISTINCT ON (authoritative_resident_id)
+          authoritative_resident_id::text AS "residentId",
+          authoritative_resident_name AS "residentName",
+          authoritative_room_or_location AS "roomOrLocation",
+          non_operational_interpretation_payload AS payload,
+          non_operational_interpretation_at AS "generatedAt"
+        FROM human_presence_non_operational_interpretations
+        WHERE authoritative_resident_id IS NOT NULL
+          AND non_operational_interpretation_payload IS NOT NULL
+        ORDER BY
+          authoritative_resident_id,
+          non_operational_interpretation_at DESC
+      `),
+
+      pool.query(`
+        SELECT DISTINCT ON (authoritative_resident_id)
+          authoritative_resident_id::text AS "residentId",
+          authoritative_resident_name AS "residentName",
+          authoritative_room_or_location AS "roomOrLocation",
+          longitudinal_interpretation_validation_payload AS payload,
+          longitudinal_interpretation_validation_at AS "generatedAt"
+        FROM human_presence_longitudinal_interpretation_validations
+        WHERE authoritative_resident_id IS NOT NULL
+          AND longitudinal_interpretation_validation_payload IS NOT NULL
+        ORDER BY
+          authoritative_resident_id,
+          longitudinal_interpretation_validation_at DESC
+      `)
+    ]);
+
+    humanPresenceLearningRows = humanPresenceLearningResult.rows || [];
+    humanPresenceInterpretationRows =
+      humanPresenceInterpretationResult.rows || [];
+    humanPresenceLongitudinalRows =
+      humanPresenceLongitudinalResult.rows || [];
+  } catch (humanPresencePresentationError) {
+    console.error(
+      "Human Presence presentation enrichment unavailable; continuing with existing dashboard:",
+      humanPresencePresentationError
+    );
+  }
+
+  const humanPresenceLearningByResidentId = new Map();
+  const humanPresenceLearningByResidentName = new Map();
+
+  for (const row of humanPresenceLearningRows) {
+    const idKey = cleanText(row?.residentId);
+    const nameKey = cleanText(row?.residentName).toLowerCase();
+
+    if (idKey) {
+      if (!humanPresenceLearningByResidentId.has(idKey)) {
+        humanPresenceLearningByResidentId.set(idKey, []);
+      }
+      humanPresenceLearningByResidentId.get(idKey).push(row);
+    }
+
+    if (nameKey) {
+      if (!humanPresenceLearningByResidentName.has(nameKey)) {
+        humanPresenceLearningByResidentName.set(nameKey, []);
+      }
+      humanPresenceLearningByResidentName.get(nameKey).push(row);
+    }
+  }
+
+  const humanPresenceInterpretationByResidentId = new Map();
+  const humanPresenceInterpretationByResidentName = new Map();
+
+  for (const row of humanPresenceInterpretationRows) {
+    const idKey = cleanText(row?.residentId);
+    const nameKey = cleanText(row?.residentName).toLowerCase();
+
+    if (idKey) {
+      humanPresenceInterpretationByResidentId.set(idKey, row);
+    }
+
+    if (nameKey) {
+      humanPresenceInterpretationByResidentName.set(nameKey, row);
+    }
+  }
+
+  const humanPresenceLongitudinalByResidentId = new Map();
+  const humanPresenceLongitudinalByResidentName = new Map();
+
+  for (const row of humanPresenceLongitudinalRows) {
+    const idKey = cleanText(row?.residentId);
+    const nameKey = cleanText(row?.residentName).toLowerCase();
+
+    if (idKey) {
+      humanPresenceLongitudinalByResidentId.set(idKey, row);
+    }
+
+    if (nameKey) {
+      humanPresenceLongitudinalByResidentName.set(nameKey, row);
+    }
+  }
   const motionDailyGroups = groupByResident(motionDailyStats);
   const todayMotionGroups = groupByResident(todayMotionEvents);
   const latestSensorMotionGroups = groupByResident(latestSensorMotionEvents);
@@ -2698,6 +2879,33 @@ async function buildAIMotionSummary() {
     const residentSensors = rowsForResident(sensorGroups, resident);
     const residentEvents = rowsForResident(eventGroups, resident);
     const residentPresenceEvents = rowsForResident(presenceGroups, resident);
+
+    const hpResidentId =
+      cleanText(resident?.id || resident?.residentId);
+
+    const hpResidentName =
+      cleanText(resident?.name || resident?.residentName).toLowerCase();
+
+    const residentHumanPresenceLearning =
+      (hpResidentId &&
+        humanPresenceLearningByResidentId.get(hpResidentId)) ||
+      (hpResidentName &&
+        humanPresenceLearningByResidentName.get(hpResidentName)) ||
+      [];
+
+    const residentHumanPresenceInterpretation =
+      (hpResidentId &&
+        humanPresenceInterpretationByResidentId.get(hpResidentId)) ||
+      (hpResidentName &&
+        humanPresenceInterpretationByResidentName.get(hpResidentName)) ||
+      null;
+
+    const residentHumanPresenceLongitudinal =
+      (hpResidentId &&
+        humanPresenceLongitudinalByResidentId.get(hpResidentId)) ||
+      (hpResidentName &&
+        humanPresenceLongitudinalByResidentName.get(hpResidentName)) ||
+      null;
     const residentActionLogs = rowsForResident(actionGroups, resident);
     const latestActionLog = residentActionLogs[0] || null;
 
@@ -2923,7 +3131,10 @@ async function buildAIMotionSummary() {
         aiStatus,
         actionGuidance,
         longitudinalIntelligence,
-        presenceIntelligence
+        presenceIntelligence,
+        humanPresenceLearning: residentHumanPresenceLearning,
+        humanPresenceInterpretation: residentHumanPresenceInterpretation,
+        humanPresenceLongitudinal: residentHumanPresenceLongitudinal
       }),
       behaviorInsights,
       openAlertCount: openAlerts.length,
