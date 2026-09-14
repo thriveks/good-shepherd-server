@@ -1,5 +1,10 @@
 "use strict";
 
+const spatialStateLearningV1Migration =
+  require(
+    "./migrations/2026-09-14-human-presence-spatial-state-learning-v1"
+  );
+
 const spatialSignatureV1Migration =
   require(
     "./migrations/2026-09-14-human-presence-spatial-signature-v1"
@@ -360,6 +365,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       spatialSignatureV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      spatialStateLearningV1Migration
     );
 
     /*
