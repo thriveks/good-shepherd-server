@@ -13048,9 +13048,10 @@ function validateHighResolutionActivityEvidenceV1(nodeId, payload) {
     );
   }
 
-  if (
-    cleanText(normalizedPayload.evidenceSchemaVersion) !== "1.0"
-  ) {
+  const evidenceSchemaVersion =
+    cleanText(normalizedPayload.evidenceSchemaVersion);
+
+  if (!["1.0", "2.0"].includes(evidenceSchemaVersion)) {
     throw new Error(
       "high_resolution_activity_evidence unsupported evidenceSchemaVersion"
     );
@@ -13068,10 +13069,15 @@ function validateHighResolutionActivityEvidenceV1(nodeId, payload) {
     );
   }
 
-  if (
-    cleanText(normalizedPayload.sampleEncoding) !==
-    "compact-array-v1"
-  ) {
+  const sampleEncoding =
+    cleanText(normalizedPayload.sampleEncoding);
+
+  const expectedSampleEncoding =
+    evidenceSchemaVersion === "2.0"
+      ? "compact-array-v2"
+      : "compact-array-v1";
+
+  if (sampleEncoding !== expectedSampleEncoding) {
     throw new Error(
       "high_resolution_activity_evidence unsupported sampleEncoding"
     );
@@ -13105,16 +13111,25 @@ function validateHighResolutionActivityEvidenceV1(nodeId, payload) {
     );
   }
 
+  const expectedSampleLength =
+    evidenceSchemaVersion === "2.0" ? 19 : 12;
+
   for (let i = 0; i < samples.length; i += 1) {
     const sample = samples[i];
 
-    if (!Array.isArray(sample) || sample.length !== 12) {
+    if (
+      !Array.isArray(sample) ||
+      sample.length !== expectedSampleLength
+    ) {
       throw new Error(
         `high_resolution_activity_evidence invalid sample at index ${i}`
       );
     }
 
-    for (let j = 0; j < sample.length; j += 1) {
+    const scalarFieldCount =
+      evidenceSchemaVersion === "2.0" ? 17 : 12;
+
+    for (let j = 0; j < scalarFieldCount; j += 1) {
       if (
         typeof sample[j] !== "number" ||
         !Number.isFinite(sample[j])
@@ -13122,6 +13137,29 @@ function validateHighResolutionActivityEvidenceV1(nodeId, payload) {
         throw new Error(
           `high_resolution_activity_evidence non-numeric sample value at ${i}:${j}`
         );
+      }
+    }
+
+    if (evidenceSchemaVersion === "2.0") {
+      for (const gateIndex of [17, 18]) {
+        const gateValues = sample[gateIndex];
+
+        if (!Array.isArray(gateValues) || gateValues.length !== 9) {
+          throw new Error(
+            `high_resolution_activity_evidence invalid gate array at ${i}:${gateIndex}`
+          );
+        }
+
+        for (let gate = 0; gate < gateValues.length; gate += 1) {
+          if (
+            typeof gateValues[gate] !== "number" ||
+            !Number.isFinite(gateValues[gate])
+          ) {
+            throw new Error(
+              `high_resolution_activity_evidence non-numeric gate value at ${i}:${gateIndex}:${gate}`
+            );
+          }
+        }
       }
     }
   }
