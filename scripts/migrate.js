@@ -1,5 +1,10 @@
 "use strict";
 
+const engineeringFeatureV1Migration =
+  require(
+    "./migrations/2026-09-14-human-presence-engineering-feature-v1"
+  );
+
 const labeledEventMatchingValidationV1Migration =
   require(
     "./migrations/2026-09-08-human-presence-labeled-event-matching-validation-v1"
@@ -340,6 +345,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       labeledEventMatchingValidationV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      engineeringFeatureV1Migration
     );
 
     /*

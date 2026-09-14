@@ -64,6 +64,10 @@ const {
 const {
   buildAndPersistHumanPresenceLongitudinalInterpretationValidationV1
 } = require("./lib/human_presence_longitudinal_interpretation_validation_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceEngineeringFeatureV1
+} = require("./lib/human_presence_engineering_feature_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -13249,12 +13253,39 @@ async function ingestMqttV2Event(nodeId, payload) {
         validatedPayload
       );
 
+    let engineeringFeatureResult = null;
+
+    if (
+      cleanText(validatedPayload.evidenceSchemaVersion) ===
+      "2.0"
+    ) {
+      engineeringFeatureResult =
+        await buildAndPersistHumanPresenceEngineeringFeatureV1(
+          pool,
+          {
+            evidence_event_id: persistence.eventId,
+            node_id: validatedPayload.nodeId,
+            evidence_schema_version: "2.0",
+            observer_only:
+              validatedPayload.observerOnly === true,
+            development_only:
+              validatedPayload.developmentOnly === true,
+            event_payload: validatedPayload,
+            evidence_received_at:
+              persistence.receivedAt
+          }
+        );
+    }
+
     console.log(
       "MQTT V2 high-resolution activity evidence ingested:",
       validatedPayload.nodeId,
       validatedPayload.batchSequence,
       validatedPayload.sampleCount,
-      persistence.eventId
+      persistence.eventId,
+      engineeringFeatureResult
+        ? engineeringFeatureResult.persistence.engineeringFeatureVersion
+        : null
     );
 
     return;
