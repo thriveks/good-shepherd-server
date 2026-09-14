@@ -76,6 +76,10 @@ const {
 const {
   buildAndPersistHumanPresenceSpatialStateLearningV1
 } = require("./lib/human_presence_spatial_state_learning_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceSpatialTemporalLearningV1
+} = require("./lib/human_presence_spatial_temporal_learning_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -13297,6 +13301,11 @@ async function ingestMqttV2Event(nodeId, payload) {
         pool,
         engineeringCurrent,
         spatialSignatureResult.signature
+      );
+
+      await buildAndPersistHumanPresenceSpatialTemporalLearningV1(
+        pool,
+        engineeringCurrent
       );
     }
 
