@@ -68,6 +68,10 @@ const {
 const {
   buildAndPersistHumanPresenceEngineeringFeatureV1
 } = require("./lib/human_presence_engineering_feature_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceSpatialSignatureV1
+} = require("./lib/human_presence_spatial_signature_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -13259,22 +13263,30 @@ async function ingestMqttV2Event(nodeId, payload) {
       cleanText(validatedPayload.evidenceSchemaVersion) ===
       "2.0"
     ) {
+      const engineeringCurrent = {
+        evidence_event_id: persistence.eventId,
+        node_id: validatedPayload.nodeId,
+        evidence_schema_version: "2.0",
+        observer_only:
+          validatedPayload.observerOnly === true,
+        development_only:
+          validatedPayload.developmentOnly === true,
+        event_payload: validatedPayload,
+        evidence_received_at:
+          persistence.receivedAt
+      };
+
       engineeringFeatureResult =
         await buildAndPersistHumanPresenceEngineeringFeatureV1(
           pool,
-          {
-            evidence_event_id: persistence.eventId,
-            node_id: validatedPayload.nodeId,
-            evidence_schema_version: "2.0",
-            observer_only:
-              validatedPayload.observerOnly === true,
-            development_only:
-              validatedPayload.developmentOnly === true,
-            event_payload: validatedPayload,
-            evidence_received_at:
-              persistence.receivedAt
-          }
+          engineeringCurrent
         );
+
+      await buildAndPersistHumanPresenceSpatialSignatureV1(
+        pool,
+        engineeringCurrent,
+        engineeringFeatureResult.feature
+      );
     }
 
     console.log(

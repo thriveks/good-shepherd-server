@@ -1,5 +1,10 @@
 "use strict";
 
+const spatialSignatureV1Migration =
+  require(
+    "./migrations/2026-09-14-human-presence-spatial-signature-v1"
+  );
+
 const engineeringFeatureV1Migration =
   require(
     "./migrations/2026-09-14-human-presence-engineering-feature-v1"
@@ -350,6 +355,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       engineeringFeatureV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      spatialSignatureV1Migration
     );
 
     /*
