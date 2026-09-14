@@ -1,5 +1,10 @@
 "use strict";
 
+const spatialRhythmLearningV1Migration =
+  require(
+    "./migrations/2026-09-14-human-presence-spatial-rhythm-learning-v1"
+  );
+
 const spatialTemporalLearningV1Migration =
   require(
     "./migrations/2026-09-14-human-presence-spatial-temporal-learning-v1"
@@ -380,6 +385,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       spatialTemporalLearningV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      spatialRhythmLearningV1Migration
     );
 
     /*

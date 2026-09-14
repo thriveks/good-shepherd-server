@@ -80,6 +80,10 @@ const {
 const {
   buildAndPersistHumanPresenceSpatialTemporalLearningV1
 } = require("./lib/human_presence_spatial_temporal_learning_persistence_v1");
+
+const {
+  buildAndPersistHumanPresenceSpatialRhythmLearningV1
+} = require("./lib/human_presence_spatial_rhythm_learning_persistence_v1");
 // ============================================================================
 
 // server.js
@@ -89,6 +93,11 @@ const {
 const {
   buildHumanPresenceRichSectionsV2
 } = require("./lib/human_presence_presentation_v2");
+
+const {
+  loadHumanPresenceEngineeringDashboardByNode,
+  buildHumanPresenceEngineeringBundlesForSensors
+} = require("./lib/human_presence_engineering_dashboard_v1");
 
 // iOS Dependency: NearbyBLESensorSyncView human presence assignment flow + AppSetupSyncService sensor assignment payload
 //
@@ -2330,7 +2339,8 @@ function buildResidentServerDrivenPresentationV1({
   presenceIntelligence,
   humanPresenceLearning = [],
   humanPresenceInterpretation = null,
-  humanPresenceLongitudinal = null
+  humanPresenceLongitudinal = null,
+  humanPresenceEngineering = []
 }) {
   const sections = [];
 
@@ -2510,7 +2520,8 @@ function buildResidentServerDrivenPresentationV1({
       presenceIntelligence,
       learningLocations: humanPresenceLearning,
       nonOperationalInterpretation: humanPresenceInterpretation,
-      longitudinalValidation: humanPresenceLongitudinal
+      longitudinalValidation: humanPresenceLongitudinal,
+      engineeringBundles: humanPresenceEngineering
     })
   );
 
@@ -2877,6 +2888,23 @@ async function buildAIMotionSummary() {
       humanPresenceLongitudinalByResidentName.set(nameKey, row);
     }
   }
+  let humanPresenceEngineeringByNodeId =
+    new Map();
+
+  try {
+    humanPresenceEngineeringByNodeId =
+      await loadHumanPresenceEngineeringDashboardByNode(
+        pool
+      );
+  } catch (
+    humanPresenceEngineeringError
+  ) {
+    console.error(
+      "Human Presence engineering dashboard enrichment unavailable; continuing with existing dashboard:",
+      humanPresenceEngineeringError
+    );
+  }
+
   const motionDailyGroups = groupByResident(motionDailyStats);
   const todayMotionGroups = groupByResident(todayMotionEvents);
   const latestSensorMotionGroups = groupByResident(latestSensorMotionEvents);
@@ -2893,6 +2921,13 @@ async function buildAIMotionSummary() {
     const residentNameKey = normalizeForMatch(resident.name);
 
     const residentSensors = rowsForResident(sensorGroups, resident);
+
+    const residentHumanPresenceEngineering =
+      buildHumanPresenceEngineeringBundlesForSensors(
+        residentSensors,
+        humanPresenceEngineeringByNodeId
+      );
+
     const residentEvents = rowsForResident(eventGroups, resident);
     const residentPresenceEvents = rowsForResident(presenceGroups, resident);
 
@@ -3150,7 +3185,8 @@ async function buildAIMotionSummary() {
         presenceIntelligence,
         humanPresenceLearning: residentHumanPresenceLearning,
         humanPresenceInterpretation: residentHumanPresenceInterpretation,
-        humanPresenceLongitudinal: residentHumanPresenceLongitudinal
+        humanPresenceLongitudinal: residentHumanPresenceLongitudinal,
+        humanPresenceEngineering: residentHumanPresenceEngineering
       }),
       behaviorInsights,
       openAlertCount: openAlerts.length,
@@ -13304,6 +13340,11 @@ async function ingestMqttV2Event(nodeId, payload) {
       );
 
       await buildAndPersistHumanPresenceSpatialTemporalLearningV1(
+        pool,
+        engineeringCurrent
+      );
+
+      await buildAndPersistHumanPresenceSpatialRhythmLearningV1(
         pool,
         engineeringCurrent
       );
