@@ -91,6 +91,10 @@ const {
 //
 // s
 const {
+  startHumanPresenceAdaptiveCaptureControllerV1
+} = require("./lib/human_presence_adaptive_capture_controller_v1");
+
+const {
   buildHumanPresenceRichSectionsV2
 } = require("./lib/human_presence_presentation_v2");
 
@@ -13870,6 +13874,7 @@ initializeDatabase()
     app.listen(PORT, () => {
       console.log(`Good Shepherd webhook server running on port ${PORT}`);
       startMqttV2Bridge();
+      startHumanPresenceAdaptiveCaptureControllerV1();
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
       console.log("Remote node command queue enabled.");
