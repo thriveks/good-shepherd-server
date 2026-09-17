@@ -7141,6 +7141,134 @@ app.get("/customer/bootstrap", async (req, res) => {
   }
 });
 
+
+app.patch("/customer/sensors/:nodeId/assignment", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res);
+    if (!session) return;
+
+    if (!requireMinimumIOSAppBuildForSetupWrites(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.params.nodeId);
+    const roomName = cleanText(req.body?.roomName);
+
+    if (!nodeId || !isEsp32NodeId(nodeId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid Good Shepherd sensor"
+      });
+    }
+
+    if (!roomName) {
+      return res.status(400).json({
+        success: false,
+        error: "Choose a room for this sensor"
+      });
+    }
+
+    const nodeResult = await pool.query(
+      `
+      SELECT
+        n.node_id AS "nodeId",
+        n.node_name AS "nodeName",
+        n.location_name AS "locationName",
+        n.setup_state AS "setupState",
+        n.is_archived AS "isArchived",
+        h.diagnostics->>'sensorMode' AS "sensorMode",
+        h.diagnostics->>'sensorType' AS "healthSensorType"
+      FROM nodes n
+      LEFT JOIN node_health h ON h.node_id = n.node_id
+      WHERE n.node_id = $1
+      LIMIT 1
+      `,
+      [nodeId]
+    );
+
+    const node = nodeResult.rows[0] || null;
+
+    if (!node || node.isArchived) {
+      return res.status(404).json({
+        success: false,
+        error: "Sensor is not available for setup"
+      });
+    }
+
+    if (normalizeSetupState(node.setupState) !== "unassigned") {
+      return res.status(409).json({
+        success: false,
+        error: "This sensor has already been assigned"
+      });
+    }
+
+    const sensorResult = await pool.query(
+      `
+      ${sensorSelectSQL()}
+      WHERE node_id = $1
+        AND is_deleted = FALSE
+      ORDER BY created_at ASC
+      LIMIT 1
+      `,
+      [nodeId]
+    );
+
+    const existingSensor = sensorResult.rows[0] || null;
+
+    const sensorAlreadyAssigned =
+      existingSensor &&
+      (
+        cleanOptionalText(existingSensor.residentId) ||
+        normalizeSetupState(existingSensor.setupState) === "assigned" ||
+        (
+          cleanText(existingSensor.residentName) &&
+          cleanText(existingSensor.residentName).toLowerCase() !== "unassigned"
+        ) ||
+        cleanOptionalText(existingSensor.roomName)
+      );
+
+    if (sensorAlreadyAssigned) {
+      return res.status(409).json({
+        success: false,
+        error: "This sensor has already been assigned"
+      });
+    }
+
+    const sensorMode =
+      cleanText(node.sensorMode) ||
+      null;
+
+    const sensorType =
+      cleanText(existingSensor?.sensorType) ||
+      cleanText(node.healthSensorType) ||
+      cleanText(node.nodeName) ||
+      null;
+
+    const assignment = await updateSensorAssignment({
+      nodeId,
+      residentId: session.residentId,
+      residentName: session.residentName,
+      roomName,
+      sourceKey: existingSensor?.sourceKey || null,
+      sensorType,
+      sensorMode
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Sensor added to your home",
+      ...assignment
+    });
+  } catch (error) {
+    console.error("Customer sensor assignment failed:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message,
+      ...(error.code ? { code: error.code } : {})
+    });
+  }
+});
+
 app.get("/customer/ai/dashboard", async (req, res) => {
   try {
     const session = await requireCustomerSession(req, res);
