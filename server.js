@@ -156,7 +156,7 @@ const SENSOR_COMMAND_EXECUTION_TIMEOUT_MINUTES = 5;
 const SENSOR_COMMAND_OTA_EXECUTION_TIMEOUT_MINUTES = 30;
 const SENSOR_COMMAND_OTA_PENDING_EXPIRATION_MINUTES = 1440;
 const SENSOR_COMMAND_IDENTIFY_EXECUTION_TIMEOUT_MINUTES = 2;
-const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset", "high_res_enable", "high_res_disable"];
+const ESP32_SENSOR_COMMAND_TYPES = ["reconfigure", "update_firmware", "identify", "locate", "ping", "reboot", "factory_reset", "high_res_enable", "high_res_disable", "high_res_capture"];
 const MONITOR_COMMAND_TYPES = ["ping", "ffmpeg_check", "diagnostic_report", "reload_cameras", "sync_cameras_from_cloud", "restart_monitors", "clear_last_error", "rtsp_test"];
 const WATCHDOG_COMMAND_TYPES = ["watchdog_ping", "watchdog_health", "start_local_monitor", "stop_local_monitor", "restart_local_monitor"];
 let acceptedWebhookCountSinceStart = 0;
@@ -845,6 +845,54 @@ function sanitizeBulkNodeIds(value) {
 function normalizeEsp32SensorCommandType(value) {
   const commandType = normalizeNodeCommandType(value);
   return ESP32_SENSOR_COMMAND_TYPES.includes(commandType) ? commandType : null;
+}
+
+function normalizeHighResCapturePayload(value) {
+  const payload = normalizeJsonObject(value);
+  const durationMs = Number(payload.durationMs);
+  const mode = cleanText(payload.mode).toLowerCase();
+  const reason = cleanText(payload.reason);
+  const allowedModes = [
+    "burst",
+    "learning",
+    "triggered",
+    "diagnostic"
+  ];
+
+  if (
+    !Number.isInteger(durationMs) ||
+    durationMs < 5000 ||
+    durationMs > 120000
+  ) {
+    return {
+      valid: false,
+      error: "high_res_capture requires payload.durationMs as an integer from 5000 through 120000"
+    };
+  }
+
+  if (!allowedModes.includes(mode)) {
+    return {
+      valid: false,
+      error: "high_res_capture requires payload.mode as burst, learning, triggered, or diagnostic"
+    };
+  }
+
+  if (!reason || reason.length > 160) {
+    return {
+      valid: false,
+      error: "high_res_capture requires payload.reason from 1 through 160 characters"
+    };
+  }
+
+  return {
+    valid: true,
+    payload: {
+      ...payload,
+      durationMs,
+      mode,
+      reason
+    }
+  };
 }
 
 function normalizeForMatch(value) {
@@ -6795,6 +6843,22 @@ async function createSensorCommand({ nodeId, commandType, payload, requestedBy, 
   if (!isEsp32NodeId(nodeId) || !ESP32_SENSOR_COMMAND_TYPES.includes(commandType)) {
     throw new Error("ESP32 sensor command requires an esp32-* target and firmware-owned command type");
   }
+
+  let normalizedPayload = normalizeJsonObject(payload);
+
+  if (commandType === "high_res_capture") {
+    const validation = normalizeHighResCapturePayload(normalizedPayload);
+
+    if (!validation.valid) {
+      const error = new Error(validation.error);
+      error.statusCode = 400;
+      error.code = "INVALID_HIGH_RES_CAPTURE_PAYLOAD";
+      throw error;
+    }
+
+    normalizedPayload = validation.payload;
+  }
+
   const client = await pool.connect();
   let didBegin = false;
 
@@ -6872,7 +6936,7 @@ async function createSensorCommand({ nodeId, commandType, payload, requestedBy, 
         randomUUID(),
         nodeId,
         commandType,
-        JSON.stringify(payload || {}),
+        JSON.stringify(normalizedPayload || {}),
         requestedBy
       ]
     );
@@ -6907,7 +6971,7 @@ async function failStaleSensorCommands(client, nodeId) {
       completed_at = NOW(),
       error = 'Expired pending sensor command'
     WHERE node_id = $1
-      AND command_type IN ('reconfigure', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable')
+      AND command_type IN ('reconfigure', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable', 'high_res_capture')
       AND status = 'pending'
       AND (
         (command_type = 'update_firmware'
@@ -10642,6 +10706,19 @@ app.post("/sensor-bulk-actions", async (req, res) => {
       }
     }
 
+    if (commandType === "high_res_capture") {
+      const validation = normalizeHighResCapturePayload(payload);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: validation.error
+        });
+      }
+
+      Object.assign(payload, validation.payload);
+    }
+
     const results = [];
     const errors = [];
 
@@ -10882,7 +10959,7 @@ app.get("/sensor-commands/:nodeId", async (req, res) => {
       `
       ${nodeCommandSelectSQL()}
       WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable')
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable', 'high_res_capture')
         AND ($2::boolean = FALSE OR status IN ('pending', 'running'))
       ORDER BY requested_at DESC
       LIMIT 50
@@ -10964,6 +11041,19 @@ app.post("/sensor-commands", async (req, res) => {
           error: "update_firmware requires payload.firmwareVersion"
         });
       }
+    }
+
+    if (commandType === "high_res_capture") {
+      const validation = normalizeHighResCapturePayload(payload);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: validation.error
+        });
+      }
+
+      Object.assign(payload, validation.payload);
     }
 
     const existingNode = await getNodeById(nodeId);
@@ -11180,7 +11270,7 @@ app.post("/sensor-commands/:nodeId/cleanup", async (req, res) => {
         COUNT(*) FILTER (WHERE status = 'running')::int AS "runningCount"
       FROM node_commands
       WHERE node_id = $1
-        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable')
+        AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable', 'high_res_capture')
         AND status IN ('pending', 'running')
       `,
       [nodeId]
@@ -11265,7 +11355,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
       FROM node_commands
       WHERE node_id = $1
         AND status = 'pending'
-        AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset', 'high_res_enable', 'high_res_disable')
+        AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset', 'high_res_enable', 'high_res_disable', 'high_res_capture')
         AND (
           command_type = 'factory_reset'
           OR requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
