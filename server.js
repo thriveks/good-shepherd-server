@@ -5264,6 +5264,7 @@ async function upsertNodeFromRegistration({
   softwareVersion,
   wifiSsid,
   wifiRssi,
+  setupId,
   setupState,
   assignmentState,
   diagnostics
@@ -5286,6 +5287,7 @@ async function upsertNodeFromRegistration({
   const resolvedSoftwareVersion = cleanText(softwareVersion) || null;
   const resolvedWifiSsid = cleanOptionalText(wifiSsid);
   const resolvedWifiRssi = Number.isFinite(Number(wifiRssi)) ? Number(wifiRssi) : null;
+  const resolvedSetupId = cleanOptionalText(setupId);
   const reportedSetup = normalizeReportedSetupState({ setupState, assignmentState, diagnostics });
   const resolvedSetupState = reportedSetup.state || normalizeSetupState(resolvedStatus);
   if (reportedSetup.disagreement) {
@@ -5308,6 +5310,7 @@ async function upsertNodeFromRegistration({
       software_version,
       wifi_ssid,
       wifi_rssi,
+      setup_id,
       setup_state,
       first_seen_at,
       last_seen_at,
@@ -5315,7 +5318,7 @@ async function upsertNodeFromRegistration({
       archived_at,
       archived_reason
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, NOW(), NOW(), FALSE, NULL, NULL)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, NOW(), NOW(), FALSE, NULL, NULL)
     ON CONFLICT (node_id)
     DO UPDATE SET
       node_name = CASE
@@ -5354,6 +5357,7 @@ async function upsertNodeFromRegistration({
       software_version = EXCLUDED.software_version,
       wifi_ssid = COALESCE(EXCLUDED.wifi_ssid, nodes.wifi_ssid),
       wifi_rssi = COALESCE(EXCLUDED.wifi_rssi, nodes.wifi_rssi),
+      setup_id = COALESCE(EXCLUDED.setup_id, nodes.setup_id),
       setup_state = CASE
         WHEN EXCLUDED.setup_state = 'assigned' THEN 'assigned'
         WHEN nodes.setup_state = 'assigned' THEN nodes.setup_state
@@ -5372,6 +5376,7 @@ async function upsertNodeFromRegistration({
       software_version AS "softwareVersion",
       wifi_ssid AS "wifiSsid",
       wifi_rssi AS "wifiRssi",
+      setup_id AS "setupId",
       setup_state AS "setupState",
       first_seen_at AS "firstSeenAt",
       last_seen_at AS "lastSeenAt",
@@ -5391,6 +5396,7 @@ async function upsertNodeFromRegistration({
       resolvedSoftwareVersion,
       resolvedWifiSsid,
       resolvedWifiRssi,
+      resolvedSetupId,
       resolvedSetupState
     ]
   );
@@ -7024,6 +7030,318 @@ async function failStaleSensorCommands(client, nodeId) {
     expiredRunningCount: runningResult.rowCount || 0
   };
 }
+
+
+const firstSensorClaimAttempts = new Map();
+const FIRST_SENSOR_CLAIM_WINDOW_MS = 10 * 60 * 1000;
+const FIRST_SENSOR_CLAIM_MAX_ATTEMPTS = 10;
+
+function firstSensorClaimKey(req) {
+  return cleanText(req.ip || req.socket?.remoteAddress || "unknown") || "unknown";
+}
+
+function firstSensorClaimRateLimited(req) {
+  const key = firstSensorClaimKey(req);
+  const now = Date.now();
+  const prior = firstSensorClaimAttempts.get(key);
+
+  if (!prior || now - prior.startedAt >= FIRST_SENSOR_CLAIM_WINDOW_MS) {
+    firstSensorClaimAttempts.set(key, { startedAt: now, attempts: 0 });
+    return false;
+  }
+
+  return prior.attempts >= FIRST_SENSOR_CLAIM_MAX_ATTEMPTS;
+}
+
+function recordFirstSensorClaimFailure(req) {
+  const key = firstSensorClaimKey(req);
+  const now = Date.now();
+  const prior = firstSensorClaimAttempts.get(key);
+
+  if (!prior || now - prior.startedAt >= FIRST_SENSOR_CLAIM_WINDOW_MS) {
+    firstSensorClaimAttempts.set(key, { startedAt: now, attempts: 1 });
+  } else {
+    prior.attempts += 1;
+    firstSensorClaimAttempts.set(key, prior);
+  }
+}
+
+function clearFirstSensorClaimFailures(req) {
+  firstSensorClaimAttempts.delete(firstSensorClaimKey(req));
+}
+
+app.post("/customer/activate-first-sensor", async (req, res) => {
+  let createdResidentId = null;
+  let createdSessionTokenHash = null;
+
+  try {
+    if (firstSensorClaimRateLimited(req)) {
+      return res.status(429).json({
+        success: false,
+        error: "Too many setup attempts. Please wait a few minutes and try again."
+      });
+    }
+
+    if (!requireMinimumIOSAppBuildForSetupWrites(req, res)) {
+      return;
+    }
+
+    const nodeId = cleanText(req.body?.nodeId);
+    const setupId = cleanText(req.body?.setupId).toUpperCase();
+    const residentName = cleanText(req.body?.residentName);
+    const roomName = cleanText(req.body?.roomName);
+    const locationName = cleanText(req.body?.locationName) || "Home";
+
+    if (!nodeId || !isEsp32NodeId(nodeId)) {
+      recordFirstSensorClaimFailure(req);
+      return res.status(400).json({
+        success: false,
+        error: "Invalid Good Shepherd sensor"
+      });
+    }
+
+    if (!/^[A-Z0-9]{6}$/.test(setupId)) {
+      recordFirstSensorClaimFailure(req);
+      return res.status(400).json({
+        success: false,
+        error: "The nearby sensor could not be verified"
+      });
+    }
+
+    if (!residentName) {
+      return res.status(400).json({
+        success: false,
+        error: "Enter the resident name"
+      });
+    }
+
+    if (!roomName) {
+      return res.status(400).json({
+        success: false,
+        error: "Choose a room for this sensor"
+      });
+    }
+
+    const nodeResult = await pool.query(
+      `
+      SELECT
+        n.node_id AS "nodeId",
+        n.node_name AS "nodeName",
+        n.location_name AS "locationName",
+        n.setup_id AS "setupId",
+        n.setup_state AS "setupState",
+        n.is_archived AS "isArchived",
+        h.diagnostics->>'sensorMode' AS "sensorMode",
+        h.diagnostics->>'sensorType' AS "healthSensorType",
+        h.diagnostics->>'residentName' AS "healthResidentName",
+        h.diagnostics->>'roomName' AS "healthRoomName"
+      FROM nodes n
+      LEFT JOIN node_health h ON h.node_id = n.node_id
+      WHERE n.node_id = $1
+        AND UPPER(TRIM(COALESCE(n.setup_id, ''))) = $2
+      LIMIT 1
+      `,
+      [nodeId, setupId]
+    );
+
+    const node = nodeResult.rows[0] || null;
+
+    if (!node || node.isArchived) {
+      recordFirstSensorClaimFailure(req);
+      return res.status(404).json({
+        success: false,
+        error: "The nearby sensor could not be verified"
+      });
+    }
+
+    const sensorResult = await pool.query(
+      `
+      ${sensorSelectSQL()}
+      WHERE node_id = $1
+        AND is_deleted = FALSE
+      ORDER BY created_at ASC
+      LIMIT 1
+      `,
+      [nodeId]
+    );
+
+    const existingSensor = sensorResult.rows[0] || null;
+
+    const sensorHasResident =
+      existingSensor &&
+      (
+        cleanOptionalText(existingSensor.residentId) ||
+        (
+          cleanText(existingSensor.residentName) &&
+          cleanText(existingSensor.residentName).toLowerCase() !== "unassigned"
+        )
+      );
+
+    if (sensorHasResident) {
+      recordFirstSensorClaimFailure(req);
+      return res.status(409).json({
+        success: false,
+        error: "This sensor has already been activated"
+      });
+    }
+
+    const nodeSetupState = normalizeSetupState(node.setupState);
+    const healthResidentName = cleanText(node.healthResidentName);
+    const healthRoomName = cleanText(node.healthRoomName);
+
+    const firmwareMatchesPendingActivation =
+      nodeSetupState === "assigned" &&
+      healthResidentName &&
+      healthResidentName.toLowerCase() === residentName.toLowerCase() &&
+      healthRoomName &&
+      healthRoomName.toLowerCase() === roomName.toLowerCase();
+
+    if (
+      nodeSetupState !== "unassigned" &&
+      !firmwareMatchesPendingActivation
+    ) {
+      recordFirstSensorClaimFailure(req);
+      return res.status(409).json({
+        success: false,
+        error: "This sensor has already been activated"
+      });
+    }
+
+    const accessCode = await generateUniqueResidentAccessCode();
+    createdResidentId = randomUUID();
+
+    const residentResult = await pool.query(
+      `
+      INSERT INTO residents (
+        id,
+        name,
+        location,
+        alert_level,
+        last_activity,
+        active_warnings,
+        status_text,
+        access_code,
+        is_deleted,
+        deleted_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        'Normal',
+        'Resident created during first sensor activation.',
+        0,
+        'Active monitoring',
+        $4,
+        FALSE,
+        NULL,
+        NOW(),
+        NOW()
+      )
+      RETURNING id, name, location
+      `,
+      [
+        createdResidentId,
+        residentName,
+        locationName,
+        accessCode
+      ]
+    );
+
+    const resident = residentResult.rows[0];
+
+    const token = randomBytes(32).toString("base64url");
+    createdSessionTokenHash = hashSessionToken(token);
+    const expiresAt =
+      new Date(
+        Date.now() +
+        CUSTOMER_SESSION_DAYS * 24 * 60 * 60 * 1000
+      );
+
+    await pool.query(
+      `
+      INSERT INTO customer_sessions (
+        token_hash,
+        resident_id,
+        expires_at
+      )
+      VALUES ($1, $2, $3)
+      `,
+      [
+        createdSessionTokenHash,
+        resident.id,
+        expiresAt.toISOString()
+      ]
+    );
+
+    const sensorMode =
+      cleanText(node.sensorMode) ||
+      null;
+
+    const sensorType =
+      cleanText(existingSensor?.sensorType) ||
+      cleanText(node.healthSensorType) ||
+      cleanText(node.nodeName) ||
+      null;
+
+    const assignment = await updateSensorAssignment({
+      nodeId,
+      residentId: resident.id,
+      residentName: resident.name,
+      locationName: resident.location,
+      roomName,
+      sourceKey: existingSensor?.sourceKey || null,
+      sensorType,
+      sensorMode
+    });
+
+    clearFirstSensorClaimFailures(req);
+
+    return res.status(201).json({
+      success: true,
+      mode: "customer",
+      message: "Your Good Shepherd home is ready",
+      token,
+      expiresAt: expiresAt.toISOString(),
+      residentId: resident.id,
+      residentName: resident.name,
+      accessCode,
+      assignment
+    });
+  } catch (error) {
+    console.error("First sensor activation failed:", error);
+
+    if (createdSessionTokenHash) {
+      await pool.query(
+        `DELETE FROM customer_sessions WHERE token_hash = $1`,
+        [createdSessionTokenHash]
+      ).catch(() => {});
+    }
+
+    if (createdResidentId) {
+      await pool.query(
+        `
+        DELETE FROM residents r
+        WHERE r.id = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sensors s
+            WHERE s.resident_id = r.id
+          )
+        `,
+        [createdResidentId]
+      ).catch(() => {});
+    }
+
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.message || "Unable to activate this home",
+      ...(error.code ? { code: error.code } : {})
+    });
+  }
+});
 
 app.post("/customer/access", async (req, res) => {
   try {

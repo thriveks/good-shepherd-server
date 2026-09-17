@@ -1,5 +1,12 @@
 "use strict";
 
+
+const nodeSetupIdV1Migration =
+  require(
+    "./migrations/2026-09-17-node-setup-id-v1"
+  );
+
+
 const spatialRhythmLearningV1Migration =
   require(
     "./migrations/2026-09-14-human-presence-spatial-rhythm-learning-v1"
@@ -391,6 +398,8 @@ async function runMigrations() {
       client,
       spatialRhythmLearningV1Migration
     );
+
+    await applyVersionedMigration(client, nodeSetupIdV1Migration);
 
     /*
      * Future schema changes belong here as explicit,
