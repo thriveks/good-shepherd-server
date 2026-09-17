@@ -7177,7 +7177,9 @@ app.patch("/customer/sensors/:nodeId/assignment", async (req, res) => {
         n.setup_state AS "setupState",
         n.is_archived AS "isArchived",
         h.diagnostics->>'sensorMode' AS "sensorMode",
-        h.diagnostics->>'sensorType' AS "healthSensorType"
+        h.diagnostics->>'sensorType' AS "healthSensorType",
+        h.diagnostics->>'residentName' AS "healthResidentName",
+        h.diagnostics->>'roomName' AS "healthRoomName"
       FROM nodes n
       LEFT JOIN node_health h ON h.node_id = n.node_id
       WHERE n.node_id = $1
@@ -7195,7 +7197,18 @@ app.patch("/customer/sensors/:nodeId/assignment", async (req, res) => {
       });
     }
 
-    if (normalizeSetupState(node.setupState) !== "unassigned") {
+    const nodeSetupState = normalizeSetupState(node.setupState);
+    const healthResidentName = cleanText(node.healthResidentName);
+    const healthRoomName = cleanText(node.healthRoomName);
+
+    const firmwareMatchesCustomerSetup =
+      nodeSetupState === "assigned" &&
+      healthResidentName &&
+      healthResidentName.toLowerCase() === cleanText(session.residentName).toLowerCase() &&
+      healthRoomName &&
+      healthRoomName.toLowerCase() === roomName.toLowerCase();
+
+    if (nodeSetupState !== "unassigned" && !firmwareMatchesCustomerSetup) {
       return res.status(409).json({
         success: false,
         error: "This sensor has already been assigned"
