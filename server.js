@@ -1482,6 +1482,15 @@ function presenceEventRoomName(event, sensor) {
 }
 
 function buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents, nodeHealthByNodeId) {
+  // State decisions must only use events that carry an interpretable
+  // current-presence state. Observer/evidence-only telemetry such as
+  // high_resolution_activity_evidence remains available to the broader
+  // Human Presence intelligence pipeline but must not compete with
+  // presence_detected / presence_cleared / moving / stationary events.
+  const statePresenceEvents = residentPresenceEvents.filter(
+    (event) => presenceEventIsActive(event) !== null
+  );
+
   const presenceSensors = residentSensors.filter((sensor) => {
     const sensorType = cleanText(sensor.sensorType).toLowerCase();
     const sourceKey = cleanText(sensor.sourceKey).toLowerCase();
@@ -1495,7 +1504,7 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
 
   const latestBySourceKey = new Map();
 
-  for (const event of residentPresenceEvents) {
+  for (const event of statePresenceEvents) {
     const sourceKey = cleanText(event.sourceKey);
 
     if (!sourceKey) {
@@ -1516,7 +1525,7 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
     }
   }
 
-  const latestPresenceEvent = residentPresenceEvents
+  const latestPresenceEvent = statePresenceEvents
     .slice()
     .sort((first, second) => new Date(second.timestamp).getTime() - new Date(first.timestamp).getTime())[0] || null;
   const lastKnownPresenceAt = latestPresenceEvent?.timestamp || null;
@@ -1605,10 +1614,10 @@ function buildResidentPresenceIntelligence(residentSensors, residentPresenceEven
 
   return {
     presenceSensorCount: presenceSensors.length,
-    presenceEventCount: residentPresenceEvents.length,
+    presenceEventCount: statePresenceEvents.length,
     presenceIsFresh,
     presenceFreshnessReason,
-    recentPresenceTimeline: residentPresenceEvents
+    recentPresenceTimeline: statePresenceEvents
       .slice()
       .sort(
         (a, b) =>
