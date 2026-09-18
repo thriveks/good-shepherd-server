@@ -7131,29 +7131,51 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
       });
     }
 
-    const nodeResult = await pool.query(
-      `
-      SELECT
-        n.node_id AS "nodeId",
-        n.node_name AS "nodeName",
-        n.location_name AS "locationName",
-        n.setup_id AS "setupId",
-        n.setup_state AS "setupState",
-        n.is_archived AS "isArchived",
-        h.diagnostics->>'sensorMode' AS "sensorMode",
-        h.diagnostics->>'sensorType' AS "healthSensorType",
-        h.diagnostics->>'residentName' AS "healthResidentName",
-        h.diagnostics->>'roomName' AS "healthRoomName"
-      FROM nodes n
-      LEFT JOIN node_health h ON h.node_id = n.node_id
-      WHERE n.node_id = $1
-        AND UPPER(TRIM(COALESCE(n.setup_id, ''))) = $2
-      LIMIT 1
-      `,
-      [nodeId, setupId]
-    );
+    let node = null;
+    const registrationDeadline = Date.now() + 20000;
 
-    const node = nodeResult.rows[0] || null;
+    while (Date.now() < registrationDeadline) {
+      const nodeResult = await pool.query(
+        `
+        SELECT
+          n.node_id AS "nodeId",
+          n.node_name AS "nodeName",
+          n.location_name AS "locationName",
+          n.setup_id AS "setupId",
+          n.setup_state AS "setupState",
+          n.is_archived AS "isArchived",
+          h.diagnostics->>'sensorMode' AS "sensorMode",
+          h.diagnostics->>'sensorType' AS "healthSensorType",
+          h.diagnostics->>'residentName' AS "healthResidentName",
+          h.diagnostics->>'roomName' AS "healthRoomName"
+        FROM nodes n
+        LEFT JOIN node_health h ON h.node_id = n.node_id
+        WHERE n.node_id = $1
+        LIMIT 1
+        `,
+        [nodeId]
+      );
+
+      const candidate = nodeResult.rows[0] || null;
+
+      if (candidate?.isArchived) {
+        break;
+      }
+
+      const registeredSetupId =
+        cleanText(candidate?.setupId).toUpperCase();
+
+      if (candidate && registeredSetupId === setupId) {
+        node = candidate;
+        break;
+      }
+
+      if (candidate && registeredSetupId && registeredSetupId !== setupId) {
+        break;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
 
     if (!node || node.isArchived) {
       recordFirstSensorClaimFailure(req);
@@ -7187,28 +7209,6 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
       );
 
     if (sensorHasResident) {
-      recordFirstSensorClaimFailure(req);
-      return res.status(409).json({
-        success: false,
-        error: "This sensor has already been activated"
-      });
-    }
-
-    const nodeSetupState = normalizeSetupState(node.setupState);
-    const healthResidentName = cleanText(node.healthResidentName);
-    const healthRoomName = cleanText(node.healthRoomName);
-
-    const firmwareMatchesPendingActivation =
-      nodeSetupState === "assigned" &&
-      healthResidentName &&
-      healthResidentName.toLowerCase() === residentName.toLowerCase() &&
-      healthRoomName &&
-      healthRoomName.toLowerCase() === roomName.toLowerCase();
-
-    if (
-      nodeSetupState !== "unassigned" &&
-      !firmwareMatchesPendingActivation
-    ) {
       recordFirstSensorClaimFailure(req);
       return res.status(409).json({
         success: false,
