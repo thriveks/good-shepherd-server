@@ -7132,7 +7132,7 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
     }
 
     let node = null;
-    const registrationDeadline = Date.now() + 20000;
+    const registrationDeadline = Date.now() + 90000;
 
     while (Date.now() < registrationDeadline) {
       const nodeResult = await pool.query(
@@ -7170,9 +7170,9 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
         break;
       }
 
-      if (candidate && registeredSetupId && registeredSetupId !== setupId) {
-        break;
-      }
+      // A node record may contain a prior setup_id while the ESP32 is
+      // completing first-home commissioning. Never accept a mismatch;
+      // keep polling until the exact BLE setup ID appears or timeout.
 
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
