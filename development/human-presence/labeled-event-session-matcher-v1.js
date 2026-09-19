@@ -249,6 +249,14 @@ AND
 AND
   authoritative_room_or_location =
     ${sqlLiteral(label.roomOrLocation)}
+AND
+  evidence_received_at >=
+    ${sqlLiteral(label.startedAt)}::timestamptz
+      - INTERVAL '5 minutes'
+AND
+  evidence_received_at <=
+    ${sqlLiteral(label.endedAt)}::timestamptz
+      + INTERVAL '5 minutes'
 ORDER BY
   evidence_received_at ASC,
   evidence_event_id ASC
