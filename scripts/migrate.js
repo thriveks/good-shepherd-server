@@ -1,5 +1,10 @@
 "use strict";
 
+const customerBootstrapResidentEventIndexV1Migration =
+  require(
+    "./migrations/2026-09-20-customer-bootstrap-resident-event-index-v1"
+  );
+
 
 const nodeSetupIdV1Migration =
   require(
@@ -400,6 +405,11 @@ async function runMigrations() {
     );
 
     await applyVersionedMigration(client, nodeSetupIdV1Migration);
+
+    await applyVersionedMigration(
+      client,
+      customerBootstrapResidentEventIndexV1Migration
+    );
 
     /*
      * Future schema changes belong here as explicit,
