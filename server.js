@@ -7615,7 +7615,7 @@ app.get("/customer/ai/dashboard", async (req, res) => {
     if (!session) return;
     const residentId = session.residentId;
 
-    const fullSummary = await buildAIMotionSummary();
+    const fullSummary = await loadMonitoringSummaryFast();
     const residents = (fullSummary.residents || []).filter((resident) => String(resident.residentId) === String(residentId));
     const summary = { ...fullSummary, residentCount: residents.length, residents };
     const briefing = buildAIBriefingFromSummary(summary);
