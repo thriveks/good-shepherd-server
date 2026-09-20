@@ -3592,6 +3592,16 @@ async function buildAIBriefing() {
 
 let aiDashboardRefreshPromise = null;
 let aiDashboardRefreshTimer = null;
+let aiDashboardRefreshRequested = false;
+
+const CUSTOMER_AI_INVALIDATION_CHANNEL =
+  "good_shepherd_customer_ai_invalidation";
+
+const pendingCustomerAIInvalidations = new Map();
+const customerAIStreamClients = new Map();
+
+let customerAIInvalidationListener = null;
+let customerAIInvalidationReconnectTimer = null;
 
 async function persistAIDashboardPayload(payload) {
   try {
@@ -3680,22 +3690,360 @@ async function buildAIDashboardPayload() {
 }
 
 async function refreshAIDashboardPayloadSingleFlight() {
-  if (aiDashboardRefreshPromise) return aiDashboardRefreshPromise;
-  aiDashboardRefreshPromise = buildAIDashboardPayload()
-    .catch((error) => {
-      console.error('AI dashboard background refresh failed:', error);
-      throw error;
-    })
-    .finally(() => { aiDashboardRefreshPromise = null; });
+  if (aiDashboardRefreshPromise) {
+    return aiDashboardRefreshPromise;
+  }
+
+  const invalidationsForThisRefresh =
+    Array.from(
+      pendingCustomerAIInvalidations.values()
+    );
+
+  aiDashboardRefreshPromise =
+    buildAIDashboardPayload()
+      .then(async (payload) => {
+        // Keep this process coherent with the freshly
+        // persisted shared dashboard snapshot.
+        monitoringSummaryMemoryCache =
+          payload.summary;
+
+        monitoringSummaryMemoryLoadedAt =
+          Date.now();
+
+        try {
+          await flushCustomerAIInvalidations(
+            invalidationsForThisRefresh
+          );
+        } catch (error) {
+          // Cache rebuild succeeded. Notification delivery
+          // is optimization/realtime transport only and must
+          // never invalidate a successful AI rebuild.
+          console.error(
+            "Customer AI invalidation flush failed:",
+            error?.message || String(error)
+          );
+        }
+
+        return payload;
+      })
+      .catch((error) => {
+        console.error(
+          "AI dashboard background refresh failed:",
+          error
+        );
+
+        throw error;
+      })
+      .finally(() => {
+        aiDashboardRefreshPromise = null;
+
+        if (aiDashboardRefreshRequested) {
+          aiDashboardRefreshRequested = false;
+
+          setImmediate(() => {
+            refreshAIDashboardPayloadSingleFlight()
+              .catch(() => {});
+          });
+        }
+      });
+
   return aiDashboardRefreshPromise;
 }
 
-function scheduleAIDashboardRefresh() {
-  if (aiDashboardRefreshTimer) clearTimeout(aiDashboardRefreshTimer);
-  aiDashboardRefreshTimer = setTimeout(() => {
-    aiDashboardRefreshTimer = null;
-    refreshAIDashboardPayloadSingleFlight().catch(() => {});
-  }, AI_DASHBOARD_REFRESH_DEBOUNCE_MS);
+function queueCustomerAIInvalidation(
+  residentId,
+  reason = "ai_data_changed"
+) {
+  const resolvedResidentId =
+    cleanText(residentId);
+
+  if (!resolvedResidentId) return;
+
+  pendingCustomerAIInvalidations.set(
+    resolvedResidentId,
+    {
+      residentId: resolvedResidentId,
+      reason:
+        cleanText(reason) ||
+        "ai_data_changed",
+      queuedAt: new Date().toISOString()
+    }
+  );
+}
+
+async function flushCustomerAIInvalidations(
+  invalidations
+) {
+  const queued =
+    Array.isArray(invalidations)
+      ? invalidations.filter(Boolean)
+      : [];
+
+  if (!queued.length) return;
+
+  const results =
+    await Promise.allSettled(
+      queued.map(async (payload) => {
+        await pool.query(
+          "SELECT pg_notify($1, $2)",
+          [
+            CUSTOMER_AI_INVALIDATION_CHANNEL,
+            JSON.stringify(payload)
+          ]
+        );
+
+        return payload;
+      })
+    );
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      const payload = result.value;
+
+      const current =
+        pendingCustomerAIInvalidations.get(
+          payload.residentId
+        );
+
+      // Delete only the exact invalidation that was
+      // represented by this completed rebuild.
+      //
+      // If a newer edge arrived while the rebuild was
+      // running, queuedAt will differ and the newer event
+      // remains pending for the next rebuild.
+      if (
+        current?.queuedAt ===
+        payload.queuedAt
+      ) {
+        pendingCustomerAIInvalidations.delete(
+          payload.residentId
+        );
+      }
+
+      continue;
+    }
+
+    console.error(
+      "Customer AI pg_notify failed:",
+      result.reason?.message ||
+        String(result.reason)
+    );
+  }
+}
+
+function scheduleAIDashboardRefresh(
+  invalidation = null
+) {
+  if (invalidation?.residentId) {
+    queueCustomerAIInvalidation(
+      invalidation.residentId,
+      invalidation.reason
+    );
+  }
+
+  if (aiDashboardRefreshTimer) {
+    clearTimeout(
+      aiDashboardRefreshTimer
+    );
+  }
+
+  aiDashboardRefreshTimer =
+    setTimeout(() => {
+      aiDashboardRefreshTimer = null;
+
+      // A sensor change occurred while the AI dashboard
+      // was already rebuilding. Do not lose that change.
+      // Request one additional rebuild after the current
+      // single-flight build completes.
+      if (aiDashboardRefreshPromise) {
+        aiDashboardRefreshRequested = true;
+        return;
+      }
+
+      refreshAIDashboardPayloadSingleFlight()
+        .catch(() => {});
+    }, AI_DASHBOARD_REFRESH_DEBOUNCE_MS);
+}
+
+function writeCustomerAIServerEvent(
+  res,
+  eventName,
+  payload
+) {
+  if (res.writableEnded || res.destroyed) {
+    return false;
+  }
+
+  try {
+    res.write(`event: ${eventName}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function addCustomerAIStreamClient(
+  residentId,
+  res
+) {
+  const resolvedResidentId = cleanText(residentId);
+
+  if (!customerAIStreamClients.has(resolvedResidentId)) {
+    customerAIStreamClients.set(
+      resolvedResidentId,
+      new Set()
+    );
+  }
+
+  customerAIStreamClients
+    .get(resolvedResidentId)
+    .add(res);
+}
+
+function removeCustomerAIStreamClient(
+  residentId,
+  res
+) {
+  const resolvedResidentId = cleanText(residentId);
+
+  const clients =
+    customerAIStreamClients.get(resolvedResidentId);
+
+  if (!clients) return;
+
+  clients.delete(res);
+
+  if (!clients.size) {
+    customerAIStreamClients.delete(
+      resolvedResidentId
+    );
+  }
+}
+
+function broadcastCustomerAIInvalidation(
+  payload
+) {
+  const residentId = cleanText(
+    payload?.residentId
+  );
+
+  if (!residentId) return;
+
+  const clients =
+    customerAIStreamClients.get(residentId);
+
+  if (!clients?.size) return;
+
+  for (const res of Array.from(clients)) {
+    const delivered = writeCustomerAIServerEvent(
+      res,
+      "ai_invalidated",
+      payload
+    );
+
+    if (!delivered) {
+      removeCustomerAIStreamClient(
+        residentId,
+        res
+      );
+    }
+  }
+}
+
+function scheduleCustomerAIInvalidationListenerReconnect() {
+  if (customerAIInvalidationReconnectTimer) {
+    return;
+  }
+
+  customerAIInvalidationReconnectTimer =
+    setTimeout(() => {
+      customerAIInvalidationReconnectTimer = null;
+
+      startCustomerAIInvalidationListener()
+        .catch((error) => {
+          console.error(
+            "Customer AI invalidation listener reconnect failed:",
+            error?.message || String(error)
+          );
+
+          scheduleCustomerAIInvalidationListenerReconnect();
+        });
+    }, 5000);
+}
+
+async function startCustomerAIInvalidationListener() {
+  if (customerAIInvalidationListener) {
+    return;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query(
+      `LISTEN ${CUSTOMER_AI_INVALIDATION_CHANNEL}`
+    );
+  } catch (error) {
+    client.release(true);
+    throw error;
+  }
+
+  customerAIInvalidationListener = client;
+
+  client.on("notification", (message) => {
+    if (
+      message.channel !==
+      CUSTOMER_AI_INVALIDATION_CHANNEL
+    ) {
+      return;
+    }
+
+    try {
+      const payload = JSON.parse(
+        message.payload || "{}"
+      );
+
+      // Another Render process may have performed the
+      // authoritative rebuild. Drop this process-local
+      // memory snapshot so the customer's subsequent GET
+      // reads the newly persisted shared cache.
+      monitoringSummaryMemoryCache = null;
+      monitoringSummaryMemoryLoadedAt = 0;
+
+      broadcastCustomerAIInvalidation(
+        payload
+      );
+    } catch (error) {
+      console.error(
+        "Customer AI invalidation payload rejected:",
+        error?.message || String(error)
+      );
+    }
+  });
+
+  client.on("error", (error) => {
+    console.error(
+      "Customer AI invalidation listener lost:",
+      error?.message || String(error)
+    );
+
+    if (
+      customerAIInvalidationListener ===
+      client
+    ) {
+      customerAIInvalidationListener = null;
+    }
+
+    try {
+      client.release(true);
+    } catch (_) {}
+
+    scheduleCustomerAIInvalidationListenerReconnect();
+  });
+
+  console.log(
+    "Customer AI cross-instance invalidation listener active."
+  );
 }
 
 async function incrementResidentDailyActivity({ resident, event, sensor }) {
@@ -7606,6 +7954,86 @@ app.patch("/customer/sensors/:nodeId/assignment", async (req, res) => {
       error: error.message,
       ...(error.code ? { code: error.code } : {})
     });
+  }
+});
+
+app.get("/customer/ai/stream", async (req, res) => {
+  try {
+    const session =
+      await requireCustomerSession(req, res);
+
+    if (!session) return;
+
+    const residentId = cleanText(
+      session.residentId
+    );
+
+    res.status(200);
+    res.set({
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
+    }
+
+    addCustomerAIStreamClient(
+      residentId,
+      res
+    );
+
+    writeCustomerAIServerEvent(
+      res,
+      "ready",
+      {
+        residentId,
+        connectedAt: new Date().toISOString()
+      }
+    );
+
+    const keepAliveTimer = setInterval(() => {
+      if (
+        res.writableEnded ||
+        res.destroyed
+      ) {
+        clearInterval(keepAliveTimer);
+        return;
+      }
+
+      try {
+        res.write(
+          `: keepalive ${Date.now()}\n\n`
+        );
+      } catch (_) {
+        clearInterval(keepAliveTimer);
+      }
+    }, 25000);
+
+    req.on("close", () => {
+      clearInterval(keepAliveTimer);
+
+      removeCustomerAIStreamClient(
+        residentId,
+        res
+      );
+    });
+  } catch (error) {
+    console.error(
+      "Customer AI stream failed:",
+      error
+    );
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        error: "Customer AI stream failed"
+      });
+    }
+
+    res.end();
   }
 });
 
@@ -12839,7 +13267,27 @@ app.post("/webhook", async (req, res) => {
 
     // Dashboard refresh is also an optimization and is already internally
     // debounced. Scheduling it must not delay the sensor webhook response.
-    scheduleAIDashboardRefresh();
+    //
+    // Customer live invalidation is intentionally limited to authoritative
+    // presence state edges. Moving/stationary telemetry must not generate a
+    // realtime client fan-out for every sample.
+    const shouldInvalidateCustomerAI =
+      Boolean(resident?.id) &&
+      [
+        "presence_detected",
+        "presence_cleared"
+      ].includes(
+        cleanText(event.eventType).toLowerCase()
+      );
+
+    scheduleAIDashboardRefresh(
+      shouldInvalidateCustomerAI
+        ? {
+            residentId: resident.id,
+            reason: event.eventType
+          }
+        : null
+    );
 
     acceptedWebhookCountSinceStart += 1;
     if (acceptedWebhookCountSinceStart === 1 || acceptedWebhookCountSinceStart % 100 === 0) {
@@ -14342,6 +14790,17 @@ initializeDatabase()
     app.listen(PORT, () => {
       console.log(`Good Shepherd webhook server running on port ${PORT}`);
       startMqttV2Bridge();
+
+      startCustomerAIInvalidationListener()
+        .catch((error) => {
+          console.error(
+            "Customer AI invalidation listener startup failed:",
+            error?.message || String(error)
+          );
+
+          scheduleCustomerAIInvalidationListenerReconnect();
+        });
+
       startHumanPresenceAdaptiveCaptureControllerV1();
       console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
       console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
