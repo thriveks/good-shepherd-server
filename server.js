@@ -3865,6 +3865,8 @@ function scheduleAIDashboardRefresh(
     }, AI_DASHBOARD_REFRESH_DEBOUNCE_MS);
 }
 
+const staffAIStreamClients = new Set();
+
 function writeCustomerAIServerEvent(
   res,
   eventName,
@@ -3880,6 +3882,30 @@ function writeCustomerAIServerEvent(
     return true;
   } catch (_) {
     return false;
+  }
+}
+
+function broadcastStaffAIInvalidation(
+  payload
+) {
+  if (!staffAIStreamClients.size) {
+    return;
+  }
+
+  for (
+    const res of
+    Array.from(staffAIStreamClients)
+  ) {
+    const delivered =
+      writeCustomerAIServerEvent(
+        res,
+        "ai_invalidated",
+        payload
+      );
+
+    if (!delivered) {
+      staffAIStreamClients.delete(res);
+    }
   }
 }
 
@@ -4011,6 +4037,10 @@ async function startCustomerAIInvalidationListener() {
       monitoringSummaryMemoryLoadedAt = 0;
 
       broadcastCustomerAIInvalidation(
+        payload
+      );
+
+      broadcastStaffAIInvalidation(
         payload
       );
     } catch (error) {
@@ -7956,6 +7986,108 @@ app.patch("/customer/sensors/:nodeId/assignment", async (req, res) => {
     });
   }
 });
+
+app.get("/ai/stream", (req, res) => {
+  try {
+    if (!isAuthorizedWebhook(req)) {
+      return res.status(401).json({
+        success: false,
+        error:
+          "Unauthorized staff AI stream request"
+      });
+    }
+
+    res.status(200);
+
+    res.set({
+      "Content-Type": "text/event-stream",
+      "Cache-Control":
+        "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+
+    if (
+      typeof res.flushHeaders ===
+      "function"
+    ) {
+      res.flushHeaders();
+    }
+
+    staffAIStreamClients.add(res);
+
+    writeCustomerAIServerEvent(
+      res,
+      "ready",
+      {
+        scope: "staff",
+        connectedAt:
+          new Date().toISOString()
+      }
+    );
+
+    const keepAliveTimer =
+      setInterval(() => {
+        if (
+          res.writableEnded ||
+          res.destroyed
+        ) {
+          clearInterval(
+            keepAliveTimer
+          );
+
+          staffAIStreamClients.delete(
+            res
+          );
+
+          return;
+        }
+
+        try {
+          res.write(
+            `: keepalive ${Date.now()}\n\n`
+          );
+        } catch (_) {
+          clearInterval(
+            keepAliveTimer
+          );
+
+          staffAIStreamClients.delete(
+            res
+          );
+        }
+      }, 25000);
+
+    req.on("close", () => {
+      clearInterval(
+        keepAliveTimer
+      );
+
+      staffAIStreamClients.delete(
+        res
+      );
+    });
+
+  } catch (error) {
+    console.error(
+      "Staff AI stream failed:",
+      error
+    );
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        error:
+          "Staff AI stream unavailable"
+      });
+    }
+
+    try {
+      res.end();
+    } catch (_) {}
+  }
+});
+
 
 app.get("/customer/ai/stream", async (req, res) => {
   try {
