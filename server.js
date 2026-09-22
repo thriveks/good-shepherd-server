@@ -8059,6 +8059,109 @@ app.get("/customer/ai/dashboard", async (req, res) => {
   }
 });
 
+app.get("/customer/ai/motion-events", async (req, res) => {
+  try {
+    const session = await requireCustomerSession(req, res);
+    if (!session) return;
+
+    const residentId = cleanText(session.residentId);
+
+    if (!residentId) {
+      return res.status(400).json({
+        success: false,
+        error: "Customer session is missing its resident assignment"
+      });
+    }
+
+    const requestedLimit = normalizeInteger(req.query.limit, 100);
+    const limit = Math.min(Math.max(requestedLimit, 1), 500);
+
+    const requestedWindow =
+      cleanText(req.query.window).toLowerCase() ||
+      "today";
+
+    const allowedWindows = new Set([
+      "today",
+      "lasthour",
+      "all"
+    ]);
+
+    if (!allowedWindows.has(requestedWindow)) {
+      return res.status(400).json({
+        success: false,
+        error: "window must be today, lastHour, or all"
+      });
+    }
+
+    const sourceKey =
+      cleanOptionalText(req.query.sourceKey);
+
+    const sensorId =
+      cleanOptionalText(req.query.sensorId);
+
+    const result = await pool.query(
+      `
+      ${motionEventSelectSQL()}
+      WHERE resident_id::text = $1
+        AND ($2::text IS NULL OR source_key = $2)
+        AND ($3::text IS NULL OR sensor_id::text = $3)
+        AND (
+          $4::text = 'all'
+          OR (
+            $4::text = 'lasthour'
+            AND event_timestamp >= NOW() - INTERVAL '1 hour'
+          )
+          OR (
+            $4::text = 'today'
+            AND event_timestamp >= (
+              (NOW() AT TIME ZONE $5)::date
+              AT TIME ZONE $5
+            )
+            AND event_timestamp < (
+              (
+                (NOW() AT TIME ZONE $5)::date + 1
+              )
+              AT TIME ZONE $5
+            )
+          )
+        )
+      ORDER BY event_timestamp DESC
+      LIMIT $6
+      `,
+      [
+        residentId,
+        sourceKey,
+        sensorId,
+        requestedWindow,
+        AI_TIME_ZONE,
+        limit
+      ]
+    );
+
+    return res.status(200).json({
+      success: true,
+      window:
+        requestedWindow === "lasthour"
+          ? "lastHour"
+          : requestedWindow,
+      aiTimeZone: AI_TIME_ZONE,
+      count: result.rows.length,
+      events: result.rows
+    });
+  } catch (error) {
+    console.error(
+      "Customer AI motion events failed:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: "Customer motion history load failed"
+    });
+  }
+});
+
+
 app.get("/", async (req, res) => {
   res.json({
     success: true,
