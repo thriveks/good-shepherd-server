@@ -6028,6 +6028,60 @@ async function upsertNodeHealth(payload) {
   }
   const lastErrorAt = lastError ? new Date().toISOString() : null;
 
+  // Human Presence uses heartbeat diagnostics as corroborating evidence.
+  // Read the previously persisted presence value before this heartbeat
+  // overwrites node_health so a real true/false transition can wake the
+  // existing AI/SSE pipeline.
+  //
+  // This extra read occurs only for heartbeats that report a boolean
+  // diagnostics.presence value. Failure is best-effort and never prevents
+  // the heartbeat from being persisted.
+  const currentHeartbeatPresenceState =
+    readPayloadBoolean(
+      diagnostics,
+      "presence"
+    );
+
+  let previousHeartbeatPresenceState = null;
+  let hasPreviousHeartbeatPresenceRecord = false;
+
+  if (currentHeartbeatPresenceState !== null) {
+    try {
+      const previousHealthResult =
+        await pool.query(
+          `
+          SELECT diagnostics
+          FROM node_health
+          WHERE node_id = $1
+          LIMIT 1
+          `,
+          [nodeId]
+        );
+
+      if (previousHealthResult.rows[0]) {
+        hasPreviousHeartbeatPresenceRecord = true;
+
+        previousHeartbeatPresenceState =
+          readPayloadBoolean(
+            normalizeJsonObject(
+              previousHealthResult.rows[0].diagnostics
+            ),
+            "presence"
+          );
+      }
+    } catch (error) {
+      console.error(
+        "Node health prior presence diagnostic read failed:",
+        {
+          nodeId,
+          error:
+            error?.message ||
+            String(error)
+        }
+      );
+    }
+  }
+
   // Heartbeat reliability rule:
   // Persist checked_in_at first. Assignment, resident, node, and sensor
   // reconciliation must never block or invalidate a valid heartbeat.
@@ -6149,6 +6203,62 @@ async function upsertNodeHealth(payload) {
   );
 
   const health = result.rows[0];
+
+  const heartbeatPresenceChanged =
+    currentHeartbeatPresenceState !== null &&
+    hasPreviousHeartbeatPresenceRecord &&
+    previousHeartbeatPresenceState !== null &&
+    currentHeartbeatPresenceState !==
+      previousHeartbeatPresenceState;
+
+  if (heartbeatPresenceChanged) {
+    // The heartbeat has already been persisted successfully.
+    // Everything below is best-effort realtime propagation and cannot
+    // invalidate the heartbeat response.
+    setImmediate(() => {
+      pool.query(
+        `
+        SELECT DISTINCT
+          resident_id AS "residentId"
+        FROM sensors
+        WHERE node_id = $1
+          AND resident_id IS NOT NULL
+        `,
+        [nodeId]
+      )
+        .then((residentResult) => {
+          for (const row of residentResult.rows) {
+            const residentId =
+              cleanText(row.residentId);
+
+            if (!residentId) {
+              continue;
+            }
+
+            scheduleAIDashboardRefresh({
+              residentId,
+              reason:
+                "presence_heartbeat_changed"
+            });
+          }
+        })
+        .catch((error) => {
+          console.error(
+            "Presence heartbeat AI invalidation failed:",
+            {
+              nodeId,
+              previousPresence:
+                previousHeartbeatPresenceState,
+              currentPresence:
+                currentHeartbeatPresenceState,
+              error:
+                error?.message ||
+                String(error)
+            }
+          );
+        });
+    });
+  }
 
   // Run assignment and inventory synchronization after the heartbeat has
   // already been committed. This work is intentionally best-effort and
