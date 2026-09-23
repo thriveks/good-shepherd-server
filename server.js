@@ -809,26 +809,6 @@ function logStructuredDiagnostic(code, severity = "info", details = {}) {
   }
 }
 
-// Temporary end-to-end observability for one Human Presence transition.
-// This logger is intentionally best-effort and does not affect request,
-// heartbeat, refresh, or SSE behavior.
-function logPresenceTrace(stage, details = {}) {
-  try {
-    console.log(JSON.stringify({
-      timestamp: new Date().toISOString(),
-      marker: "PRESENCE_TRACE",
-      stage,
-      ...details
-    }));
-  } catch (_) {}
-}
-
-function isPresenceTraceInvalidation(invalidation) {
-  return cleanText(invalidation?.reason)
-    .toLowerCase()
-    .startsWith("presence_");
-}
-
 function commandOwnerFor(nodeId, commandType) {
   const type = cleanText(commandType).toLowerCase();
   if (isEsp32NodeId(nodeId)) return ESP32_SENSOR_COMMAND_TYPES.includes(type) ? "sensor" : null;
@@ -1501,7 +1481,7 @@ function presenceEventRoomName(event, sensor) {
     "Unknown room";
 }
 
-function buildResidentPresenceIntelligence(residentId, residentSensors, residentPresenceEvents, nodeHealthByNodeId) {
+function buildResidentPresenceIntelligence(residentSensors, residentPresenceEvents, nodeHealthByNodeId) {
   // State decisions must only use events that carry an interpretable
   // current-presence state. Observer/evidence-only telemetry such as
   // high_resolution_activity_evidence remains available to the broader
@@ -1574,18 +1554,6 @@ function buildResidentPresenceIntelligence(residentId, residentSensors, resident
   else if (presenceSensors.length > 0 && diagnosticState === null) presenceFreshnessReason = "missing_presence_diagnostic";
   else if (presenceSensors.length > 0 && diagnosticState !== lastKnownPresenceState) presenceFreshnessReason = "heartbeat_event_disagreement";
   else if (presenceIsFresh) presenceFreshnessReason = "fresh_heartbeat_corroborates_last_edge";
-
-  if (presenceSensors.length > 0) {
-    logPresenceTrace("presence_freshness_decision", {
-      residentId: cleanText(residentId) || null,
-      nodeId: latestSensor?.nodeId || null,
-      lastKnownPresenceState,
-      diagnosticState,
-      healthIsFresh,
-      presenceIsFresh,
-      presenceFreshnessReason
-    });
-  }
 
   const latestPresenceAt = lastKnownPresenceAt;
   const latestPresenceState = presenceIsFresh ? lastKnownPresenceState : null;
@@ -3091,7 +3059,6 @@ async function buildAIMotionSummary() {
     }).length;
     const roomIntelligence = buildResidentRoomIntelligence(residentSensors, residentTodayMotionEvents);
     const presenceIntelligence = buildResidentPresenceIntelligence(
-      resident.id,
       residentSensors,
       residentPresenceEvents,
       nodeHealthByNodeId
@@ -3732,21 +3699,6 @@ async function refreshAIDashboardPayloadSingleFlight() {
       pendingCustomerAIInvalidations.values()
     );
 
-  const presenceInvalidationsForThisRefresh =
-    invalidationsForThisRefresh.filter(
-      isPresenceTraceInvalidation
-    );
-
-  if (presenceInvalidationsForThisRefresh.length) {
-    logPresenceTrace("dashboard_refresh_build_started", {
-      pendingCustomerInvalidations:
-        presenceInvalidationsForThisRefresh.map((payload) => ({
-          residentId: payload.residentId,
-          reason: payload.reason
-        }))
-    });
-  }
-
   aiDashboardRefreshPromise =
     buildAIDashboardPayload()
       .then(async (payload) => {
@@ -3757,16 +3709,6 @@ async function refreshAIDashboardPayloadSingleFlight() {
 
         monitoringSummaryMemoryLoadedAt =
           Date.now();
-
-        if (presenceInvalidationsForThisRefresh.length) {
-          logPresenceTrace("dashboard_refresh_build_completed", {
-            pendingCustomerInvalidations:
-              presenceInvalidationsForThisRefresh.map((item) => ({
-                residentId: item.residentId,
-                reason: item.reason
-              }))
-          });
-        }
 
         try {
           await flushCustomerAIInvalidations(
@@ -3842,14 +3784,6 @@ async function flushCustomerAIInvalidations(
   const results =
     await Promise.allSettled(
       queued.map(async (payload) => {
-        if (isPresenceTraceInvalidation(payload)) {
-          logPresenceTrace("customer_invalidation_pg_notify", {
-            residentId: payload.residentId,
-            reason: payload.reason,
-            queuedAt: payload.queuedAt
-          });
-        }
-
         await pool.query(
           "SELECT pg_notify($1, $2)",
           [
@@ -3900,13 +3834,6 @@ async function flushCustomerAIInvalidations(
 function scheduleAIDashboardRefresh(
   invalidation = null
 ) {
-  if (isPresenceTraceInvalidation(invalidation)) {
-    logPresenceTrace("dashboard_refresh_queued", {
-      residentId: cleanText(invalidation.residentId) || null,
-      reason: cleanText(invalidation.reason) || null
-    });
-  }
-
   if (invalidation?.residentId) {
     queueCustomerAIInvalidation(
       invalidation.residentId,
@@ -4032,18 +3959,7 @@ function broadcastCustomerAIInvalidation(
   const clients =
     customerAIStreamClients.get(residentId);
 
-  let deliveryCount = 0;
-
-  if (!clients?.size) {
-    if (isPresenceTraceInvalidation(payload)) {
-      logPresenceTrace("customer_sse_ai_invalidated", {
-        residentId,
-        reason: cleanText(payload?.reason) || null,
-        deliveryCount
-      });
-    }
-    return;
-  }
+  if (!clients?.size) return;
 
   for (const res of Array.from(clients)) {
     const delivered = writeCustomerAIServerEvent(
@@ -4057,17 +3973,7 @@ function broadcastCustomerAIInvalidation(
         residentId,
         res
       );
-    } else {
-      deliveryCount += 1;
     }
-  }
-
-  if (isPresenceTraceInvalidation(payload)) {
-    logPresenceTrace("customer_sse_ai_invalidated", {
-      residentId,
-      reason: cleanText(payload?.reason) || null,
-      deliveryCount
-    });
   }
 }
 
@@ -6174,17 +6080,6 @@ async function upsertNodeHealth(payload) {
         }
       );
     }
-  }
-
-  if (currentHeartbeatPresenceState !== null) {
-    logPresenceTrace("heartbeat_presence_upsert_input", {
-      nodeId,
-      presence: currentHeartbeatPresenceState,
-      previousPersistedPresence:
-        hasPreviousHeartbeatPresenceRecord
-          ? previousHeartbeatPresenceState
-          : null
-    });
   }
 
   // Heartbeat reliability rule:
@@ -13681,19 +13576,6 @@ app.post("/webhook", async (req, res) => {
       sensorType: resolvedSensorType,
       eventPayload: fullWebhookPayload
     };
-
-    if (
-      event.eventType === "presence_detected" ||
-      event.eventType === "presence_cleared"
-    ) {
-      logPresenceTrace("webhook_presence_received", {
-        residentId: resident?.id || sensor?.residentId || null,
-        nodeId: event.nodeId,
-        source: event.sourceKey || event.sourceName || null,
-        eventType: event.eventType,
-        eventTimestamp: event.timestamp
-      });
-    }
 
     await pool.query(
       `
