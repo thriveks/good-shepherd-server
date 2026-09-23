@@ -8294,6 +8294,33 @@ app.get("/customer/ai/motion-events", async (req, res) => {
 });
 
 
+app.get("/health", async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    await pool.query("SELECT 1");
+
+    return res.status(200).json({
+      success: true,
+      status: "healthy",
+      database: "reachable",
+      responseTimeMs: Date.now() - startedAt
+    });
+  } catch (error) {
+    console.error(
+      "Health check failed:",
+      error?.message || String(error)
+    );
+
+    return res.status(503).json({
+      success: false,
+      status: "unhealthy",
+      database: "unreachable"
+    });
+  }
+});
+
+
 app.get("/", async (req, res) => {
   res.json({
     success: true,
