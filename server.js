@@ -7252,6 +7252,77 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
   }
 }
 
+
+async function prepareNodeForReconfigure(client, nodeId) {
+  // Reconfigure is intentionally non-destructive.
+  //
+  // Preserve:
+  // - physical node identity
+  // - source/device identity
+  // - Wi-Fi metadata
+  // - firmware/history
+  //
+  // Clear only the active resident/location/room assignment so the same
+  // physical sensor can safely enter BLE commissioning and be assigned again.
+
+  await client.query(
+    `
+    UPDATE sensors
+    SET
+      resident_id = NULL,
+      resident_name = 'Unassigned',
+      location_name = 'Unassigned Location',
+      room_name = NULL,
+      setup_state = 'unassigned',
+      assignment_authority = 'operator_explicit',
+      is_active = TRUE,
+      is_deleted = FALSE,
+      deleted_at = NULL,
+      updated_at = NOW()
+    WHERE node_id = $1
+      AND is_deleted = FALSE
+    `,
+    [nodeId]
+  );
+
+  await client.query(
+    `
+    UPDATE nodes
+    SET
+      location_name = 'Unassigned Location',
+      status = 'Pending Setup',
+      setup_state = 'unassigned',
+      is_archived = FALSE,
+      archived_at = NULL,
+      archived_reason = NULL,
+      last_seen_at = NOW()
+    WHERE node_id = $1
+    `,
+    [nodeId]
+  );
+
+  await client.query(
+    `
+    UPDATE node_health
+    SET
+      location_name = 'Unassigned Location',
+      setup_state = 'unassigned',
+      diagnostics =
+        COALESCE(diagnostics, '{}'::jsonb) ||
+        jsonb_build_object(
+          'residentName', 'Unassigned',
+          'locationName', 'Unassigned Location',
+          'roomName', '',
+          'assignmentState', 'Unassigned',
+          'setupState', 'unassigned'
+        ),
+      updated_at = NOW()
+    WHERE node_id = $1
+    `,
+    [nodeId]
+  );
+}
+
 async function prepareNodeForFactoryReset(client, nodeId) {
   const sensorResult = await client.query(
     `
@@ -7447,6 +7518,10 @@ async function createSensorCommand({ nodeId, commandType, payload, requestedBy, 
         requestedBy
       ]
     );
+
+    if (commandType === "reconfigure") {
+      await prepareNodeForReconfigure(client, nodeId);
+    }
 
     if (commandType === "factory_reset") {
       await prepareNodeForFactoryReset(client, nodeId);
@@ -12416,6 +12491,10 @@ app.post("/sensor-commands", async (req, res) => {
         requestedBy
       ]
     );
+
+    if (commandType === "reconfigure") {
+      await prepareNodeForReconfigure(client, nodeId);
+    }
 
     if (commandType === "factory_reset") {
       await prepareNodeForFactoryReset(client, nodeId);
