@@ -4,15 +4,31 @@ services:
     runtime: node
     plan: starter
     buildCommand: npm install
-    preDeployCommand: npm run migrate
+    preDeployCommand: npm run config:check && npm run migrate
     startCommand: node server.js
     healthCheckPath: /health
     autoDeployTrigger: off
     envVars:
+      - key: NODE_ENV
+        value: "production"
       - key: DATABASE_URL
         fromDatabase:
           name: good-shepherd-db
           property: connectionString
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: STAFF_ACCESS_CODE
+        sync: false
+      - key: MQTT_BRIDGE_ENABLED
+        value: "true"
+      - key: MQTT_HOST
+        sync: false
+      - key: MQTT_PORT
+        value: "8883"
+      - key: MQTT_USERNAME
+        sync: false
+      - key: MQTT_PASSWORD
+        sync: false
 
 databases:
   - name: good-shepherd-db

@@ -1,5 +1,10 @@
 "use strict";
 
+const humanPresenceLatestResidentIndexesV1Migration =
+  require(
+    "./migrations/2026-09-26-human-presence-latest-resident-indexes-v1"
+  );
+
 const customerBootstrapResidentEventIndexV1Migration =
   require(
     "./migrations/2026-09-20-customer-bootstrap-resident-event-index-v1"
@@ -409,6 +414,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       customerBootstrapResidentEventIndexV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      humanPresenceLatestResidentIndexesV1Migration
     );
 
     /*

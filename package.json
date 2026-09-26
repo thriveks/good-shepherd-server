@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "migrate": "node scripts/migrate.js"
+    "config:check": "node scripts/validate_runtime_config.js",
+    "migrate": "node scripts/migrate.js",
+    "test:refactor": "node --test tests/refactor/*.test.js"
   },
   "dependencies": {
     "express": "^4.21.2",
