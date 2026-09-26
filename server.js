@@ -4224,6 +4224,27 @@ const MONITORING_LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const MONITORING_LOGIN_MAX_ATTEMPTS = 8;
 const monitoringLoginAttempts = new Map();
 
+const ATTEMPT_MAP_PRUNE_INTERVAL_MS = 60 * 1000;
+const attemptMapLastPrunedAt = new WeakMap();
+
+function pruneExpiredAttemptEntries(attemptMap, windowMs, now = Date.now()) {
+  const lastPrunedAt = attemptMapLastPrunedAt.get(attemptMap) || 0;
+
+  if (now - lastPrunedAt < ATTEMPT_MAP_PRUNE_INTERVAL_MS) {
+    return;
+  }
+
+  attemptMapLastPrunedAt.set(attemptMap, now);
+
+  for (const [key, entry] of attemptMap.entries()) {
+    const startedAt = Number(entry?.startedAt);
+
+    if (!Number.isFinite(startedAt) || now - startedAt >= windowMs) {
+      attemptMap.delete(key);
+    }
+  }
+}
+
 function monitoringEncryptionKey() {
   const raw = cleanText(process.env.MONITORING_ENCRYPTION_KEY);
   if (!raw) return null;
@@ -4470,6 +4491,11 @@ function monitoringAttemptKey(req) {
 function monitoringRateLimited(req) {
   const key = monitoringAttemptKey(req);
   const now = Date.now();
+  pruneExpiredAttemptEntries(
+    monitoringLoginAttempts,
+    MONITORING_LOGIN_WINDOW_MS,
+    now
+  );
   const prior = monitoringLoginAttempts.get(key);
   if (!prior || now - prior.startedAt >= MONITORING_LOGIN_WINDOW_MS) {
     monitoringLoginAttempts.set(key, { startedAt: now, attempts: 0 });
@@ -4481,6 +4507,11 @@ function monitoringRateLimited(req) {
 function recordMonitoringFailure(req) {
   const key = monitoringAttemptKey(req);
   const now = Date.now();
+  pruneExpiredAttemptEntries(
+    monitoringLoginAttempts,
+    MONITORING_LOGIN_WINDOW_MS,
+    now
+  );
   const prior = monitoringLoginAttempts.get(key);
   if (!prior || now - prior.startedAt >= MONITORING_LOGIN_WINDOW_MS) monitoringLoginAttempts.set(key, { startedAt: now, attempts: 1 });
   else prior.attempts += 1;
@@ -4700,6 +4731,11 @@ function customerAttemptKey(req) {
 function customerCodeRateLimited(req) {
   const key = customerAttemptKey(req);
   const now = Date.now();
+  pruneExpiredAttemptEntries(
+    customerCodeAttempts,
+    CUSTOMER_CODE_WINDOW_MS,
+    now
+  );
   const prior = customerCodeAttempts.get(key);
   if (!prior || now - prior.startedAt >= CUSTOMER_CODE_WINDOW_MS) {
     customerCodeAttempts.set(key, { startedAt: now, attempts: 0 });
@@ -4711,6 +4747,11 @@ function customerCodeRateLimited(req) {
 function recordCustomerCodeFailure(req) {
   const key = customerAttemptKey(req);
   const now = Date.now();
+  pruneExpiredAttemptEntries(
+    customerCodeAttempts,
+    CUSTOMER_CODE_WINDOW_MS,
+    now
+  );
   const prior = customerCodeAttempts.get(key);
   if (!prior || now - prior.startedAt >= CUSTOMER_CODE_WINDOW_MS) {
     customerCodeAttempts.set(key, { startedAt: now, attempts: 1 });
@@ -7624,6 +7665,11 @@ function firstSensorClaimKey(req) {
 function firstSensorClaimRateLimited(req) {
   const key = firstSensorClaimKey(req);
   const now = Date.now();
+  pruneExpiredAttemptEntries(
+    firstSensorClaimAttempts,
+    FIRST_SENSOR_CLAIM_WINDOW_MS,
+    now
+  );
   const prior = firstSensorClaimAttempts.get(key);
 
   if (!prior || now - prior.startedAt >= FIRST_SENSOR_CLAIM_WINDOW_MS) {
@@ -7637,6 +7683,11 @@ function firstSensorClaimRateLimited(req) {
 function recordFirstSensorClaimFailure(req) {
   const key = firstSensorClaimKey(req);
   const now = Date.now();
+  pruneExpiredAttemptEntries(
+    firstSensorClaimAttempts,
+    FIRST_SENSOR_CLAIM_WINDOW_MS,
+    now
+  );
   const prior = firstSensorClaimAttempts.get(key);
 
   if (!prior || now - prior.startedAt >= FIRST_SENSOR_CLAIM_WINDOW_MS) {
