@@ -7271,6 +7271,15 @@ async function prepareNodeForReconfigure(client, nodeId) {
     SET
       resident_id = NULL,
       resident_name = 'Unassigned',
+      source_name = CASE
+        WHEN LOWER(TRIM(COALESCE(sensor_type, ''))) IN
+          ('human_presence', 'presence')
+          THEN 'Human Presence Sensor'
+        WHEN LOWER(TRIM(COALESCE(sensor_type, ''))) IN
+          ('motion', 'motion_sensor', 'pir', 'pir_motion')
+          THEN 'Motion Sensor'
+        ELSE 'Sensor'
+      END,
       location_name = 'Unassigned Location',
       room_name = NULL,
       setup_state = 'unassigned',
