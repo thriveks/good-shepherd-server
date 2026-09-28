@@ -30,6 +30,7 @@ const REQUIRED_TABLES = [
   "resident_checkins",
   "residents",
   "sensors",
+  "staff_app_sessions",
   "webhook_events"
 ];
 
@@ -983,6 +984,18 @@ const REQUIRED_COLUMNS = [
     "updated_at"
   ],
   [
+    "staff_app_sessions",
+    "created_at"
+  ],
+  [
+    "staff_app_sessions",
+    "expires_at"
+  ],
+  [
+    "staff_app_sessions",
+    "token_hash"
+  ],
+  [
     "webhook_events",
     "acknowledged"
   ],
@@ -1101,6 +1114,7 @@ const REQUIRED_INDEXES = [
   "sensors_node_id_idx",
   "sensors_resident_id_idx",
   "sensors_source_key_unique_idx",
+  "staff_app_sessions_expires_at_idx",
   "webhook_events_event_type_timestamp_idx",
   "webhook_events_source_key_event_type_timestamp_idx"
 ];

@@ -1,5 +1,10 @@
 "use strict";
 
+const staffAppSessionsV1Migration =
+  require(
+    "./migrations/2026-09-28-staff-app-sessions-v1"
+  );
+
 const humanPresenceLatestResidentIndexesV1Migration =
   require(
     "./migrations/2026-09-26-human-presence-latest-resident-indexes-v1"
@@ -419,6 +424,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       humanPresenceLatestResidentIndexesV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      staffAppSessionsV1Migration
     );
 
     /*

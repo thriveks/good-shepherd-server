@@ -15,6 +15,12 @@ const {
 } = require("./lib/sessionActivity");
 
 const {
+  createStaffAppSession,
+  authenticateStaffAppSession,
+  revokeStaffAppSession
+} = require("./lib/staffAppSessionService");
+
+const {
   createAIBriefingService
 } = require("./services/aiBriefingService");
 
@@ -291,6 +297,52 @@ async function initializeDatabase() {
 
   console.log(
     `Database schema baseline verified: ${schemaBaselineVersion}`
+  );
+
+  const requiredRuntimeMigrationVersions = [
+    "2026-09-28-staff-app-sessions-v1"
+  ];
+
+  const runtimeMigrationResult =
+    await pool.query(
+      `
+        SELECT version
+        FROM schema_migrations
+        WHERE version =
+          ANY($1::text[])
+      `,
+      [
+        requiredRuntimeMigrationVersions
+      ]
+    );
+
+  const appliedRuntimeMigrations =
+    new Set(
+      runtimeMigrationResult.rows.map(
+        (row) => row.version
+      )
+    );
+
+  const missingRuntimeMigrations =
+    requiredRuntimeMigrationVersions.filter(
+      (version) =>
+        !appliedRuntimeMigrations.has(
+          version
+        )
+    );
+
+  if (
+    missingRuntimeMigrations.length
+  ) {
+    throw new Error(
+      "Required runtime migrations are not applied: " +
+      missingRuntimeMigrations.join(", ")
+    );
+  }
+
+  console.log(
+    "Required runtime migrations verified: " +
+    requiredRuntimeMigrationVersions.join(", ")
   );
 
   // Runtime/data bootstrap remains separate from schema migration.
@@ -4590,6 +4642,7 @@ function monitoringResidentPayload(resident) {
 }
 
 const CUSTOMER_SESSION_DAYS = 180;
+const STAFF_APP_SESSION_HOURS = 12;
 const CUSTOMER_CODE_WINDOW_MS = 15 * 60 * 1000;
 const CUSTOMER_CODE_MAX_ATTEMPTS = 5;
 const STAFF_ACCESS_CODE = runtimeConfig.staffAccessCode;
@@ -4603,6 +4656,40 @@ function bearerToken(req) {
   const authorization = cleanText(req.header("authorization"));
   if (!authorization || !authorization.toLowerCase().startsWith("bearer ")) return null;
   return authorization.slice(7).trim() || null;
+}
+
+async function authenticatedStaffAppSession(req) {
+  const token = bearerToken(req);
+
+  if (!token) {
+    return null;
+  }
+
+  return authenticateStaffAppSession(
+    pool,
+    token
+  );
+}
+
+async function requireStaffAppSession(
+  req,
+  res
+) {
+  const session =
+    await authenticatedStaffAppSession(
+      req
+    );
+
+  if (!session) {
+    res.status(401).json({
+      success: false,
+      error: "Staff session required"
+    });
+
+    return null;
+  }
+
+  return session;
 }
 
 function normalizeAccessCode(value) {
@@ -4742,6 +4829,23 @@ function isAuthorizedServiceRequest(req) {
   return constantTimeTextEqual(incomingSecret, WEBHOOK_SECRET);
 }
 
+async function isAuthorizedStaffOrServiceRequest(
+  req
+) {
+  if (
+    isAuthorizedServiceRequest(req)
+  ) {
+    return true;
+  }
+
+  const session =
+    await authenticatedStaffAppSession(
+      req
+    );
+
+  return Boolean(session);
+}
+
 function isAuthorizedSignedWebhook(req) {
   if (!WEBHOOK_SECRET || !Buffer.isBuffer(req.rawWebhookBody)) {
     return false;
@@ -4785,8 +4889,8 @@ function isAuthorizedWebhook(req) {
   return isAuthorizedServiceRequest(req);
 }
 
-function requireAuthorizedRequest(req, res) {
-  if (!isAuthorizedServiceRequest(req)) {
+async function requireAuthorizedRequest(req, res) {
+  if (!(await isAuthorizedStaffOrServiceRequest(req))) {
     res.status(401).json({
       success: false,
       error: "Unauthorized request"
@@ -4796,6 +4900,26 @@ function requireAuthorizedRequest(req, res) {
   }
 
   return true;
+}
+
+async function requireFirmwareMetadataRequest(req, res) {
+  if (await isAuthorizedStaffOrServiceRequest(req)) {
+    return true;
+  }
+
+  const customerSession =
+    await authenticatedCustomerSession(req);
+
+  if (customerSession) {
+    return true;
+  }
+
+  res.status(401).json({
+    success: false,
+    error: "Authorized app session required"
+  });
+
+  return false;
 }
 
 function requestAppBuild(req) {
@@ -4847,8 +4971,8 @@ function requireMinimumIOSAppBuildForSetupWrites(req, res) {
   return true;
 }
 
-function requireAuthorizedCurrentAppWrite(req, res) {
-  if (!requireAuthorizedRequest(req, res)) {
+async function requireAuthorizedCurrentAppWrite(req, res) {
+  if (!(await requireAuthorizedRequest(req, res))) {
     return false;
   }
 
@@ -8037,9 +8161,25 @@ app.post("/customer/access", async (req, res) => {
 
     if (accessCode === STAFF_ACCESS_CODE) {
       clearCustomerCodeFailures(req);
+
+      const {
+        token,
+        expiresAt
+      } =
+        await createStaffAppSession(
+          pool,
+          {
+            sessionHours:
+              STAFF_APP_SESSION_HOURS
+          }
+        );
+
       return res.status(200).json({
         success: true,
-        mode: "staff"
+        mode: "staff",
+        token,
+        expiresAt:
+          expiresAt.toISOString()
       });
     }
 
@@ -8073,6 +8213,67 @@ app.post("/customer/access", async (req, res) => {
   } catch (error) {
     console.error("Customer access failed:", error);
     return res.status(500).json({ success: false, error: "Unable to connect this home right now." });
+  }
+});
+
+app.get("/staff/session", async (req, res) => {
+  try {
+    const session =
+      await requireStaffAppSession(
+        req,
+        res
+      );
+
+    if (!session) {
+      return;
+    }
+
+    return res.status(200).json({
+      success: true,
+      mode: "staff",
+      expiresAt:
+        new Date(
+          session.expiresAt
+        ).toISOString()
+    });
+  } catch (error) {
+    console.error(
+      "Staff session check failed:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error:
+        "Staff session check failed"
+    });
+  }
+});
+
+app.post("/staff/logout", async (req, res) => {
+  try {
+    const token =
+      bearerToken(req);
+
+    if (token) {
+      await revokeStaffAppSession(
+        pool,
+        token
+      );
+    }
+
+    return res.status(200).json({
+      success: true
+    });
+  } catch (error) {
+    console.warn(
+      "Staff logout cleanup failed:",
+      error?.message || error
+    );
+
+    return res.status(200).json({
+      success: true
+    });
   }
 });
 
@@ -8298,14 +8499,10 @@ app.patch("/customer/sensors/:nodeId/assignment", async (req, res) => {
   }
 });
 
-app.get("/ai/stream", (req, res) => {
+app.get("/ai/stream", async (req, res) => {
   try {
-    if (!isAuthorizedWebhook(req)) {
-      return res.status(401).json({
-        success: false,
-        error:
-          "Unauthorized staff AI stream request"
-      });
+    if (!(await requireAuthorizedRequest(req, res))) {
+      return;
     }
 
     res.status(200);
@@ -8734,7 +8931,7 @@ app.get("/", async (req, res) => {
 
 app.get("/events", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
     const includeAcknowledged = parseBooleanQuery(req.query.includeAcknowledged);
@@ -8767,7 +8964,7 @@ app.get("/events", async (req, res) => {
 
 app.get("/presence-telemetry/latest", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -10196,7 +10393,7 @@ app.post("/monitoring/api/residents/:residentId/follow-up", async (req, res) => 
 
 app.get("/ai/dashboard", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
     let cached = null;
@@ -10237,7 +10434,7 @@ app.get("/ai/dashboard", async (req, res) => {
 
 app.get("/ai/human-presence-learning", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
     const residentId = cleanOptionalText(req.query.residentId);
@@ -10344,7 +10541,7 @@ app.get("/ai/human-presence-learning", async (req, res) => {
 
 app.get("/ai/briefing", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -10363,7 +10560,7 @@ app.get("/ai/briefing", async (req, res) => {
 
 app.get("/ai/motion-summary", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -10381,7 +10578,7 @@ app.get("/ai/motion-summary", async (req, res) => {
 
 app.get("/ai/motion-events", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
     const requestedLimit = normalizeInteger(req.query.limit, 100);
@@ -10414,7 +10611,7 @@ app.get("/ai/motion-events", async (req, res) => {
 
 app.get("/ai/action-logs", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
     const requestedLimit = normalizeInteger(req.query.limit, 100);
@@ -10449,11 +10646,8 @@ app.get("/ai/action-logs", async (req, res) => {
 
 app.post("/ai/action-logs", async (req, res) => {
   try {
-    if (!isAuthorizedWebhook(req)) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized action log request"
-      });
+    if (!(await requireAuthorizedRequest(req, res))) {
+      return;
     }
 
     const residentId = cleanOptionalText(req.body?.residentId);
@@ -10523,11 +10717,8 @@ app.post("/ai/action-logs", async (req, res) => {
 
 app.patch("/events/:eventId/acknowledge", async (req, res) => {
   try {
-    if (!isAuthorizedWebhook(req)) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized event acknowledgment request"
-      });
+    if (!(await requireAuthorizedRequest(req, res))) {
+      return;
     }
 
     const eventId = cleanText(req.params.eventId);
@@ -10601,7 +10792,7 @@ app.patch("/events/:eventId/acknowledge", async (req, res) => {
 
 app.get("/nodes", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
     const includeArchived = parseBooleanQuery(req.query.includeArchived);
@@ -10704,7 +10895,7 @@ registerNodeHealthRoutes({
 
 app.post("/node-commands", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -10779,7 +10970,7 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
   let didBegin = false;
 
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -10909,7 +11100,7 @@ app.post("/node-commands/:commandId/result", async (req, res) => {
   const client = await pool.connect();
   let didBegin = false;
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -11045,7 +11236,7 @@ app.post("/node-commands/:commandId/result", async (req, res) => {
 
 app.get("/node-commands/:nodeId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -11085,11 +11276,8 @@ app.get("/node-commands/:nodeId", async (req, res) => {
 
 app.patch("/nodes/:nodeId", async (req, res) => {
   try {
-    if (!isAuthorizedWebhook(req)) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized node update request"
-      });
+    if (!(await requireAuthorizedRequest(req, res))) {
+      return;
     }
 
     const nodeId = cleanText(req.params.nodeId);
@@ -11164,11 +11352,8 @@ app.patch("/nodes/:nodeId", async (req, res) => {
 
 app.patch("/nodes/:nodeId/archive", async (req, res) => {
   try {
-    if (!isAuthorizedWebhook(req)) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized node archive request"
-      });
+    if (!(await requireAuthorizedRequest(req, res))) {
+      return;
     }
 
     const nodeId = cleanText(req.params.nodeId);
@@ -11236,11 +11421,8 @@ app.patch("/nodes/:nodeId/archive", async (req, res) => {
 
 app.patch("/nodes/:nodeId/restore", async (req, res) => {
   try {
-    if (!isAuthorizedWebhook(req)) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized node restore request"
-      });
+    if (!(await requireAuthorizedRequest(req, res))) {
+      return;
     }
 
     const nodeId = cleanText(req.params.nodeId);
@@ -11312,11 +11494,8 @@ app.delete("/nodes/:nodeId", async (req, res) => {
   let didBegin = false;
 
   try {
-    if (!isAuthorizedWebhook(req)) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized node delete request"
-      });
+    if (!(await requireAuthorizedRequest(req, res))) {
+      return;
     }
 
     const nodeId = cleanText(req.params.nodeId);
@@ -11475,7 +11654,7 @@ app.delete("/nodes/:nodeId", async (req, res) => {
 app.get("/residents", async (req, res) => {
   try {
     await ensureResidentAccessCodes();
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -11507,7 +11686,7 @@ app.get("/residents", async (req, res) => {
 
 app.post("/residents", async (req, res) => {
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -11608,7 +11787,7 @@ app.patch("/residents/:residentId", async (req, res) => {
   let didBegin = false;
 
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -11810,7 +11989,7 @@ app.patch("/residents/:residentId", async (req, res) => {
 
 app.delete("/residents/:residentId", async (req, res) => {
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -12006,7 +12185,7 @@ app.delete("/residents/:residentId", async (req, res) => {
 
 app.get("/cameras", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -12045,7 +12224,7 @@ app.get("/cameras", async (req, res) => {
 
 app.post("/cameras", async (req, res) => {
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -12159,7 +12338,7 @@ app.post("/cameras", async (req, res) => {
 
 app.patch("/cameras/:cameraId", async (req, res) => {
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -12276,7 +12455,7 @@ app.patch("/cameras/:cameraId", async (req, res) => {
 
 app.delete("/cameras/:cameraId", async (req, res) => {
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -12328,7 +12507,7 @@ app.delete("/cameras/:cameraId", async (req, res) => {
 
 app.get("/sensor-inventory", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -12464,7 +12643,7 @@ app.get("/sensor-inventory", async (req, res) => {
 
 app.patch("/sensors/:nodeId/assignment", async (req, res) => {
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -12506,7 +12685,7 @@ app.patch("/sensors/:nodeId/assignment", async (req, res) => {
 
 app.post("/sensor-bulk-actions", async (req, res) => {
   try {
-    if (!requireAuthorizedCurrentAppWrite(req, res)) {
+    if (!(await requireAuthorizedCurrentAppWrite(req, res))) {
       return;
     }
 
@@ -12678,7 +12857,7 @@ app.post("/sensor-bulk-actions", async (req, res) => {
 
 app.get("/sensors", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -12727,7 +12906,7 @@ app.get("/sensors", async (req, res) => {
 
 app.get("/resident-candidates", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -12766,7 +12945,7 @@ app.get("/resident-candidates", async (req, res) => {
 
 app.get("/sensor-config/:nodeId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -12846,7 +13025,7 @@ app.get("/sensor-config/:nodeId", async (req, res) => {
 
 app.get("/sensor-commands/:nodeId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -12893,7 +13072,7 @@ app.post("/sensor-commands", async (req, res) => {
   let didBegin = false;
 
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13095,7 +13274,7 @@ app.post("/sensor-commands/:nodeId/cleanup", async (req, res) => {
   let didBegin = false;
 
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13233,7 +13412,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
   let didBegin = false;
 
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13353,7 +13532,7 @@ const sensorCommandResultService = createSensorCommandResultService({
 
 app.post("/sensor-commands/:commandId/result", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13485,7 +13664,7 @@ app.get("/firmware/human-presence/download/:releaseTag/:assetName", async (req, 
 
 app.get("/firmware/human-presence/releases", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13517,7 +13696,7 @@ app.get("/firmware/human-presence/releases", async (req, res) => {
 
 app.post("/firmware/human-presence/releases", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13602,7 +13781,7 @@ app.post("/firmware/human-presence/releases", async (req, res) => {
 
 app.get("/firmware/human-presence/latest", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13630,7 +13809,7 @@ app.get("/firmware/human-presence/latest", async (req, res) => {
 
 app.get("/firmware/releases", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13662,7 +13841,7 @@ app.get("/firmware/releases", async (req, res) => {
 
 app.post("/firmware/releases", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13747,7 +13926,7 @@ app.post("/firmware/releases", async (req, res) => {
 
 app.get("/firmware/latest", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireFirmwareMetadataRequest(req, res))) {
       return;
     }
 
@@ -13806,7 +13985,7 @@ app.get("/firmware/latest", async (req, res) => {
 
 app.post("/firmware/update-node", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13910,7 +14089,7 @@ app.post("/firmware/update-node", async (req, res) => {
 
 app.get("/device-mappings", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
     const result = await pool.query(

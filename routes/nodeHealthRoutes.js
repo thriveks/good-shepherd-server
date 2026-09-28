@@ -21,7 +21,7 @@ function registerNodeHealthRoutes({
 
 app.get("/node-health", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -49,7 +49,7 @@ app.get("/node-health", async (req, res) => {
 
 app.get("/node-health/:nodeId", async (req, res) => {
   try {
-    if (!requireAuthorizedRequest(req, res)) {
+    if (!(await requireAuthorizedRequest(req, res))) {
       return;
     }
 
