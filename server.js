@@ -57,26 +57,42 @@ const {
 
 const express = require("express");
 const { Pool } = require("pg");
-const { randomUUID, randomBytes, randomInt, createHash, pbkdf2Sync, timingSafeEqual, createHmac, createCipheriv, createDecipheriv, createSign } = require("crypto");
+const { randomUUID, randomBytes, randomInt, createHash, pbkdf2, timingSafeEqual, createHmac, createCipheriv, createDecipheriv, createSign } = require("crypto");
+const { promisify } = require("util");
 const path = require("path");
 const https = require("https");
-const http = require("http");
 const http2 = require("http2");
 const QRCode = require("./lib/qrcode");
 const QRErrorCorrectLevel = require("./lib/qrcode/QRErrorCorrectLevel");
 
+const pbkdf2Async = promisify(pbkdf2);
+
 const app = express();
+app.disable("x-powered-by");
+
+const TRUST_PROXY_HOPS = (() => {
+  const configured = Number(process.env.TRUST_PROXY_HOPS);
+  return Number.isInteger(configured) && configured >= 0 ? configured : 1;
+})();
+
+app.set("trust proxy", TRUST_PROXY_HOPS);
+
 const runtimeConfig = loadRuntimeConfig();
 const PORT = runtimeConfig.port;
 const WEBHOOK_SECRET = runtimeConfig.webhookSecret;
 let mqttV2Bridge = null;
+let activeHttpServer = null;
+let humanPresenceAdaptiveCaptureHandle = null;
+let serverReadiness = "starting";
+let serverShutdownPromise = null;
+let serverIsShuttingDown = false;
 const MAX_EVENTS = 50;
 const MIN_IOS_APP_BUILD = 1;
 const NODE_OFFLINE_AFTER_SECONDS = (() => {
   const configuredValue = Number(process.env.NODE_OFFLINE_AFTER_SECONDS);
   return Number.isFinite(configuredValue) && configuredValue > 0
     ? Math.trunc(configuredValue)
-    : 86400;
+    : 900;
 })();
 const AI_SENSOR_MOTION_ONLINE_GRACE_SECONDS = 600;
 const AI_SENSOR_EVENT_ONLINE_GRACE_SECONDS = 3600;
@@ -88,7 +104,15 @@ const AI_MOTION_HISTORY_EVENT_LIMIT = 5000;
 const AI_BASELINE_MIN_DAYS = 3;
 const AI_BASELINE_QUIET_RATIO = 0.5;
 const AI_BASELINE_ACTIVE_RATIO = 1.75;
-const AI_TIME_ZONE = process.env.AI_TIME_ZONE || "America/Chicago";
+const AI_TIME_ZONE = (() => {
+  const candidate = cleanText(process.env.AI_TIME_ZONE) || "America/Chicago";
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch (_) {
+    throw new Error(`Invalid AI_TIME_ZONE: ${candidate}`);
+  }
+})();
 const AI_PRESENCE_ACTIVE_WATCH_MINUTES = 120;
 const AI_PRESENCE_ACTIVE_WARNING_MINUTES = 240;
 const AI_PRESENCE_ACTIVE_CRITICAL_MINUTES = 480;
@@ -110,7 +134,30 @@ const HUMAN_PRESENCE_FIRMWARE_DOWNLOAD_ASSET_NAME = process.env.HUMAN_PRESENCE_F
 const MAX_FIRMWARE_DOWNLOAD_REDIRECTS = 8;
 const FIRMWARE_DOWNLOAD_TIMEOUT_MS = 120000;
 
-app.use(express.json({ limit: "25mb" }));
+const HTTP_JSON_BODY_LIMIT = cleanText(process.env.HTTP_JSON_BODY_LIMIT) || "2mb";
+
+app.use((req, res, next) => {
+  const suppliedRequestId = cleanText(req.header("x-request-id"));
+  req.requestId = suppliedRequestId && suppliedRequestId.length <= 128
+    ? suppliedRequestId
+    : randomUUID();
+
+  res.setHeader("X-Request-Id", req.requestId);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
+
+app.use(express.json({
+  limit: HTTP_JSON_BODY_LIMIT,
+  verify: (req, _res, buffer) => {
+    if (req.originalUrl === "/webhook" || req.originalUrl.startsWith("/webhook?")) {
+      req.rawWebhookBody = Buffer.from(buffer);
+    }
+  }
+}));
 
 // Monitoring Center frontend is served by this same trusted application origin.
 // No server secrets are ever placed in browser JavaScript.
@@ -120,30 +167,47 @@ app.use("/monitoring", express.static(path.join(__dirname, "public", "monitoring
   maxAge: process.env.NODE_ENV === "production" ? "5m" : 0
 }));
 
-app.use((req, res, next) => {
-    const origin = req.headers.origin;
+const DEFAULT_ALLOWED_BROWSER_ORIGINS = [
+  "https://thriveks.com",
+  "https://www.thriveks.com",
+  "https://thriveks.neocities.org"
+];
 
-    const allowedOrigins = [
-        "https://thriveks.com",
-        "https://www.thriveks.com",
-        "https://thriveks.neocities.org"
-    ];
-
-    if (allowedOrigins.includes(origin)) {
-        res.header("Access-Control-Allow-Origin", origin);
-        res.header(
-  "Access-Control-Allow-Headers",
-  "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-webhook-secret, x-app-build, x-app-version, x-app-client"
+const ALLOWED_BROWSER_ORIGINS = new Set(
+  (cleanText(process.env.ALLOWED_BROWSER_ORIGINS)
+    ? process.env.ALLOWED_BROWSER_ORIGINS.split(",")
+    : DEFAULT_ALLOWED_BROWSER_ORIGINS)
+    .map((value) => cleanText(value))
+    .filter(Boolean)
 );
-        res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
-    }
 
-    if (req.method === "OPTIONS") {
-        return res.sendStatus(204);
-    }
+app.use((req, res, next) => {
+  const origin = cleanText(req.headers.origin);
 
-    next();
+  if (origin) {
+    res.vary("Origin");
+  }
+
+  if (origin && ALLOWED_BROWSER_ORIGINS.has(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header(
+      "Access-Control-Allow-Headers",
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-webhook-secret, x-app-build, x-app-version, x-app-client, x-request-id"
+    );
+    res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
 });
+
+const DATABASE_POOL_MAX = (() => {
+  const configured = Number(process.env.DATABASE_POOL_MAX);
+  return Number.isInteger(configured) && configured > 0 ? configured : 20;
+})();
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -151,8 +215,58 @@ const pool = new Pool({
     ? {
         rejectUnauthorized: false
       }
-    : false
+    : false,
+  max: DATABASE_POOL_MAX,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+  keepAlive: true,
+  application_name: "good-shepherd-server"
 });
+
+pool.on("error", (error) => {
+  console.error("Unexpected PostgreSQL pool error:", error);
+});
+
+async function withTransaction(work) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Transaction rollback failed:", rollbackError);
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function httpError(statusCode, message, code = null) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.expose = true;
+  if (code) error.code = code;
+  return error;
+}
+
+function publicErrorMessage(error, fallback = "Request failed") {
+  const statusCode = Number(error?.statusCode);
+  const mayExpose = error?.expose === true ||
+    (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 500);
+
+  if (mayExpose) {
+    const message = cleanText(error?.publicMessage || error?.message);
+    if (message) return message;
+  }
+
+  return fallback;
+}
 
 async function initializeDatabase() {
   const schemaBaselineVersion =
@@ -184,23 +298,28 @@ async function initializeDatabase() {
 
   await ensureResidentAccessCodes();
 
-  await pool.query(`
-    INSERT INTO device_mappings (
-      source_key,
-      source_name,
-      resident_name,
-      default_alert_level,
-      default_time_text
-    )
-    VALUES (
-      'thrive-office-wyze',
-      'Office Wyze Camera',
-      'Mary Thompson',
-      'Caution',
-      'Office Motion Event'
-    )
-    ON CONFLICT (source_key) DO NOTHING
-  `);
+  const seedDemoDeviceMapping =
+    cleanText(process.env.SEED_DEMO_DEVICE_MAPPING).toLowerCase() === "true";
+
+  if (seedDemoDeviceMapping) {
+    await pool.query(`
+      INSERT INTO device_mappings (
+        source_key,
+        source_name,
+        resident_name,
+        default_alert_level,
+        default_time_text
+      )
+      VALUES (
+        'thrive-office-wyze',
+        'Office Wyze Camera',
+        'Mary Thompson',
+        'Caution',
+        'Office Motion Event'
+      )
+      ON CONFLICT (source_key) DO NOTHING
+    `);
+  }
 }
 
 let residentActivityBackfillPromise = null;
@@ -846,6 +965,7 @@ class SensorAssignmentConflictError extends Error {
     super(message);
     this.name = "SensorAssignmentConflictError";
     this.statusCode = 409;
+    this.expose = true;
     this.code = "SENSOR_ASSIGNMENT_CONFLICT";
   }
 }
@@ -3700,7 +3820,7 @@ function broadcastCustomerAIInvalidation(
 }
 
 function scheduleCustomerAIInvalidationListenerReconnect() {
-  if (customerAIInvalidationReconnectTimer) {
+  if (serverIsShuttingDown || customerAIInvalidationReconnectTimer) {
     return;
   }
 
@@ -3790,12 +3910,53 @@ async function startCustomerAIInvalidationListener() {
       client.release(true);
     } catch (_) {}
 
-    scheduleCustomerAIInvalidationListenerReconnect();
+    if (!serverIsShuttingDown) {
+      scheduleCustomerAIInvalidationListenerReconnect();
+    }
   });
 
   console.log(
     "Customer AI cross-instance invalidation listener active."
   );
+}
+
+async function stopCustomerAIInvalidationListener() {
+  if (customerAIInvalidationReconnectTimer) {
+    clearTimeout(customerAIInvalidationReconnectTimer);
+    customerAIInvalidationReconnectTimer = null;
+  }
+
+  const client = customerAIInvalidationListener;
+  customerAIInvalidationListener = null;
+
+  if (!client) return;
+
+  try {
+    await client.query(`UNLISTEN ${CUSTOMER_AI_INVALIDATION_CHANNEL}`);
+  } catch (error) {
+    console.warn(
+      "Customer AI invalidation listener UNLISTEN failed during shutdown:",
+      error?.message || String(error)
+    );
+  }
+
+  try {
+    client.release();
+  } catch (_) {}
+}
+
+function closeAIStreamClients() {
+  for (const res of Array.from(staffAIStreamClients)) {
+    try { res.end(); } catch (_) {}
+  }
+  staffAIStreamClients.clear();
+
+  for (const clients of customerAIStreamClients.values()) {
+    for (const res of Array.from(clients)) {
+      try { res.end(); } catch (_) {}
+    }
+  }
+  customerAIStreamClients.clear();
 }
 
 async function incrementResidentDailyActivity({ resident, event, sensor }) {
@@ -3993,19 +4154,27 @@ function decryptMonitoringSecret(value) {
   return Buffer.concat([decipher.update(Buffer.from(encryptedText, "base64url")), decipher.final()]).toString("utf8");
 }
 
-function passwordHash(password, saltText = null) {
+async function passwordHash(password, saltText = null) {
   const salt = saltText ? Buffer.from(saltText, "base64url") : randomBytes(16);
-  const derived = pbkdf2Sync(String(password), salt, 210000, 32, "sha256");
+  const derived = await pbkdf2Async(String(password), salt, 210000, 32, "sha256");
   return `pbkdf2_sha256$210000$${salt.toString("base64url")}$${derived.toString("base64url")}`;
 }
 
-function passwordMatches(password, stored) {
+async function passwordMatches(password, stored) {
   try {
     const [algorithm, iterationsText, saltText, hashText] = String(stored || "").split("$");
     if (algorithm !== "pbkdf2_sha256") return false;
     const iterations = Number(iterationsText);
+    if (!Number.isInteger(iterations) || iterations < 100000 || iterations > 2000000) return false;
     const expected = Buffer.from(hashText, "base64url");
-    const actual = pbkdf2Sync(String(password), Buffer.from(saltText, "base64url"), iterations, expected.length, "sha256");
+    if (!expected.length) return false;
+    const actual = await pbkdf2Async(
+      String(password),
+      Buffer.from(saltText, "base64url"),
+      iterations,
+      expected.length,
+      "sha256"
+    );
     return expected.length === actual.length && timingSafeEqual(expected, actual);
   } catch (_) {
     return false;
@@ -4051,12 +4220,52 @@ function monitoringActivationTokenHash(token) {
   return createHash("sha256").update(String(token || "")).digest("hex");
 }
 
-function monitoringActivationUrl(req, token) {
-  const forwardedProto = cleanText(req.header("x-forwarded-proto")).split(",")[0].trim();
+function configuredPublicBaseUrl() {
+  const configured = cleanText(
+    process.env.MONITORING_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL
+  );
+
+  if (!configured) return null;
+
+  try {
+    const parsed = new URL(configured);
+    if (!["https:", "http:"].includes(parsed.protocol)) return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
+function trustedRequestOrigin(req) {
+  const forwardedProto = cleanText(req.header("x-forwarded-proto"))
+    .split(",")[0]
+    .trim();
   const protocol = forwardedProto || req.protocol || "https";
   const host = cleanText(req.header("host"));
-  if (!host) return `/monitoring/?activate=${encodeURIComponent(token)}`;
-  return `${protocol}://${host}/monitoring/?activate=${encodeURIComponent(token)}`;
+
+  if (!host || !["https", "http"].includes(protocol)) return null;
+
+  const hostname = host.split(":")[0].toLowerCase();
+  const trustedHostnames = new Set(
+    Array.from(ALLOWED_BROWSER_ORIGINS)
+      .map((origin) => {
+        try { return new URL(origin).hostname.toLowerCase(); } catch (_) { return null; }
+      })
+      .filter(Boolean)
+  );
+
+  const renderHostname = cleanText(process.env.RENDER_EXTERNAL_HOSTNAME).toLowerCase();
+  if (renderHostname) trustedHostnames.add(renderHostname);
+
+  return trustedHostnames.has(hostname) ? `${protocol}://${host}` : null;
+}
+
+function monitoringActivationUrl(req, token) {
+  const baseUrl = configuredPublicBaseUrl() || trustedRequestOrigin(req);
+  const path = `/monitoring/?activate=${encodeURIComponent(token)}`;
+
+  return baseUrl ? `${baseUrl}${path}` : path;
 }
 
 function monitoringQrSvg(text) {
@@ -4100,7 +4309,7 @@ async function issueMonitoringActivation(operatorId, req) {
         activation_token_hash=$4, activation_expires_at=$5, activation_created_at=NOW(), activation_used_at=NULL,
         is_active=TRUE, updated_at=NOW()
     WHERE id=$1
-  `, [operatorId, passwordHash(placeholderPassword), encryptMonitoringSecret(totpSecret), tokenHash, expiresAt]);
+  `, [operatorId, await passwordHash(placeholderPassword), encryptMonitoringSecret(totpSecret), tokenHash, expiresAt]);
   await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [operatorId]);
   return { token, activationUrl: monitoringActivationUrl(req, token), expiresAt };
 }
@@ -4158,7 +4367,7 @@ async function ensureMonitoringBootstrapOperator() {
     await pool.query(`
       INSERT INTO monitoring_operators (id, username, display_name, role, password_hash, totp_secret_encrypted, is_active, is_bootstrap, is_enrolled)
       VALUES ($1, $2, $3, 'admin', $4, $5, TRUE, TRUE, TRUE)
-    `, [id, username, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
+    `, [id, username, displayName, await passwordHash(password), encryptMonitoringSecret(totpSecret)]);
     console.log(`Monitoring Center bootstrap admin created: ${username}`);
     return;
   }
@@ -4168,7 +4377,7 @@ async function ensureMonitoringBootstrapOperator() {
   try { storedTotp = decryptMonitoringSecret(operator.totpSecretEncrypted); }
   catch (_) { storedTotp = null; }
 
-  const credentialsChanged = !passwordMatches(password, operator.passwordHash) || storedTotp !== totpSecret;
+  const credentialsChanged = !(await passwordMatches(password, operator.passwordHash)) || storedTotp !== totpSecret;
   const profileChanged = operator.displayName !== displayName || operator.role !== "admin" || operator.isActive !== true || operator.isBootstrap !== true;
 
   if (!credentialsChanged && !profileChanged) return;
@@ -4186,7 +4395,7 @@ async function ensureMonitoringBootstrapOperator() {
         activation_expires_at=NULL,
         updated_at=NOW()
     WHERE id=$1
-  `, [operator.id, displayName, passwordHash(password), encryptMonitoringSecret(totpSecret)]);
+  `, [operator.id, displayName, await passwordHash(password), encryptMonitoringSecret(totpSecret)]);
 
   if (credentialsChanged) {
     await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [operator.id]);
@@ -4241,8 +4450,16 @@ function recordMonitoringFailure(req) {
 
 function clearMonitoringFailures(req) { monitoringLoginAttempts.delete(monitoringAttemptKey(req)); }
 
-async function writeMonitoringAudit(operator, req, action, targetType = null, targetId = null, details = {}) {
-  await pool.query(`
+async function writeMonitoringAudit(
+  operator,
+  req,
+  action,
+  targetType = null,
+  targetId = null,
+  details = {},
+  queryable = pool
+) {
+  await queryable.query(`
     INSERT INTO monitoring_audit_log (id, operator_id, operator_name, action, target_type, target_id, details, ip_address)
     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)
   `, [randomUUID(), operator?.id || null, operator?.displayName || operator?.username || null, action, targetType, targetId, JSON.stringify(details || {}), monitoringAttemptKey(req)]);
@@ -4505,17 +4722,71 @@ function clearCustomerCodeFailures(req) {
   customerCodeAttempts.delete(customerAttemptKey(req));
 }
 
-function isAuthorizedWebhook(req) {
+function constantTimeTextEqual(firstValue, secondValue) {
+  const first = Buffer.from(String(firstValue || ""), "utf8");
+  const second = Buffer.from(String(secondValue || ""), "utf8");
+
+  if (first.length !== second.length) {
+    return false;
+  }
+
+  return first.length > 0 && timingSafeEqual(first, second);
+}
+
+function isAuthorizedServiceRequest(req) {
   if (!WEBHOOK_SECRET) {
     return runtimeConfig.isProduction === false;
   }
 
-  const incomingSecret = req.header("x-webhook-secret");
-  return incomingSecret && incomingSecret === WEBHOOK_SECRET;
+  const incomingSecret = cleanText(req.header("x-webhook-secret"));
+  return constantTimeTextEqual(incomingSecret, WEBHOOK_SECRET);
+}
+
+function isAuthorizedSignedWebhook(req) {
+  if (!WEBHOOK_SECRET || !Buffer.isBuffer(req.rawWebhookBody)) {
+    return false;
+  }
+
+  const timestampText = cleanText(req.header("x-webhook-timestamp"));
+  const signatureText = cleanText(req.header("x-webhook-signature"))
+    .replace(/^sha256=/i, "");
+  const timestampSeconds = Number(timestampText);
+
+  if (!Number.isFinite(timestampSeconds) || !/^[a-f0-9]{64}$/i.test(signatureText)) {
+    return false;
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSeconds - timestampSeconds) > 300) {
+    return false;
+  }
+
+  const expectedSignature = createHmac("sha256", WEBHOOK_SECRET)
+    .update(timestampText)
+    .update(".")
+    .update(req.rawWebhookBody)
+    .digest("hex");
+
+  return constantTimeTextEqual(signatureText.toLowerCase(), expectedSignature);
+}
+
+function isAuthorizedWebhook(req) {
+  const hasSignedWebhookHeaders =
+    Boolean(cleanText(req.header("x-webhook-timestamp"))) ||
+    Boolean(cleanText(req.header("x-webhook-signature")));
+
+  if (hasSignedWebhookHeaders) {
+    return isAuthorizedSignedWebhook(req);
+  }
+
+  // Backward-compatible path for deployed devices while signed webhook
+  // authentication is rolled out. General staff/service APIs use the
+  // service-request check directly instead of pretending to be webhooks.
+  return isAuthorizedServiceRequest(req);
 }
 
 function requireAuthorizedRequest(req, res) {
-  if (!isAuthorizedWebhook(req)) {
+  if (!isAuthorizedServiceRequest(req)) {
     res.status(401).json({
       success: false,
       error: "Unauthorized request"
@@ -4667,16 +4938,28 @@ function copyFirmwareDownloadHeaders(upstreamResponse, res) {
   }
 }
 
+function isAllowedFirmwareProxyUrl(parsedUrl) {
+  if (!parsedUrl || parsedUrl.protocol !== "https:") {
+    return false;
+  }
+
+  if (parsedUrl.username || parsedUrl.password) {
+    return false;
+  }
+
+  if (parsedUrl.port && parsedUrl.port !== "443") {
+    return false;
+  }
+
+  const hostname = cleanText(parsedUrl.hostname).toLowerCase();
+
+  return hostname === "github.com" ||
+    hostname.endsWith(".githubusercontent.com") ||
+    /^github-production-release-asset-[^.]+\.s3\.amazonaws\.com$/.test(hostname);
+}
+
 function firmwareDownloadClientForUrl(parsedUrl) {
-  if (parsedUrl.protocol === "https:") {
-    return https;
-  }
-
-  if (parsedUrl.protocol === "http:") {
-    return http;
-  }
-
-  return null;
+  return isAllowedFirmwareProxyUrl(parsedUrl) ? https : null;
 }
 
 function proxyFirmwareDownload(upstreamUrl, res, redirectsRemaining = MAX_FIRMWARE_DOWNLOAD_REDIRECTS) {
@@ -4700,7 +4983,7 @@ function proxyFirmwareDownload(upstreamUrl, res, redirectsRemaining = MAX_FIRMWA
     if (!res.headersSent) {
       res.status(502).json({
         success: false,
-        error: "Unsupported upstream firmware URL protocol"
+        error: "Firmware upstream host is not allowed"
       });
     }
     return;
@@ -4731,7 +5014,19 @@ function proxyFirmwareDownload(upstreamUrl, res, redirectsRemaining = MAX_FIRMWA
           return;
         }
 
-        const nextUrl = new URL(redirectLocation, parsedUrl).toString();
+        let nextUrl;
+        try {
+          nextUrl = new URL(redirectLocation, parsedUrl).toString();
+        } catch (error) {
+          if (!res.headersSent) {
+            res.status(502).json({
+              success: false,
+              error: "Firmware upstream returned an invalid redirect"
+            });
+          }
+          return;
+        }
+
         proxyFirmwareDownload(nextUrl, res, redirectsRemaining - 1);
         return;
       }
@@ -4780,7 +5075,7 @@ function proxyFirmwareDownload(upstreamUrl, res, redirectsRemaining = MAX_FIRMWA
     if (!res.headersSent) {
       res.status(502).json({
         success: false,
-        error: error.message || "Firmware proxy download failed"
+        error: "Firmware proxy download failed"
       });
     } else {
       res.destroy(error);
@@ -4843,7 +5138,7 @@ function proxyHumanPresenceFirmwareDownload(upstreamUrl, res, redirectsRemaining
     if (!res.headersSent) {
       res.status(502).json({
         success: false,
-        error: "Unsupported upstream human-presence firmware URL protocol"
+        error: "Human-presence firmware upstream host is not allowed"
       });
     }
     return;
@@ -4874,7 +5169,19 @@ function proxyHumanPresenceFirmwareDownload(upstreamUrl, res, redirectsRemaining
           return;
         }
 
-        const nextUrl = new URL(redirectLocation, parsedUrl).toString();
+        let nextUrl;
+        try {
+          nextUrl = new URL(redirectLocation, parsedUrl).toString();
+        } catch (error) {
+          if (!res.headersSent) {
+            res.status(502).json({
+              success: false,
+              error: "Human-presence firmware upstream returned an invalid redirect"
+            });
+          }
+          return;
+        }
+
         proxyHumanPresenceFirmwareDownload(nextUrl, res, redirectsRemaining - 1);
         return;
       }
@@ -4923,7 +5230,7 @@ function proxyHumanPresenceFirmwareDownload(upstreamUrl, res, redirectsRemaining
     if (!res.headersSent) {
       res.status(502).json({
         success: false,
-        error: error.message || "Human-presence firmware proxy download failed"
+        error: "Human-presence firmware proxy download failed"
       });
     } else {
       res.destroy(error);
@@ -6064,12 +6371,36 @@ async function findOrCreateResidentFromEvent({ residentName, locationName, alert
     WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
       AND is_deleted = FALSE
     ORDER BY created_at ASC
-    LIMIT 1
+    LIMIT 25
     `,
     [name]
   );
 
-  if (existing.rows[0]) {
+  const normalizedLocation = normalizeForMatch(location);
+  const locationIsMeaningful = Boolean(
+    normalizedLocation &&
+    normalizedLocation !== "unassigned location" &&
+    normalizedLocation !== "unassigned"
+  );
+  const exactLocationMatches = locationIsMeaningful
+    ? existing.rows.filter(
+        (resident) => normalizeForMatch(resident.location) === normalizedLocation
+      )
+    : [];
+  const exactLocationMatch = exactLocationMatches.length === 1
+    ? exactLocationMatches[0]
+    : null;
+  const existingResident = exactLocationMatch ||
+    (existing.rows.length === 1 ? existing.rows[0] : null);
+
+  if (existing.rows.length > 1 && !exactLocationMatch) {
+    logStructuredDiagnostic("AMBIGUOUS_RESIDENT_NAME_MATCH", "warning", {
+      reason: "multiple_active_residents_share_name_without_location_match",
+      rowCount: existing.rows.length
+    });
+  }
+
+  if (existingResident) {
     const result = await pool.query(
       `
       UPDATE residents
@@ -6101,7 +6432,7 @@ async function findOrCreateResidentFromEvent({ residentName, locationName, alert
         updated_at AS "updatedAt"
       `,
       [
-        existing.rows[0].id,
+        existingResident.id,
         location,
         normalizedAlertLevel,
         activeWarnings,
@@ -7435,9 +7766,21 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
     }
 
     let node = null;
-    const registrationDeadline = Date.now() + 90000;
+    const registrationStartedAt = Date.now();
+    const registrationDeadline = registrationStartedAt + 90000;
+    let pairingRequestAborted = false;
 
-    while (Date.now() < registrationDeadline) {
+    req.once("aborted", () => {
+      pairingRequestAborted = true;
+    });
+
+    res.once("close", () => {
+      if (!res.writableEnded) {
+        pairingRequestAborted = true;
+      }
+    });
+
+    while (Date.now() < registrationDeadline && !pairingRequestAborted) {
       const nodeResult = await pool.query(
         `
         SELECT
@@ -7477,7 +7820,18 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
       // completing first-home commissioning. Never accept a mismatch;
       // keep polling until the exact BLE setup ID appears or timeout.
 
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      const elapsedMs = Date.now() - registrationStartedAt;
+      const pollDelayMs = elapsedMs < 5000
+        ? 500
+        : elapsedMs < 20000
+          ? 1000
+          : 2000;
+
+      await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
+    }
+
+    if (pairingRequestAborted) {
+      return;
     }
 
     if (!node || node.isArchived) {
@@ -7659,7 +8013,7 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
 
     return res.status(error.statusCode || 500).json({
       success: false,
-      error: error.message || "Unable to activate this home",
+      error: publicErrorMessage(error, "Unable to activate this home"),
       ...(error.code ? { code: error.code } : {})
     });
   }
@@ -7764,8 +8118,30 @@ app.get("/customer/bootstrap", async (req, res) => {
       [residentId]
     );
     const eventsResult = await pool.query(
-      `${eventSelectSQL()} WHERE LOWER(TRIM(resident_name)) = LOWER(TRIM($1)) ORDER BY timestamp DESC LIMIT 50`,
-      [resident.name]
+      `
+      ${eventSelectSQL()}
+      WHERE EXISTS (
+        SELECT 1
+        FROM sensors s
+        WHERE s.resident_id = $1
+          AND s.is_deleted = FALSE
+          AND (
+            (s.node_id IS NOT NULL AND s.node_id = webhook_events.node_id)
+            OR (s.source_key IS NOT NULL AND s.source_key = webhook_events.source_key)
+          )
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM cameras c
+        WHERE c.resident_id = $1
+          AND c.is_deleted = FALSE
+          AND c.source_key IS NOT NULL
+          AND c.source_key = webhook_events.source_key
+      )
+      ORDER BY timestamp DESC
+      LIMIT 50
+      `,
+      [residentId]
     );
 
     const { accessCode: _privateAccessCode, ...customerResident } = resident;
@@ -7916,7 +8292,7 @@ app.patch("/customer/sensors/:nodeId/assignment", async (req, res) => {
     console.error("Customer sensor assignment failed:", error);
     return res.status(error.statusCode || 500).json({
       success: false,
-      error: error.message,
+      error: publicErrorMessage(error, "Unable to update sensor assignment"),
       ...(error.code ? { code: error.code } : {})
     });
   }
@@ -8229,17 +8605,60 @@ app.get("/customer/ai/motion-events", async (req, res) => {
 });
 
 
+app.get("/livez", (req, res) => {
+  return res.status(200).json({
+    success: true,
+    status: "alive",
+    requestId: req.requestId
+  });
+});
+
+app.get("/readyz", async (req, res) => {
+  const startedAt = Date.now();
+
+  if (serverReadiness !== "ready" || serverIsShuttingDown) {
+    return res.status(503).json({
+      success: false,
+      status: "not_ready",
+      readiness: serverReadiness,
+      requestId: req.requestId
+    });
+  }
+
+  try {
+    await pool.query("SELECT 1");
+    return res.status(200).json({
+      success: true,
+      status: "ready",
+      database: "reachable",
+      responseTimeMs: Date.now() - startedAt,
+      requestId: req.requestId
+    });
+  } catch (error) {
+    console.error("Readiness check failed:", error?.message || String(error));
+    return res.status(503).json({
+      success: false,
+      status: "not_ready",
+      database: "unreachable",
+      requestId: req.requestId
+    });
+  }
+});
+
 app.get("/health", async (req, res) => {
   const startedAt = Date.now();
 
   try {
     await pool.query("SELECT 1");
 
-    return res.status(200).json({
-      success: true,
-      status: "healthy",
+    const ready = serverReadiness === "ready" && !serverIsShuttingDown;
+    return res.status(ready ? 200 : 503).json({
+      success: ready,
+      status: ready ? "healthy" : "starting",
+      readiness: serverReadiness,
       database: "reachable",
-      responseTimeMs: Date.now() - startedAt
+      responseTimeMs: Date.now() - startedAt,
+      requestId: req.requestId
     });
   } catch (error) {
     console.error(
@@ -8250,7 +8669,9 @@ app.get("/health", async (req, res) => {
     return res.status(503).json({
       success: false,
       status: "unhealthy",
-      database: "unreachable"
+      readiness: serverReadiness,
+      database: "unreachable",
+      requestId: req.requestId
     });
   }
 });
@@ -8313,6 +8734,9 @@ app.get("/", async (req, res) => {
 
 app.get("/events", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const includeAcknowledged = parseBooleanQuery(req.query.includeAcknowledged);
 
     const result = await pool.query(
@@ -8493,7 +8917,7 @@ app.post("/monitoring/api/login", async (req, res) => {
     const code = String(req.body?.code || "");
     const result = await pool.query(`SELECT id, username, display_name AS "displayName", role, password_hash AS "passwordHash", totp_secret_encrypted AS "totpSecretEncrypted", COALESCE(is_bootstrap,FALSE) AS "isBootstrap", COALESCE(must_change_password,FALSE) AS "mustChangePassword", COALESCE(is_enrolled,TRUE) AS "isEnrolled" FROM monitoring_operators WHERE LOWER(username)=LOWER($1) AND is_active=TRUE LIMIT 1`, [username]);
     const operator = result.rows[0];
-    let valid = Boolean(operator) && operator.isEnrolled !== false && passwordMatches(password, operator.passwordHash);
+    let valid = Boolean(operator) && operator.isEnrolled !== false && await passwordMatches(password, operator.passwordHash);
     if (valid) {
       try { valid = verifyMonitoringTotp(decryptMonitoringSecret(operator.totpSecretEncrypted), code); }
       catch (_) { valid = false; }
@@ -8573,7 +8997,7 @@ app.post("/monitoring/api/operators", async (req, res) => {
     await pool.query(`
       INSERT INTO monitoring_operators (id,username,display_name,role,password_hash,totp_secret_encrypted,is_active,is_bootstrap,must_change_password,is_enrolled)
       VALUES ($1,$2,$3,$4,$5,$6,TRUE,FALSE,FALSE,FALSE)
-    `, [id, username, displayName, role, passwordHash(placeholderPassword), encryptMonitoringSecret(initialSecret)]);
+    `, [id, username, displayName, role, await passwordHash(placeholderPassword), encryptMonitoringSecret(initialSecret)]);
     const activation = await issueMonitoringActivation(id, req);
     await writeMonitoringAudit(admin, req, "operator_created", "operator", id, { username, displayName, role, activationExpiresAt:activation.expiresAt });
     return res.status(201).json({ success:true, operator:{id,username,displayName,role,isActive:true,isBootstrap:false,mustChangePassword:false,isEnrolled:false,activationExpiresAt:activation.expiresAt}, activation:{ url:activation.activationUrl, expiresAt:activation.expiresAt } });
@@ -8684,7 +9108,7 @@ app.post("/monitoring/api/activation/:token/complete", async (req, res) => {
           activation_expires_at=NULL, activation_used_at=NOW(), updated_at=NOW()
       WHERE id=$1 AND activation_token_hash=$3 AND COALESCE(is_enrolled,TRUE)=FALSE
       RETURNING id
-    `, [operator.id, passwordHash(newPassword), tokenHash]);
+    `, [operator.id, await passwordHash(newPassword), tokenHash]);
     if (!updated.rowCount) return res.status(410).json({ success:false, error:"This activation link has already been used" });
     await pool.query(`DELETE FROM monitoring_sessions WHERE operator_id=$1`, [operator.id]);
     await writeMonitoringAudit(operator, req, "operator_activation_completed", "operator", operator.id, { username:operator.username, role:operator.role });
@@ -8701,7 +9125,7 @@ app.post("/monitoring/api/change-password", async (req, res) => {
     if (operator.isBootstrap) return res.status(400).json({ success:false, error:"Bootstrap administrator credentials are managed through the protected recovery configuration" });
     const newPassword = String(req.body?.newPassword || "");
     if (newPassword.length < 12) return res.status(400).json({ success:false, error:"New password must be at least 12 characters" });
-    await pool.query(`UPDATE monitoring_operators SET password_hash=$2,must_change_password=FALSE,updated_at=NOW() WHERE id=$1`, [operator.id,passwordHash(newPassword)]);
+    await pool.query(`UPDATE monitoring_operators SET password_hash=$2,must_change_password=FALSE,updated_at=NOW() WHERE id=$1`, [operator.id,await passwordHash(newPassword)]);
     await writeMonitoringAudit(operator, req, "password_changed", "operator", operator.id, {});
     return res.json({ success:true });
   } catch (error) {
@@ -8992,8 +9416,8 @@ app.post("/monitoring/api/residents/:residentId/cases/accept", async (req, res) 
       await client.query(`UPDATE monitoring_cases SET status='accepted',assigned_operator_id=$2,assigned_operator_name=$3,accepted_at=COALESCE(accepted_at,NOW()),updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName]);
       await client.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_accepted','Case accepted',NULL)`, [randomUUID(),incident.id,operator.id,operator.displayName]);
     }
+    await writeMonitoringAudit(operator, req, "case_accepted", "resident", resident.residentId, { caseId:incident.id }, client);
     await client.query('COMMIT');
-    await writeMonitoringAudit(operator, req, "case_accepted", "resident", resident.residentId, { caseId:incident.id });
     return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(resident.residentId) });
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
@@ -9010,20 +9434,96 @@ app.post("/monitoring/api/residents/:residentId/cases/accept", async (req, res) 
 // and audit log.
 app.post("/monitoring/api/cases/:caseId/takeover", async (req, res) => {
   try {
-    const operator = await requireMonitoringSupervisor(req, res); if (!operator) return;
-    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId",assigned_operator_name AS "assignedOperatorName" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
-    const incident = found.rows[0];
-    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
-    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"Only an active case can be reassigned" });
-    if (incident.assignedOperatorId && String(incident.assignedOperatorId) === String(operator.id)) return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
-    const priorName = incident.assignedOperatorName || 'Unassigned';
-    await pool.query(`UPDATE monitoring_cases SET assigned_operator_id=$2,assigned_operator_name=$3,status='accepted',accepted_at=COALESCE(accepted_at,NOW()),handoff_to_operator_id=NULL,handoff_to_operator_name=NULL,handoff_requested_by_operator_id=NULL,handoff_requested_by_operator_name=NULL,handoff_reason=NULL,handoff_requested_at=NULL,updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_reassigned','Case reassigned',$5)`, [randomUUID(),incident.id,operator.id,operator.displayName,`Supervisor takeover from ${priorName}`]);
-    await writeMonitoringAudit(operator, req, "case_reassigned", "case", incident.id, { priorOperatorName:priorName, assignedOperatorId:operator.id, assignedOperatorName:operator.displayName });
-    return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
+    const operator = await requireMonitoringSupervisor(req, res);
+    if (!operator) return;
+
+    const transactionResult = await withTransaction(async (client) => {
+      const found = await client.query(
+        `
+        SELECT
+          id,
+          resident_id AS "residentId",
+          status,
+          assigned_operator_id AS "assignedOperatorId",
+          assigned_operator_name AS "assignedOperatorName"
+        FROM monitoring_cases
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [req.params.caseId]
+      );
+
+      const incident = found.rows[0];
+      if (!incident) throw httpError(404, "Case not found", "MONITORING_CASE_NOT_FOUND");
+      if (!["open", "accepted", "escalated"].includes(incident.status)) {
+        throw httpError(409, "Only an active case can be reassigned", "MONITORING_CASE_CLOSED");
+      }
+
+      if (incident.assignedOperatorId && String(incident.assignedOperatorId) === String(operator.id)) {
+        return { residentId: incident.residentId, unchanged: true };
+      }
+
+      const priorName = incident.assignedOperatorName || "Unassigned";
+
+      await client.query(
+        `
+        UPDATE monitoring_cases
+        SET
+          assigned_operator_id = $2,
+          assigned_operator_name = $3,
+          status = 'accepted',
+          accepted_at = COALESCE(accepted_at, NOW()),
+          handoff_to_operator_id = NULL,
+          handoff_to_operator_name = NULL,
+          handoff_requested_by_operator_id = NULL,
+          handoff_requested_by_operator_name = NULL,
+          handoff_reason = NULL,
+          handoff_requested_at = NULL,
+          updated_at = NOW()
+        WHERE id = $1
+        `,
+        [incident.id, operator.id, operator.displayName]
+      );
+
+      await client.query(
+        `
+        INSERT INTO monitoring_case_events (
+          id, case_id, operator_id, operator_name, event_type, label, note
+        )
+        VALUES ($1,$2,$3,$4,'case_reassigned','Case reassigned',$5)
+        `,
+        [randomUUID(), incident.id, operator.id, operator.displayName, `Supervisor takeover from ${priorName}`]
+      );
+
+      await writeMonitoringAudit(
+        operator,
+        req,
+        "case_reassigned",
+        "case",
+        incident.id,
+        {
+          priorOperatorName: priorName,
+          assignedOperatorId: operator.id,
+          assignedOperatorName: operator.displayName
+        },
+        client
+      );
+
+      return { residentId: incident.residentId, unchanged: false };
+    });
+
+    return res.json({
+      success: true,
+      incident: await monitoringCasePayloadForResident(transactionResult.residentId)
+    });
   } catch (error) {
     console.error("Monitoring case takeover failed:", error);
-    return res.status(500).json({ success:false, error:"Failed to reassign case" });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.statusCode ? error.message : "Failed to reassign case",
+      ...(error.code ? { code: error.code } : {})
+    });
   }
 });
 
@@ -9058,8 +9558,8 @@ app.post("/monitoring/api/cases/:caseId/handoff", async (req, res) => {
     const targetName = target.displayName || target.username;
     await client.query(`UPDATE monitoring_cases SET handoff_to_operator_id=$2,handoff_to_operator_name=$3,handoff_requested_by_operator_id=$4,handoff_requested_by_operator_name=$5,handoff_reason=$6,handoff_requested_at=NOW(),updated_at=NOW() WHERE id=$1`, [incident.id,target.id,targetName,operator.id,operator.displayName,reason]);
     await client.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'handoff_requested','Handoff requested',$5,$6::jsonb)`, [randomUUID(),incident.id,operator.id,operator.displayName,`${operator.displayName} → ${targetName}\nReason: ${reason}`,JSON.stringify({fromOperatorId:operator.id,fromOperatorName:operator.displayName,toOperatorId:target.id,toOperatorName:targetName,reason})]);
+    await writeMonitoringAudit(operator,req,'case_handoff_requested','case',incident.id,{toOperatorId:target.id,toOperatorName:targetName,reason},client);
     await client.query('COMMIT');
-    await writeMonitoringAudit(operator,req,'case_handoff_requested','case',incident.id,{toOperatorId:target.id,toOperatorName:targetName,reason});
     return res.status(201).json({success:true,incident:await monitoringCasePayloadForResident(incident.residentId)});
   } catch (error) { try{await client.query('ROLLBACK')}catch(_){} console.error("Monitoring handoff request failed:",error); return res.status(500).json({success:false,error:"Failed to request case handoff"}); }
   finally { client.release(); }
@@ -9079,27 +9579,107 @@ app.post("/monitoring/api/cases/:caseId/handoff/accept", async (req, res) => {
     const priorName=incident.assignedOperatorName||'Unassigned';
     await client.query(`UPDATE monitoring_cases SET assigned_operator_id=$2,assigned_operator_name=$3,status=CASE WHEN status='open' THEN 'accepted' ELSE status END,accepted_at=COALESCE(accepted_at,NOW()),handoff_to_operator_id=NULL,handoff_to_operator_name=NULL,handoff_requested_by_operator_id=NULL,handoff_requested_by_operator_name=NULL,handoff_reason=NULL,handoff_requested_at=NULL,updated_at=NOW() WHERE id=$1`,[incident.id,operator.id,operator.displayName]);
     await client.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'handoff_accepted','Handoff accepted',$5,$6::jsonb)`,[randomUUID(),incident.id,operator.id,operator.displayName,`Ownership transferred from ${priorName} to ${operator.displayName}.`,JSON.stringify({fromOperatorId:incident.assignedOperatorId,fromOperatorName:priorName,toOperatorId:operator.id,toOperatorName:operator.displayName,reason:incident.handoffReason||null})]);
+    await writeMonitoringAudit(operator,req,'case_handoff_accepted','case',incident.id,{priorOperatorId:incident.assignedOperatorId,priorOperatorName:priorName},client);
     await client.query('COMMIT');
-    await writeMonitoringAudit(operator,req,'case_handoff_accepted','case',incident.id,{priorOperatorId:incident.assignedOperatorId,priorOperatorName:priorName});
     return res.json({success:true,incident:await monitoringCasePayloadForResident(incident.residentId)});
   } catch(error){try{await client.query('ROLLBACK')}catch(_){} console.error("Monitoring handoff accept failed:",error);return res.status(500).json({success:false,error:"Failed to accept case handoff"});}
   finally{client.release();}
 });
 
-app.post("/monitoring/api/cases/:caseId/handoff/cancel", async (req,res)=>{
-  try{
-    const operator=await requireMonitoringOperator(req,res);if(!operator)return;
-    const found=await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId",handoff_to_operator_id AS "handoffToOperatorId",handoff_to_operator_name AS "handoffToOperatorName" FROM monitoring_cases WHERE id=$1 LIMIT 1`,[req.params.caseId]);
-    const incident=found.rows[0];if(!incident)return res.status(404).json({success:false,error:"Case not found"});
-    if(!incident.handoffToOperatorId)return res.status(409).json({success:false,error:"This case has no pending handoff"});
-    const canCancel=String(incident.assignedOperatorId)===String(operator.id)||monitoringRoleRank(operator.role)>=monitoringRoleRank('supervisor');
-    if(!canCancel)return res.status(403).json({success:false,error:"Only the assigned operator or a supervisor can cancel this handoff"});
-    const targetName=incident.handoffToOperatorName||'receiving operator';
-    await pool.query(`UPDATE monitoring_cases SET handoff_to_operator_id=NULL,handoff_to_operator_name=NULL,handoff_requested_by_operator_id=NULL,handoff_requested_by_operator_name=NULL,handoff_reason=NULL,handoff_requested_at=NULL,updated_at=NOW() WHERE id=$1`,[incident.id]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'handoff_cancelled','Handoff cancelled',$5)`,[randomUUID(),incident.id,operator.id,operator.displayName,`Pending handoff to ${targetName} was cancelled.`]);
-    await writeMonitoringAudit(operator,req,'case_handoff_cancelled','case',incident.id,{targetOperatorName:targetName});
-    return res.json({success:true,incident:await monitoringCasePayloadForResident(incident.residentId)});
-  }catch(error){console.error("Monitoring handoff cancel failed:",error);return res.status(500).json({success:false,error:"Failed to cancel case handoff"});}
+app.post("/monitoring/api/cases/:caseId/handoff/cancel", async (req, res) => {
+  try {
+    const operator = await requireMonitoringOperator(req, res);
+    if (!operator) return;
+
+    const transactionResult = await withTransaction(async (client) => {
+      const found = await client.query(
+        `
+        SELECT
+          id,
+          resident_id AS "residentId",
+          status,
+          assigned_operator_id AS "assignedOperatorId",
+          handoff_to_operator_id AS "handoffToOperatorId",
+          handoff_to_operator_name AS "handoffToOperatorName"
+        FROM monitoring_cases
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [req.params.caseId]
+      );
+
+      const incident = found.rows[0];
+      if (!incident) throw httpError(404, "Case not found", "MONITORING_CASE_NOT_FOUND");
+      if (!incident.handoffToOperatorId) {
+        throw httpError(409, "This case has no pending handoff", "MONITORING_HANDOFF_NOT_PENDING");
+      }
+
+      const canCancel =
+        String(incident.assignedOperatorId) === String(operator.id) ||
+        monitoringRoleRank(operator.role) >= monitoringRoleRank("supervisor");
+
+      if (!canCancel) {
+        throw httpError(
+          403,
+          "Only the assigned operator or a supervisor can cancel this handoff",
+          "MONITORING_HANDOFF_CANCEL_FORBIDDEN"
+        );
+      }
+
+      const targetName = incident.handoffToOperatorName || "receiving operator";
+
+      await client.query(
+        `
+        UPDATE monitoring_cases
+        SET
+          handoff_to_operator_id = NULL,
+          handoff_to_operator_name = NULL,
+          handoff_requested_by_operator_id = NULL,
+          handoff_requested_by_operator_name = NULL,
+          handoff_reason = NULL,
+          handoff_requested_at = NULL,
+          updated_at = NOW()
+        WHERE id = $1
+        `,
+        [incident.id]
+      );
+
+      await client.query(
+        `
+        INSERT INTO monitoring_case_events (
+          id, case_id, operator_id, operator_name, event_type, label, note
+        )
+        VALUES ($1,$2,$3,$4,'handoff_cancelled','Handoff cancelled',$5)
+        `,
+        [randomUUID(), incident.id, operator.id, operator.displayName, `Pending handoff to ${targetName} was cancelled.`]
+      );
+
+      await writeMonitoringAudit(
+        operator,
+        req,
+        "case_handoff_cancelled",
+        "case",
+        incident.id,
+        { targetOperatorName: targetName },
+        client
+      );
+
+      return { residentId: incident.residentId };
+    });
+
+    return res.json({
+      success: true,
+      incident: await monitoringCasePayloadForResident(transactionResult.residentId)
+    });
+  } catch (error) {
+    console.error("Monitoring handoff cancel failed:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.statusCode ? error.message : "Failed to cancel case handoff",
+      ...(error.code ? { code: error.code } : {})
+    });
+  }
 });
 
 app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
@@ -9161,142 +9741,438 @@ app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
 
 app.post("/monitoring/api/cases/:caseId/actions", async (req, res) => {
   try {
-    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const operator = await requireMonitoringOperator(req, res);
+    if (!operator) return;
+
     const action = cleanText(req.body?.action);
     const note = cleanText(req.body?.note);
     const outcome = cleanText(req.body?.outcome);
     const baseLabel = MONITORING_CASE_ACTIONS.get(action);
-    if (!baseLabel) return res.status(400).json({ success:false, error:"Unsupported case action" });
+
+    if (!baseLabel) {
+      return res.status(400).json({ success: false, error: "Unsupported case action" });
+    }
+
     if (MONITORING_CONTACT_ACTIONS.has(action) && !monitoringContactOutcomeAllowed(action, outcome)) {
-      return res.status(400).json({ success:false, error:"A valid contact outcome is required" });
+      return res.status(400).json({ success: false, error: "A valid contact outcome is required" });
     }
-    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,priority,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
-    const incident = found.rows[0];
-    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
-    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
-    if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Accept this case before recording operator actions" });
 
-    // Escalation actions are state transitions, not repeatable timeline notes.
-    // Reject duplicates server-side so a stale browser or direct API request cannot
-    // create multiple supervisor/emergency escalation events for the same open case.
-    if (['supervisor_escalation','emergency_escalation'].includes(action)) {
-      const duplicate = await pool.query(
-        `SELECT 1 FROM monitoring_case_events WHERE case_id=$1 AND event_type=$2 LIMIT 1`,
-        [incident.id, action]
+    const transactionResult = await withTransaction(async (client) => {
+      const found = await client.query(
+        `
+        SELECT
+          id,
+          resident_id AS "residentId",
+          status,
+          priority,
+          assigned_operator_id AS "assignedOperatorId"
+        FROM monitoring_cases
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [req.params.caseId]
       );
-      if (duplicate.rowCount) {
-        return res.status(409).json({
-          success:false,
-          error: action === 'supervisor_escalation'
-            ? 'This case has already been escalated to a supervisor'
-            : 'Emergency / 911 escalation has already been recorded for this case'
-        });
+
+      const incident = found.rows[0];
+
+      if (!incident) {
+        throw httpError(404, "Case not found", "MONITORING_CASE_NOT_FOUND");
       }
-    }
 
-    let nextStatus = ['supervisor_escalation','emergency_escalation'].includes(action) ? 'escalated' : incident.status;
-    let nextPriority = incident.priority;
-    let label = baseLabel;
-    let guidance = null;
+      if (!["open", "accepted", "escalated"].includes(incident.status)) {
+        throw httpError(409, "This case is already closed", "MONITORING_CASE_CLOSED");
+      }
 
-    if (MONITORING_CONTACT_ACTIONS.has(action)) {
-      const outcomeLabel = MONITORING_CONTACT_OUTCOMES.get(outcome);
-      label = `${baseLabel} — ${outcomeLabel}`;
-      guidance = monitoringProtocolGuidance(action, outcome, incident.priority);
-      nextPriority = guidance.priority || incident.priority;
-      if (guidance.escalate) nextStatus = 'escalated';
-    } else if (action === 'supervisor_escalation') {
-      guidance = {
-        priority: nextPriority,
-        escalate: true,
-        label: `${cleanText(nextPriority || 'P5').toUpperCase()} — Supervisor review required`,
-        note: 'Case escalated to supervisor. Maintain the current priority until a supervisor records the appropriate disposition or emergency response action.'
+      if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) {
+        throw httpError(409, "Accept this case before recording operator actions", "MONITORING_CASE_NOT_ASSIGNED");
+      }
+
+      if (["supervisor_escalation", "emergency_escalation"].includes(action)) {
+        const duplicate = await client.query(
+          `SELECT 1 FROM monitoring_case_events WHERE case_id = $1 AND event_type = $2 LIMIT 1`,
+          [incident.id, action]
+        );
+
+        if (duplicate.rowCount) {
+          throw httpError(
+            409,
+            action === "supervisor_escalation"
+              ? "This case has already been escalated to a supervisor"
+              : "Emergency / 911 escalation has already been recorded for this case",
+            "MONITORING_DUPLICATE_ESCALATION"
+          );
+        }
+      }
+
+      let nextStatus = ["supervisor_escalation", "emergency_escalation"].includes(action)
+        ? "escalated"
+        : incident.status;
+      let nextPriority = incident.priority;
+      let label = baseLabel;
+      let guidance = null;
+
+      if (MONITORING_CONTACT_ACTIONS.has(action)) {
+        const outcomeLabel = MONITORING_CONTACT_OUTCOMES.get(outcome);
+        label = `${baseLabel} — ${outcomeLabel}`;
+        guidance = monitoringProtocolGuidance(action, outcome, incident.priority);
+        nextPriority = guidance.priority || incident.priority;
+        if (guidance.escalate) nextStatus = "escalated";
+      } else if (action === "supervisor_escalation") {
+        guidance = {
+          priority: nextPriority,
+          escalate: true,
+          label: `${cleanText(nextPriority || "P5").toUpperCase()} — Supervisor review required`,
+          note: "Case escalated to supervisor. Maintain the current priority until a supervisor records the appropriate disposition or emergency response action."
+        };
+      } else if (action === "emergency_escalation") {
+        guidance = {
+          priority: nextPriority,
+          escalate: true,
+          label: `${cleanText(nextPriority || "P5").toUpperCase()} — Emergency response initiated`,
+          note: "Emergency / 911 escalation has been recorded. Keep the case open and document response details and final disposition."
+        };
+      }
+
+      await client.query(
+        `UPDATE monitoring_cases SET status = $2, priority = $3, updated_at = NOW() WHERE id = $1`,
+        [incident.id, nextStatus, nextPriority]
+      );
+
+      await client.query(
+        `
+        INSERT INTO monitoring_case_events (
+          id, case_id, operator_id, operator_name, event_type, label, note, metadata
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+        `,
+        [
+          randomUUID(),
+          incident.id,
+          operator.id,
+          operator.displayName,
+          action,
+          label,
+          note || null,
+          JSON.stringify({
+            outcome: outcome || null,
+            outcomeLabel: outcome ? MONITORING_CONTACT_OUTCOMES.get(outcome) : null,
+            protocolDriven: Boolean(guidance)
+          })
+        ]
+      );
+
+      if (guidance) {
+        await client.query(
+          `
+          INSERT INTO monitoring_case_events (
+            id, case_id, operator_id, operator_name, event_type, label, note, metadata
+          )
+          VALUES ($1,$2,$3,$4,'protocol_next_step',$5,$6,$7::jsonb)
+          `,
+          [
+            randomUUID(),
+            incident.id,
+            operator.id,
+            operator.displayName,
+            guidance.label,
+            guidance.note,
+            JSON.stringify({
+              sourceAction: action,
+              outcome,
+              priority: nextPriority,
+              escalated: guidance.escalate
+            })
+          ]
+        );
+      }
+
+      await writeMonitoringAudit(
+        operator,
+        req,
+        "case_action",
+        "case",
+        incident.id,
+        {
+          action,
+          label,
+          outcome: outcome || null,
+          note: note || null,
+          nextPriority,
+          nextStatus,
+          protocolGuidance: guidance
+        },
+        client
+      );
+
+      return {
+        residentId: incident.residentId,
+        guidance
       };
-    } else if (action === 'emergency_escalation') {
-      guidance = {
-        priority: nextPriority,
-        escalate: true,
-        label: `${cleanText(nextPriority || 'P5').toUpperCase()} — Emergency response initiated`,
-        note: 'Emergency / 911 escalation has been recorded. Keep the case open and document response details and final disposition.'
-      };
-    }
+    });
 
-    await pool.query(`UPDATE monitoring_cases SET status=$2,priority=$3,updated_at=NOW() WHERE id=$1`, [incident.id,nextStatus,nextPriority]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [
-      randomUUID(), incident.id, operator.id, operator.displayName, action, label, note || null,
-      JSON.stringify({ outcome: outcome || null, outcomeLabel: outcome ? MONITORING_CONTACT_OUTCOMES.get(outcome) : null, protocolDriven:Boolean(guidance) })
-    ]);
-
-    if (guidance) {
-      await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'protocol_next_step',$5,$6,$7::jsonb)`, [
-        randomUUID(), incident.id, operator.id, operator.displayName, guidance.label, guidance.note,
-        JSON.stringify({ sourceAction:action, outcome, priority:nextPriority, escalated:guidance.escalate })
-      ]);
-    }
-
-    await writeMonitoringAudit(operator, req, "case_action", "case", incident.id, { action, label, outcome:outcome || null, note:note || null, nextPriority, nextStatus, protocolGuidance:guidance });
-    return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId), protocolGuidance:guidance });
-  } catch (error) { console.error("Monitoring case action failed:", error); return res.status(500).json({ success:false, error:"Failed to record case action" }); }
+    return res.status(201).json({
+      success: true,
+      incident: await monitoringCasePayloadForResident(transactionResult.residentId),
+      protocolGuidance: transactionResult.guidance
+    });
+  } catch (error) {
+    console.error("Monitoring case action failed:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.statusCode ? error.message : "Failed to record case action",
+      ...(error.code ? { code: error.code } : {})
+    });
+  }
 });
 
 app.post("/monitoring/api/cases/:caseId/supervisor-disposition", async (req, res) => {
   try {
-    const supervisor = await requireMonitoringSupervisor(req, res); if (!supervisor) return;
+    const supervisor = await requireMonitoringSupervisor(req, res);
+    if (!supervisor) return;
+
     const disposition = cleanText(req.body?.disposition);
     const note = cleanText(req.body?.note);
     const config = MONITORING_SUPERVISOR_DISPOSITIONS.get(disposition);
-    if (!config) return res.status(400).json({ success:false, error:"Unsupported supervisor disposition" });
-    if (['return_to_operator','verified_safe','field_response','emergency_response'].includes(disposition) && !note) {
-      return res.status(400).json({ success:false, error:"A disposition note is required for this supervisor action" });
+
+    if (!config) {
+      return res.status(400).json({ success: false, error: "Unsupported supervisor disposition" });
     }
 
-    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,priority,assigned_operator_id AS "assignedOperatorId",assigned_operator_name AS "assignedOperatorName" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
-    const incident = found.rows[0];
-    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
-    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
-
-    const supervisorEscalation = await pool.query(`SELECT 1 FROM monitoring_case_events WHERE case_id=$1 AND event_type='supervisor_escalation' LIMIT 1`, [incident.id]);
-    if (!supervisorEscalation.rowCount) return res.status(409).json({ success:false, error:"This case has not been escalated for supervisor review" });
-
-    if (disposition === 'emergency_response') {
-      const duplicateEmergency = await pool.query(`SELECT 1 FROM monitoring_case_events WHERE case_id=$1 AND event_type='emergency_escalation' LIMIT 1`, [incident.id]);
-      if (duplicateEmergency.rowCount) return res.status(409).json({ success:false, error:"Emergency / 911 escalation has already been recorded for this case" });
+    if (["return_to_operator", "verified_safe", "field_response", "emergency_response"].includes(disposition) && !note) {
+      return res.status(400).json({ success: false, error: "A disposition note is required for this supervisor action" });
     }
 
-    const priority = cleanText(incident.priority || 'P5').toUpperCase() || 'P5';
-    const guidanceLabel = `${priority} — ${config.guidanceLabel}`;
-    await pool.query(`UPDATE monitoring_cases SET status='escalated',updated_at=NOW() WHERE id=$1`, [incident.id]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [
-      randomUUID(), incident.id, supervisor.id, supervisor.displayName, config.eventType, config.label, note || null,
-      JSON.stringify({ supervisorDisposition:disposition, assignedOperatorId:incident.assignedOperatorId || null, assignedOperatorName:incident.assignedOperatorName || null })
-    ]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'protocol_next_step',$5,$6,$7::jsonb)`, [
-      randomUUID(), incident.id, supervisor.id, supervisor.displayName, guidanceLabel, config.guidanceNote,
-      JSON.stringify({ sourceAction:'supervisor_disposition', disposition, priority })
-    ]);
-    await writeMonitoringAudit(supervisor, req, 'supervisor_disposition', 'case', incident.id, { disposition, note:note || null, priority, assignedOperatorId:incident.assignedOperatorId || null });
-    return res.status(201).json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId), protocolGuidance:{ label:guidanceLabel, note:config.guidanceNote } });
+    const transactionResult = await withTransaction(async (client) => {
+      const found = await client.query(
+        `
+        SELECT
+          id,
+          resident_id AS "residentId",
+          status,
+          priority,
+          assigned_operator_id AS "assignedOperatorId",
+          assigned_operator_name AS "assignedOperatorName"
+        FROM monitoring_cases
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [req.params.caseId]
+      );
+
+      const incident = found.rows[0];
+
+      if (!incident) {
+        throw httpError(404, "Case not found", "MONITORING_CASE_NOT_FOUND");
+      }
+
+      if (!["open", "accepted", "escalated"].includes(incident.status)) {
+        throw httpError(409, "This case is already closed", "MONITORING_CASE_CLOSED");
+      }
+
+      const supervisorEscalation = await client.query(
+        `SELECT 1 FROM monitoring_case_events WHERE case_id = $1 AND event_type = 'supervisor_escalation' LIMIT 1`,
+        [incident.id]
+      );
+
+      if (!supervisorEscalation.rowCount) {
+        throw httpError(409, "This case has not been escalated for supervisor review", "MONITORING_SUPERVISOR_ESCALATION_REQUIRED");
+      }
+
+      if (disposition === "emergency_response") {
+        const duplicateEmergency = await client.query(
+          `SELECT 1 FROM monitoring_case_events WHERE case_id = $1 AND event_type = 'emergency_escalation' LIMIT 1`,
+          [incident.id]
+        );
+
+        if (duplicateEmergency.rowCount) {
+          throw httpError(409, "Emergency / 911 escalation has already been recorded for this case", "MONITORING_DUPLICATE_EMERGENCY_ESCALATION");
+        }
+      }
+
+      const priority = cleanText(incident.priority || "P5").toUpperCase() || "P5";
+      const guidanceLabel = `${priority} — ${config.guidanceLabel}`;
+
+      await client.query(
+        `UPDATE monitoring_cases SET status = 'escalated', updated_at = NOW() WHERE id = $1`,
+        [incident.id]
+      );
+
+      await client.query(
+        `
+        INSERT INTO monitoring_case_events (
+          id, case_id, operator_id, operator_name, event_type, label, note, metadata
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+        `,
+        [
+          randomUUID(),
+          incident.id,
+          supervisor.id,
+          supervisor.displayName,
+          config.eventType,
+          config.label,
+          note || null,
+          JSON.stringify({
+            supervisorDisposition: disposition,
+            assignedOperatorId: incident.assignedOperatorId || null,
+            assignedOperatorName: incident.assignedOperatorName || null
+          })
+        ]
+      );
+
+      await client.query(
+        `
+        INSERT INTO monitoring_case_events (
+          id, case_id, operator_id, operator_name, event_type, label, note, metadata
+        )
+        VALUES ($1,$2,$3,$4,'protocol_next_step',$5,$6,$7::jsonb)
+        `,
+        [
+          randomUUID(),
+          incident.id,
+          supervisor.id,
+          supervisor.displayName,
+          guidanceLabel,
+          config.guidanceNote,
+          JSON.stringify({
+            sourceAction: "supervisor_disposition",
+            disposition,
+            priority
+          })
+        ]
+      );
+
+      await writeMonitoringAudit(
+        supervisor,
+        req,
+        "supervisor_disposition",
+        "case",
+        incident.id,
+        {
+          disposition,
+          note: note || null,
+          priority,
+          assignedOperatorId: incident.assignedOperatorId || null
+        },
+        client
+      );
+
+      return {
+        residentId: incident.residentId,
+        guidance: {
+          label: guidanceLabel,
+          note: config.guidanceNote
+        }
+      };
+    });
+
+    return res.status(201).json({
+      success: true,
+      incident: await monitoringCasePayloadForResident(transactionResult.residentId),
+      protocolGuidance: transactionResult.guidance
+    });
   } catch (error) {
     console.error("Monitoring supervisor disposition failed:", error);
-    return res.status(500).json({ success:false, error:"Failed to record supervisor disposition" });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.statusCode ? error.message : "Failed to record supervisor disposition",
+      ...(error.code ? { code: error.code } : {})
+    });
   }
 });
 
 app.post("/monitoring/api/cases/:caseId/resolve", async (req, res) => {
   try {
-    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
+    const operator = await requireMonitoringOperator(req, res);
+    if (!operator) return;
+
     const resolution = cleanText(req.body?.resolution);
-    if (!resolution) return res.status(400).json({ success:false, error:"A resolution note is required" });
-    const found = await pool.query(`SELECT id,resident_id AS "residentId",status,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
-    const incident = found.rows[0];
-    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
-    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
-    if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Only the assigned operator can resolve this case" });
-    await pool.query(`UPDATE monitoring_cases SET status='resolved',resolved_at=NOW(),resolved_by_operator_id=$2,resolved_by_operator_name=$3,resolution=$4,updated_at=NOW() WHERE id=$1`, [incident.id,operator.id,operator.displayName,resolution]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note) VALUES ($1,$2,$3,$4,'case_resolved','Case resolved',$5)`, [randomUUID(),incident.id,operator.id,operator.displayName,resolution]);
-    await writeMonitoringAudit(operator, req, "case_resolved", "case", incident.id, { resolution });
-    return res.json({ success:true, incident:await monitoringCasePayloadForResident(incident.residentId) });
-  } catch (error) { console.error("Monitoring case resolve failed:", error); return res.status(500).json({ success:false, error:"Failed to resolve case" }); }
+    if (!resolution) {
+      return res.status(400).json({ success: false, error: "A resolution note is required" });
+    }
+
+    const transactionResult = await withTransaction(async (client) => {
+      const found = await client.query(
+        `
+        SELECT
+          id,
+          resident_id AS "residentId",
+          status,
+          assigned_operator_id AS "assignedOperatorId"
+        FROM monitoring_cases
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [req.params.caseId]
+      );
+
+      const incident = found.rows[0];
+
+      if (!incident) {
+        throw httpError(404, "Case not found", "MONITORING_CASE_NOT_FOUND");
+      }
+
+      if (!["open", "accepted", "escalated"].includes(incident.status)) {
+        throw httpError(409, "This case is already closed", "MONITORING_CASE_CLOSED");
+      }
+
+      if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) {
+        throw httpError(409, "Only the assigned operator can resolve this case", "MONITORING_CASE_NOT_ASSIGNED");
+      }
+
+      await client.query(
+        `
+        UPDATE monitoring_cases
+        SET
+          status = 'resolved',
+          resolved_at = NOW(),
+          resolved_by_operator_id = $2,
+          resolved_by_operator_name = $3,
+          resolution = $4,
+          updated_at = NOW()
+        WHERE id = $1
+        `,
+        [incident.id, operator.id, operator.displayName, resolution]
+      );
+
+      await client.query(
+        `
+        INSERT INTO monitoring_case_events (
+          id, case_id, operator_id, operator_name, event_type, label, note
+        )
+        VALUES ($1,$2,$3,$4,'case_resolved','Case resolved',$5)
+        `,
+        [randomUUID(), incident.id, operator.id, operator.displayName, resolution]
+      );
+
+      await writeMonitoringAudit(
+        operator,
+        req,
+        "case_resolved",
+        "case",
+        incident.id,
+        { resolution },
+        client
+      );
+
+      return { residentId: incident.residentId };
+    });
+
+    return res.json({
+      success: true,
+      incident: await monitoringCasePayloadForResident(transactionResult.residentId)
+    });
+  } catch (error) {
+    console.error("Monitoring case resolve failed:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.statusCode ? error.message : "Failed to resolve case",
+      ...(error.code ? { code: error.code } : {})
+    });
+  }
 });
 
 app.post("/monitoring/api/residents/:residentId/follow-up", async (req, res) => {
@@ -9320,6 +10196,9 @@ app.post("/monitoring/api/residents/:residentId/follow-up", async (req, res) => 
 
 app.get("/ai/dashboard", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     let cached = null;
 
     try {
@@ -9358,6 +10237,9 @@ app.get("/ai/dashboard", async (req, res) => {
 
 app.get("/ai/human-presence-learning", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const residentId = cleanOptionalText(req.query.residentId);
 
     const result = await pool.query(
@@ -9462,6 +10344,9 @@ app.get("/ai/human-presence-learning", async (req, res) => {
 
 app.get("/ai/briefing", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const briefing = await buildAIBriefing();
     res.status(200).json(briefing);
   } catch (error) {
@@ -9475,6 +10360,9 @@ app.get("/ai/briefing", async (req, res) => {
 
 app.get("/ai/motion-summary", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const summary = await buildAIMotionSummary();
     res.status(200).json(summary);
   } catch (error) {
@@ -9488,6 +10376,9 @@ app.get("/ai/motion-summary", async (req, res) => {
 
 app.get("/ai/motion-events", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const requestedLimit = normalizeInteger(req.query.limit, 100);
     const limit = Math.min(Math.max(requestedLimit, 1), 500);
     const residentId = cleanOptionalText(req.query.residentId);
@@ -9518,6 +10409,9 @@ app.get("/ai/motion-events", async (req, res) => {
 
 app.get("/ai/action-logs", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const requestedLimit = normalizeInteger(req.query.limit, 100);
     const limit = Math.min(Math.max(requestedLimit, 1), 500);
     const residentId = cleanOptionalText(req.query.residentId);
@@ -9695,13 +10589,16 @@ app.patch("/events/:eventId/acknowledge", async (req, res) => {
     console.error("Event acknowledgment failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to acknowledge event"
     });
   }
 });
 
 app.get("/nodes", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const includeArchived = parseBooleanQuery(req.query.includeArchived);
 
     const result = await pool.query(
@@ -9779,9 +10676,10 @@ app.post("/nodes/register", async (req, res) => {
     });
   } catch (error) {
     console.error("Node registration failed:", error);
-    return res.status(400).json({
+    const statusCode = Number(error?.statusCode);
+    return res.status(Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 500 ? statusCode : 400).json({
       success: false,
-      error: error.message
+      error: publicErrorMessage(error, "Invalid node registration request")
     });
   }
 });
@@ -9866,7 +10764,7 @@ app.post("/node-commands", async (req, res) => {
     console.error("Create node command failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to create node command"
     });
   }
 });
@@ -9995,7 +10893,7 @@ app.get("/node-commands/:nodeId/pending", async (req, res) => {
     console.error("Fetch pending node commands failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch pending node commands"
     });
   } finally {
     client.release();
@@ -10133,7 +11031,7 @@ app.post("/node-commands/:commandId/result", async (req, res) => {
     console.error("Save node command result failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to save node command result"
     });
   } finally {
     client.release();
@@ -10175,7 +11073,7 @@ app.get("/node-commands/:nodeId", async (req, res) => {
     console.error("Fetch node command history failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch node command history"
     });
   }
 });
@@ -10254,7 +11152,7 @@ app.patch("/nodes/:nodeId", async (req, res) => {
     console.error("Node update failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to update node"
     });
   }
 });
@@ -10326,7 +11224,7 @@ app.patch("/nodes/:nodeId/archive", async (req, res) => {
     console.error("Node archive failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to archive node"
     });
   }
 });
@@ -10399,7 +11297,7 @@ app.patch("/nodes/:nodeId/restore", async (req, res) => {
     console.error("Node restore failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to restore node"
     });
   }
 });
@@ -10562,7 +11460,7 @@ app.delete("/nodes/:nodeId", async (req, res) => {
     console.error("Permanent archived node delete failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to permanently delete archived node"
     });
   } finally {
     client.release();
@@ -10695,7 +11593,7 @@ app.post("/residents", async (req, res) => {
     console.error("Resident save failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to save resident"
     });
   }
 });
@@ -10898,7 +11796,7 @@ app.patch("/residents/:residentId", async (req, res) => {
     console.error("Resident update failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to update resident"
     });
   } finally {
     client.release();
@@ -11096,7 +11994,7 @@ app.delete("/residents/:residentId", async (req, res) => {
     console.error("Resident delete failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to delete resident"
     });
   }
 });
@@ -11249,7 +12147,7 @@ app.post("/cameras", async (req, res) => {
     console.error("Camera save failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to save camera"
     });
   }
 });
@@ -11366,7 +12264,7 @@ app.patch("/cameras/:cameraId", async (req, res) => {
     console.error("Camera update failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to update camera"
     });
   }
 });
@@ -11418,7 +12316,7 @@ app.delete("/cameras/:cameraId", async (req, res) => {
     console.error("Camera delete failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to delete camera"
     });
   }
 });
@@ -11554,7 +12452,7 @@ app.get("/sensor-inventory", async (req, res) => {
     console.error("Fetch sensor inventory failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch sensor inventory"
     });
   }
 });
@@ -11595,7 +12493,7 @@ app.patch("/sensors/:nodeId/assignment", async (req, res) => {
     console.error("Sensor assignment update failed:", error);
     return res.status(error.statusCode || 500).json({
       success: false,
-      error: error.message,
+      error: publicErrorMessage(error, "Unable to update sensor assignment"),
       ...(error.code ? { code: error.code } : {})
     });
   }
@@ -11666,7 +12564,7 @@ app.post("/sensor-bulk-actions", async (req, res) => {
           errors.push({
             nodeId: assignmentNodeId || null,
             success: false,
-            error: error.message,
+            error: publicErrorMessage(error, "Sensor assignment failed"),
             ...(error.code ? { code: error.code } : {})
           });
         }
@@ -11749,7 +12647,7 @@ app.post("/sensor-bulk-actions", async (req, res) => {
         errors.push({
           nodeId,
           success: false,
-          error: error.message
+          error: publicErrorMessage(error, "Sensor command failed")
         });
       }
     }
@@ -11768,7 +12666,7 @@ app.post("/sensor-bulk-actions", async (req, res) => {
     console.error("Sensor bulk action failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to complete sensor bulk action"
     });
   }
 });
@@ -11936,7 +12834,7 @@ app.get("/sensor-config/:nodeId", async (req, res) => {
     console.error("Failed to fetch sensor config:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch sensor configuration"
     });
   }
 });
@@ -11980,7 +12878,7 @@ app.get("/sensor-commands/:nodeId", async (req, res) => {
     console.error("Fetch sensor command history failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch sensor command history"
     });
   }
 });
@@ -12180,7 +13078,7 @@ app.post("/sensor-commands", async (req, res) => {
     console.error("Create sensor command failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to create sensor command"
     });
   } finally {
     client.release();
@@ -12318,7 +13216,7 @@ app.post("/sensor-commands/:nodeId/cleanup", async (req, res) => {
     console.error("Sensor command cleanup failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to clean up sensor commands"
     });
   } finally {
     client.release();
@@ -12432,7 +13330,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
     console.error("Fetch pending sensor commands failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch pending sensor commands"
     });
   } finally {
     client.release();
@@ -12533,7 +13431,7 @@ app.get("/firmware/download/:releaseTag/:assetName", async (req, res) => {
     if (!res.headersSent) {
       return res.status(500).json({
         success: false,
-        error: error.message
+        error: "Firmware download failed"
       });
     }
 
@@ -12572,7 +13470,7 @@ app.get("/firmware/human-presence/download/:releaseTag/:assetName", async (req, 
     if (!res.headersSent) {
       return res.status(500).json({
         success: false,
-        error: error.message
+        error: "Human-presence firmware download failed"
       });
     }
 
@@ -12607,7 +13505,7 @@ app.get("/firmware/human-presence/releases", async (req, res) => {
     console.error("Fetch human-presence firmware releases failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch human-presence firmware releases"
     });
   }
 });
@@ -12692,7 +13590,7 @@ app.post("/firmware/human-presence/releases", async (req, res) => {
     console.error("Save human-presence firmware release failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to save human-presence firmware release"
     });
   }
 });
@@ -12720,7 +13618,7 @@ app.get("/firmware/human-presence/latest", async (req, res) => {
     console.error("Fetch latest human-presence firmware release failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch latest human-presence firmware release"
     });
   }
 });
@@ -12752,7 +13650,7 @@ app.get("/firmware/releases", async (req, res) => {
     console.error("Fetch firmware releases failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch firmware releases"
     });
   }
 });
@@ -12837,7 +13735,7 @@ app.post("/firmware/releases", async (req, res) => {
     console.error("Save firmware release failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to save firmware release"
     });
   }
 });
@@ -12896,7 +13794,7 @@ app.get("/firmware/latest", async (req, res) => {
     console.error("Fetch latest firmware release failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to fetch latest firmware release"
     });
   }
 });
@@ -13000,13 +13898,16 @@ app.post("/firmware/update-node", async (req, res) => {
     console.error("Queue firmware update failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Unable to queue firmware update"
     });
   }
 });
 
 app.get("/device-mappings", async (req, res) => {
   try {
+    if (!requireAuthorizedRequest(req, res)) {
+      return;
+    }
     const result = await pool.query(
       `
       SELECT
@@ -13086,9 +13987,42 @@ app.post("/webhook", async (req, res) => {
     console.error("Webhook processing failed:", error);
     return res.status(500).json({
       success: false,
-      error: error.message
+      error: "Webhook processing failed"
     });
   }
+});
+
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    code: "ROUTE_NOT_FOUND",
+    error: "Route not found",
+    requestId: req.requestId
+  });
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  console.error("Unhandled request error:", {
+    requestId: req.requestId,
+    method: req.method,
+    path: req.path,
+    error: error?.stack || error?.message || String(error)
+  });
+
+  const statusCode = Number.isInteger(error?.statusCode)
+    ? error.statusCode
+    : 500;
+
+  return res.status(statusCode).json({
+    success: false,
+    code: error?.code || (statusCode >= 500 ? "INTERNAL_ERROR" : "REQUEST_FAILED"),
+    error: statusCode >= 500 ? "An unexpected server error occurred" : error.message,
+    requestId: req.requestId
+  });
 });
 
 mqttV2Bridge = createMqttV2Bridge({
@@ -13112,23 +14046,151 @@ mqttV2Bridge = createMqttV2Bridge({
     sensorCommandResultService.saveSensorCommandResult
 });
 
+async function waitForHttpServerToClose(server, timeoutMs = 10000) {
+  if (!server?.listening) return;
+
+  await new Promise((resolve) => {
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceTimer);
+      resolve();
+    };
+
+    const forceTimer = setTimeout(() => {
+      try { server.closeIdleConnections?.(); } catch (_) {}
+      try { server.closeAllConnections?.(); } catch (_) {}
+      finish();
+    }, timeoutMs);
+
+    try {
+      server.close(() => finish());
+    } catch (_) {
+      finish();
+    }
+  });
+}
+
+async function stopOptionalService(service, label) {
+  if (!service) return;
+
+  try {
+    if (typeof service === "function") {
+      await service();
+      return;
+    }
+
+    if (typeof service.stop === "function") {
+      await service.stop();
+      return;
+    }
+
+    if (typeof service.close === "function") {
+      await service.close();
+    }
+  } catch (error) {
+    console.warn(`${label} shutdown failed:`, error?.message || String(error));
+  }
+}
+
+async function shutdownServer(reason = "shutdown") {
+  if (serverShutdownPromise) {
+    return serverShutdownPromise;
+  }
+
+  serverShutdownPromise = (async () => {
+    serverIsShuttingDown = true;
+    serverReadiness = "stopping";
+
+    console.log(`Good Shepherd server shutdown starting: ${reason}`);
+
+    if (aiDashboardRefreshTimer) {
+      clearTimeout(aiDashboardRefreshTimer);
+      aiDashboardRefreshTimer = null;
+    }
+    aiDashboardRefreshRequested = false;
+
+    if (customerAIInvalidationReconnectTimer) {
+      clearTimeout(customerAIInvalidationReconnectTimer);
+      customerAIInvalidationReconnectTimer = null;
+    }
+
+    const httpClosePromise = waitForHttpServerToClose(activeHttpServer);
+
+    closeAIStreamClients();
+    await stopCustomerAIInvalidationListener();
+    await stopOptionalService(mqttV2Bridge, "MQTT bridge");
+    await stopOptionalService(
+      humanPresenceAdaptiveCaptureHandle,
+      "Human Presence adaptive capture controller"
+    );
+
+    await httpClosePromise;
+
+    try {
+      await pool.end();
+    } catch (error) {
+      console.warn("PostgreSQL pool shutdown failed:", error?.message || String(error));
+    }
+
+    activeHttpServer = null;
+    serverReadiness = "stopped";
+    console.log("Good Shepherd server shutdown complete.");
+  })();
+
+  return serverShutdownPromise;
+}
+
 async function startServer() {
   const configurationIssues = runtimeConfigurationIssues(runtimeConfig);
 
   if (configurationIssues.length > 0) {
+    serverReadiness = "failed";
     throw new Error(
       `Runtime configuration invalid: ${configurationIssues.join("; ")}`
     );
   }
 
+  if (activeHttpServer?.listening) {
+    return activeHttpServer;
+  }
+
+  serverIsShuttingDown = false;
+  serverShutdownPromise = null;
+  serverReadiness = "starting";
+
   await initializeDatabase();
 
-  const server = app.listen(PORT, () => {
-    console.log(`Good Shepherd webhook server running on port ${PORT}`);
-    mqttV2Bridge.start();
+  const server = app.listen(PORT);
+  activeHttpServer = server;
+
+  await new Promise((resolve, reject) => {
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+
+    server.once("listening", onListening);
+    server.once("error", onError);
+  });
+
+  try {
+    const mqttStartResult = mqttV2Bridge.start();
+    if (mqttStartResult && typeof mqttStartResult.then === "function") {
+      await mqttStartResult;
+    }
 
     startCustomerAIInvalidationListener()
       .catch((error) => {
+        if (serverIsShuttingDown) return;
+
         console.error(
           "Customer AI invalidation listener startup failed:",
           error?.message || String(error)
@@ -13137,7 +14199,17 @@ async function startServer() {
         scheduleCustomerAIInvalidationListenerReconnect();
       });
 
-    startHumanPresenceAdaptiveCaptureControllerV1();
+    const humanPresenceStartResult =
+      startHumanPresenceAdaptiveCaptureControllerV1();
+
+    humanPresenceAdaptiveCaptureHandle =
+      humanPresenceStartResult && typeof humanPresenceStartResult.then === "function"
+        ? (await humanPresenceStartResult) || null
+        : humanPresenceStartResult || null;
+
+    serverReadiness = "ready";
+
+    console.log(`Good Shepherd webhook server running on port ${PORT}`);
     console.log(`Minimum iOS app build for resident/camera writes: ${MIN_IOS_APP_BUILD}`);
     console.log(`Remote support node health enabled. Offline after ${NODE_OFFLINE_AFTER_SECONDS} seconds.`);
     console.log("Remote node command queue enabled.");
@@ -13145,6 +14217,8 @@ async function startServer() {
     console.log("Scalable persisted AI dashboard cache enabled.");
 
     setImmediate(() => {
+      if (serverIsShuttingDown) return;
+
       runResidentActivityBackfill().catch((error) => {
         console.error(
           "Resident activity startup backfill failed:",
@@ -13154,12 +14228,31 @@ async function startServer() {
     });
 
     scheduleAIDashboardRefresh();
-  });
+    return server;
+  } catch (error) {
+    serverReadiness = "failed";
+    await shutdownServer("startup_failure");
+    throw error;
+  }
+}
 
-  return server;
+function installProcessLifecycleHandlers() {
+  const terminate = (signal) => {
+    shutdownServer(signal)
+      .then(() => process.exit(0))
+      .catch((error) => {
+        console.error("Good Shepherd shutdown failed:", error);
+        process.exit(1);
+      });
+  };
+
+  process.once("SIGTERM", () => terminate("SIGTERM"));
+  process.once("SIGINT", () => terminate("SIGINT"));
 }
 
 if (require.main === module) {
+  installProcessLifecycleHandlers();
+
   startServer().catch((error) => {
     console.error("Good Shepherd server startup failed:", error);
     process.exit(1);
@@ -13168,5 +14261,6 @@ if (require.main === module) {
 
 module.exports = {
   app,
-  startServer
+  startServer,
+  shutdownServer
 };

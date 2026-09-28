@@ -10,7 +10,15 @@ const expectedRoutes = require("./expected-routes.json");
 test("server can be required without opening database/network and preserves route surface", () => {
   const routes = [];
   const app = {
-    use() {},
+    use() {
+      return app;
+    },
+    disable() {
+      return app;
+    },
+    set() {
+      return app;
+    },
     listen() {
       throw new Error("listen must not run while server module is required");
     }
@@ -36,6 +44,9 @@ test("server can be required without opening database/network and preserves rout
     }
     connect() {
       throw new Error("database connect must not run during require-time contract test");
+    }
+    on() {
+      return this;
     }
   }
 

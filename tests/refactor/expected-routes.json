@@ -109,6 +109,10 @@
   ],
   [
     "GET",
+    "/livez"
+  ],
+  [
+    "GET",
     "/monitoring/api/activation/:token"
   ],
   [
@@ -158,6 +162,10 @@
   [
     "GET",
     "/presence-telemetry/latest"
+  ],
+  [
+    "GET",
+    "/readyz"
   ],
   [
     "GET",
