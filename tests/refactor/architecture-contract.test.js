@@ -49,3 +49,26 @@ test("latest Human Presence dashboard lookups have a versioned index migration",
   assert.match(sql[0], /authoritative_resident_id[\s\S]*non_operational_interpretation_at DESC/);
   assert.match(sql[0], /authoritative_resident_id[\s\S]*longitudinal_interpretation_validation_at DESC/);
 });
+
+
+test("global AI summary endpoints use the persisted summary fast path", () => {
+  const server = read("server.js");
+
+  const briefingStart = server.indexOf('app.get("/ai/briefing"');
+  const summaryStart = server.indexOf('app.get("/ai/motion-summary"');
+  const eventsStart = server.indexOf('app.get("/ai/motion-events"');
+
+  assert.notEqual(briefingStart, -1);
+  assert.notEqual(summaryStart, -1);
+  assert.notEqual(eventsStart, -1);
+
+  const briefingRoute = server.slice(briefingStart, summaryStart);
+  const summaryRoute = server.slice(summaryStart, eventsStart);
+
+  assert.match(briefingRoute, /loadMonitoringSummaryFast\(\)/);
+  assert.match(briefingRoute, /buildAIBriefingFromSummary\(summary\)/);
+  assert.doesNotMatch(briefingRoute, /await buildAIBriefing\(\)/);
+
+  assert.match(summaryRoute, /loadMonitoringSummaryFast\(\)/);
+  assert.doesNotMatch(summaryRoute, /await buildAIMotionSummary\(\)/);
+});

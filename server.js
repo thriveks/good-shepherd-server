@@ -10347,7 +10347,10 @@ app.get("/ai/briefing", async (req, res) => {
     if (!requireAuthorizedRequest(req, res)) {
       return;
     }
-    const briefing = await buildAIBriefing();
+
+    const summary = await loadMonitoringSummaryFast();
+    const briefing = buildAIBriefingFromSummary(summary);
+
     res.status(200).json(briefing);
   } catch (error) {
     console.error("Failed to build AI briefing:", error);
@@ -10363,7 +10366,9 @@ app.get("/ai/motion-summary", async (req, res) => {
     if (!requireAuthorizedRequest(req, res)) {
       return;
     }
-    const summary = await buildAIMotionSummary();
+
+    const summary = await loadMonitoringSummaryFast();
+
     res.status(200).json(summary);
   } catch (error) {
     console.error("Failed to build AI motion summary:", error);
