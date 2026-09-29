@@ -208,3 +208,72 @@ test("resident deletion scopes sensor cleanup by resident id only", () => {
     );
   }
 });
+
+test("HTTP observability logs only safe request metadata", () => {
+  const server = read("server.js");
+
+  const start =
+    server.indexOf("const HTTP_SLOW_REQUEST_MS");
+
+  const end =
+    server.indexOf(
+      "app.use(express.json",
+      start
+    );
+
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+
+  const block =
+    server.slice(start, end);
+
+  assert.match(
+    block,
+    /res\.once\("finish"/
+  );
+
+  assert.match(
+    block,
+    /process\.hrtime\.bigint\(\)/
+  );
+
+  assert.match(
+    block,
+    /requestId: req\.requestId/
+  );
+
+  assert.match(
+    block,
+    /route: routePattern/
+  );
+
+  assert.match(
+    block,
+    /statusCode: res\.statusCode/
+  );
+
+  assert.match(
+    block,
+    /durationMs/
+  );
+
+  assert.doesNotMatch(
+    block,
+    /req\.originalUrl/
+  );
+
+  assert.doesNotMatch(
+    block,
+    /req\.headers\.authorization/
+  );
+
+  assert.doesNotMatch(
+    block,
+    /req\.body/
+  );
+
+  assert.doesNotMatch(
+    block,
+    /req\.query/
+  );
+});

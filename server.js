@@ -142,6 +142,13 @@ const FIRMWARE_DOWNLOAD_TIMEOUT_MS = 120000;
 
 const HTTP_JSON_BODY_LIMIT = cleanText(process.env.HTTP_JSON_BODY_LIMIT) || "2mb";
 
+const HTTP_SLOW_REQUEST_MS = (() => {
+  const configured = Number(process.env.HTTP_SLOW_REQUEST_MS);
+  return Number.isFinite(configured) && configured >= 0
+    ? Math.trunc(configured)
+    : 1000;
+})();
+
 app.use((req, res, next) => {
   const suppliedRequestId = cleanText(req.header("x-request-id"));
   req.requestId = suppliedRequestId && suppliedRequestId.length <= 128
@@ -153,6 +160,46 @@ app.use((req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
+
+app.use((req, res, next) => {
+  const startedAt = process.hrtime.bigint();
+
+  res.once("finish", () => {
+    const elapsedNanoseconds =
+      process.hrtime.bigint() - startedAt;
+
+    const durationMs =
+      Number(elapsedNanoseconds) / 1_000_000;
+
+    const isServerError =
+      res.statusCode >= 500;
+
+    const isSlow =
+      durationMs >= HTTP_SLOW_REQUEST_MS;
+
+    if (!isServerError && !isSlow) {
+      return;
+    }
+
+    const routePattern =
+      typeof req.route?.path === "string"
+        ? req.route.path
+        : "unmatched";
+
+    console.warn(JSON.stringify({
+      type: "http_request",
+      requestId: req.requestId,
+      method: req.method,
+      route: routePattern,
+      statusCode: res.statusCode,
+      durationMs: Number(durationMs.toFixed(1)),
+      slow: isSlow,
+      serverError: isServerError
+    }));
+  });
+
   next();
 });
 
