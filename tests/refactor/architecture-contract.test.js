@@ -72,3 +72,139 @@ test("global AI summary endpoints use the persisted summary fast path", () => {
   assert.match(summaryRoute, /loadMonitoringSummaryFast\(\)/);
   assert.doesNotMatch(summaryRoute, /await buildAIMotionSummary\(\)/);
 });
+
+test("resident deletion scopes camera cleanup by resident id only", () => {
+  const server = read("server.js");
+
+  const routeStart =
+    server.indexOf('app.delete("/residents/:residentId"');
+
+  const cameraStart =
+    server.indexOf(
+      "const cameraResult = await client.query(",
+      routeStart
+    );
+
+  const sensorStart =
+    server.indexOf(
+      "const sensorResult = await client.query(",
+      cameraStart
+    );
+
+  assert.notEqual(routeStart, -1);
+  assert.notEqual(cameraStart, -1);
+  assert.notEqual(sensorStart, -1);
+
+  const cameraBlock =
+    server.slice(cameraStart, sensorStart);
+
+  assert.match(
+    cameraBlock,
+    /WHERE is_deleted = FALSE[\s\S]*AND resident_id = \$1/
+  );
+
+  assert.doesNotMatch(
+    cameraBlock,
+    /LOWER\(TRIM\(resident_name\)\)/
+  );
+});
+
+test("customer motion history preserves resident id index usage", () => {
+  const server = read("server.js");
+
+  const start =
+    server.indexOf('app.get("/customer/ai/motion-events"');
+
+  const end =
+    server.indexOf('app.get("/livez"', start);
+
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+
+  const route =
+    server.slice(start, end);
+
+  assert.match(
+    route,
+    /WHERE resident_id = \$1/
+  );
+
+  assert.doesNotMatch(
+    route,
+    /resident_id::text/
+  );
+});
+
+test("resident deletion scopes sensor cleanup by resident id only", () => {
+  const server = read("server.js");
+
+  const routeStart =
+    server.indexOf('app.delete("/residents/:residentId"');
+
+  const sensorSelectStart =
+    server.indexOf(
+      "const sensorResult = await client.query(",
+      routeStart
+    );
+
+  const lockStart =
+    server.indexOf(
+      "await lockSensorIdentityForResidentDeletion(",
+      sensorSelectStart
+    );
+
+  const sensorUpdateStart =
+    server.indexOf(
+      "const unassignedSensorResult = await client.query(",
+      lockStart
+    );
+
+  const affectedNodesStart =
+    server.indexOf(
+      "const affectedNodeIds",
+      sensorUpdateStart
+    );
+
+  assert.notEqual(routeStart, -1);
+  assert.notEqual(sensorSelectStart, -1);
+  assert.notEqual(lockStart, -1);
+  assert.notEqual(sensorUpdateStart, -1);
+  assert.notEqual(affectedNodesStart, -1);
+
+  const sensorSelect =
+    server.slice(
+      sensorSelectStart,
+      lockStart
+    );
+
+  const sensorUpdate =
+    server.slice(
+      sensorUpdateStart,
+      affectedNodesStart
+    );
+
+  for (const block of [
+    sensorSelect,
+    sensorUpdate
+  ]) {
+    assert.match(
+      block,
+      /resident_id = \$1/
+    );
+
+    assert.doesNotMatch(
+      block,
+      /resident_id IS NULL/
+    );
+
+    assert.doesNotMatch(
+      block,
+      /LOWER\(TRIM\(resident_name\)\)/
+    );
+
+    assert.doesNotMatch(
+      block,
+      /LOWER\(TRIM\(location_name\)\)/
+    );
+  }
+});

@@ -8742,7 +8742,7 @@ app.get("/customer/ai/motion-events", async (req, res) => {
     const result = await pool.query(
       `
       ${motionEventSelectSQL()}
-      WHERE resident_id::text = $1
+      WHERE resident_id = $1
         AND ($2::text IS NULL OR source_key = $2)
         AND ($3::text IS NULL OR sensor_id::text = $3)
         AND (
@@ -12041,9 +12041,6 @@ app.delete("/residents/:residentId", async (req, res) => {
         });
       }
 
-      const deletedResidentName = residentResult.rows[0].name;
-      const deletedResidentLocation = residentResult.rows[0].location;
-
       const cameraResult = await client.query(
         `
         UPDATE cameras
@@ -12056,13 +12053,10 @@ app.delete("/residents/:residentId", async (req, res) => {
           assigned_node_id = NULL,
           updated_at = NOW()
         WHERE is_deleted = FALSE
-          AND (
-            resident_id = $1
-            OR LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
-          )
+          AND resident_id = $1
         RETURNING id
         `,
-        [residentId, deletedResidentName]
+        [residentId]
       );
 
       const sensorResult = await client.query(
@@ -12073,17 +12067,10 @@ app.delete("/residents/:residentId", async (req, res) => {
           source_key AS "sourceKey"
         FROM sensors
         WHERE is_deleted = FALSE
-          AND (
-            resident_id = $1
-            OR (
-              resident_id IS NULL
-              AND LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
-              AND LOWER(TRIM(location_name)) = LOWER(TRIM($3))
-            )
-          )
+          AND resident_id = $1
         ORDER BY node_id NULLS LAST, source_key
         `,
-        [residentId, deletedResidentName, deletedResidentLocation]
+        [residentId]
       );
 
       await lockSensorIdentityForResidentDeletion(
@@ -12105,17 +12092,10 @@ app.delete("/residents/:residentId", async (req, res) => {
           is_active = TRUE,
           updated_at = NOW()
         WHERE is_deleted = FALSE
-          AND (
-            resident_id = $1
-            OR (
-              resident_id IS NULL
-              AND LOWER(TRIM(resident_name)) = LOWER(TRIM($2))
-              AND LOWER(TRIM(location_name)) = LOWER(TRIM($3))
-            )
-          )
+          AND resident_id = $1
         RETURNING id, node_id AS "nodeId", source_key AS "sourceKey"
         `,
-        [residentId, deletedResidentName, deletedResidentLocation]
+        [residentId]
       );
 
       const affectedNodeIds = [...new Set(
