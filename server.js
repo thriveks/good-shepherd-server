@@ -8389,31 +8389,78 @@ app.get("/customer/bootstrap", async (req, res) => {
       `${cameraSelectSQL()} WHERE resident_id = $1 AND is_deleted = FALSE ORDER BY source_name ASC`,
       [residentId]
     );
+    // Resolve customer ownership before querying the large event table.
+    // Authorization remains resident-ID based while history retrieval uses
+    // the customer's concrete node/source identifiers and supporting indexes.
+    const ownershipResult = await pool.query(
+      `
+      SELECT
+        ARRAY(
+          SELECT DISTINCT s.node_id
+          FROM sensors s
+          WHERE s.resident_id = $1
+            AND s.is_deleted = FALSE
+            AND s.node_id IS NOT NULL
+        ) AS "nodeIds",
+
+        ARRAY(
+          SELECT owned_source.source_key
+          FROM (
+            SELECT s.source_key
+            FROM sensors s
+            WHERE s.resident_id = $1
+              AND s.is_deleted = FALSE
+              AND s.source_key IS NOT NULL
+
+            UNION
+
+            SELECT c.source_key
+            FROM cameras c
+            WHERE c.resident_id = $1
+              AND c.is_deleted = FALSE
+              AND c.source_key IS NOT NULL
+          ) owned_source
+        ) AS "sourceKeys"
+      `,
+      [residentId]
+    );
+
+    const nodeIds =
+      ownershipResult.rows[0]?.nodeIds || [];
+
+    const sourceKeys =
+      ownershipResult.rows[0]?.sourceKeys || [];
+
     const eventsResult = await pool.query(
       `
-      ${eventSelectSQL()}
-      WHERE EXISTS (
-        SELECT 1
-        FROM sensors s
-        WHERE s.resident_id = $1
-          AND s.is_deleted = FALSE
-          AND (
-            (s.node_id IS NOT NULL AND s.node_id = webhook_events.node_id)
-            OR (s.source_key IS NOT NULL AND s.source_key = webhook_events.source_key)
-          )
+      WITH candidate_events AS (
+        (
+          ${eventSelectSQL()}
+          WHERE node_id = ANY($1::text[])
+          ORDER BY timestamp DESC
+          LIMIT 50
+        )
+
+        UNION ALL
+
+        (
+          ${eventSelectSQL()}
+          WHERE source_key = ANY($2::text[])
+          ORDER BY timestamp DESC
+          LIMIT 50
+        )
+      ),
+      deduplicated_events AS (
+        SELECT DISTINCT ON (id) *
+        FROM candidate_events
+        ORDER BY id, timestamp DESC
       )
-      OR EXISTS (
-        SELECT 1
-        FROM cameras c
-        WHERE c.resident_id = $1
-          AND c.is_deleted = FALSE
-          AND c.source_key IS NOT NULL
-          AND c.source_key = webhook_events.source_key
-      )
+      SELECT *
+      FROM deduplicated_events
       ORDER BY timestamp DESC
       LIMIT 50
       `,
-      [residentId]
+      [nodeIds, sourceKeys]
     );
 
     const { accessCode: _privateAccessCode, ...customerResident } = resident;
