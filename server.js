@@ -7279,6 +7279,9 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
       existingNodeSensor = existingNodeSensorResult.rows[0] || null;
     }
 
+    const previousResidentId =
+      cleanOptionalText(existingNodeSensor?.residentId);
+
     if (requestedSourceKey) {
       const requestedSourceResult = await client.query(
         `
@@ -7453,6 +7456,24 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
 
     await client.query("COMMIT");
     didBegin = false;
+
+    const affectedResidentIds = new Set(
+      [
+        previousResidentId,
+        cleanOptionalText(sensor?.residentId)
+      ].filter(Boolean)
+    );
+
+    if (affectedResidentIds.size === 0) {
+      scheduleAIDashboardRefresh();
+    } else {
+      for (const affectedResidentId of affectedResidentIds) {
+        scheduleAIDashboardRefresh({
+          residentId: affectedResidentId,
+          reason: "sensor_assignment_changed"
+        });
+      }
+    }
 
     return {
       node: nodeResult.rows[0],
@@ -11476,6 +11497,8 @@ app.patch("/nodes/:nodeId/archive", async (req, res) => {
       });
     }
 
+    scheduleAIDashboardRefresh();
+
     return res.status(200).json({
       success: true,
       message: "Node archived",
@@ -11545,6 +11568,8 @@ app.patch("/nodes/:nodeId/restore", async (req, res) => {
       `,
       [nodeId, restoredStatus]
     );
+
+    scheduleAIDashboardRefresh();
 
     return res.status(200).json({
       success: true,

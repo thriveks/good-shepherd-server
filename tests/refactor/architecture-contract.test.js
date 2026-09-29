@@ -335,3 +335,74 @@ test("resident-scoped staff queries preserve UUID index usage", () => {
     /resident_id = \$3::uuid/
   );
 });
+
+test("sensor topology changes invalidate AI dashboard cache", () => {
+  const server = read("server.js");
+
+  const assignmentStart = server.indexOf(
+    "async function updateSensorAssignment"
+  );
+  const assignmentEnd = server.indexOf(
+    "async function prepareNodeForReconfigure",
+    assignmentStart
+  );
+
+  assert.notEqual(assignmentStart, -1);
+  assert.notEqual(assignmentEnd, -1);
+
+  const assignmentBlock = server.slice(
+    assignmentStart,
+    assignmentEnd
+  );
+
+  assert.match(
+    assignmentBlock,
+    /previousResidentId/
+  );
+
+  assert.match(
+    assignmentBlock,
+    /sensor_assignment_changed/
+  );
+
+  assert.match(
+    assignmentBlock,
+    /scheduleAIDashboardRefresh\(/
+  );
+
+  const archiveStart = server.indexOf(
+    'app.patch("/nodes/:nodeId/archive"'
+  );
+  const restoreStart = server.indexOf(
+    'app.patch("/nodes/:nodeId/restore"',
+    archiveStart
+  );
+  const deleteStart = server.indexOf(
+    'app.delete("/nodes/:nodeId"',
+    restoreStart
+  );
+
+  assert.notEqual(archiveStart, -1);
+  assert.notEqual(restoreStart, -1);
+  assert.notEqual(deleteStart, -1);
+
+  const archiveBlock = server.slice(
+    archiveStart,
+    restoreStart
+  );
+
+  const restoreBlock = server.slice(
+    restoreStart,
+    deleteStart
+  );
+
+  assert.match(
+    archiveBlock,
+    /scheduleAIDashboardRefresh\(\)/
+  );
+
+  assert.match(
+    restoreBlock,
+    /scheduleAIDashboardRefresh\(\)/
+  );
+});
