@@ -22,6 +22,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: good_shepherd_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d good_shepherd_ci"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/good_shepherd_ci
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +54,9 @@ jobs:
 
       - name: Install exact dependencies
         run: npm ci
+
+      - name: Run database migrations
+        run: npm run migrate
 
       - name: Run server tests
         run: npm run test:refactor
