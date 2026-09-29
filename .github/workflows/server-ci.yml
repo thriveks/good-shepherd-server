@@ -39,6 +39,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/good_shepherd_ci
+      DATABASE_SSL: "false"
 
     steps:
       - name: Checkout

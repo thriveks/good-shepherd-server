@@ -109,11 +109,31 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
+const DATABASE_SSL_ENABLED = (() => {
+  const configured =
+    String(process.env.DATABASE_SSL || "")
+      .trim()
+      .toLowerCase();
+
+  if (!configured) {
+    return true;
+  }
+
+  return ![
+    "0",
+    "false",
+    "no",
+    "off"
+  ].includes(configured);
+})();
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl: DATABASE_SSL_ENABLED
+    ? {
+        rejectUnauthorized: false
+      }
+    : false
 });
 
 function setFromRows(rows, selector) {

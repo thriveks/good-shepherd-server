@@ -277,3 +277,28 @@ test("HTTP observability logs only safe request metadata", () => {
     /req\.query/
   );
 });
+
+test("migration runner supports non-SSL CI without weakening production default", () => {
+  const migration = read("scripts/migrate.js");
+  const workflow = read(".github/workflows/server-ci.yml");
+
+  assert.match(
+    migration,
+    /const DATABASE_SSL_ENABLED/
+  );
+
+  assert.match(
+    migration,
+    /if \(!configured\) \{\s*return true;/s
+  );
+
+  assert.match(
+    migration,
+    /ssl: DATABASE_SSL_ENABLED/
+  );
+
+  assert.match(
+    workflow,
+    /DATABASE_SSL: "false"/
+  );
+});
