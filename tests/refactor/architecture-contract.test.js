@@ -406,3 +406,39 @@ test("sensor topology changes invalidate AI dashboard cache", () => {
     /scheduleAIDashboardRefresh\(\)/
   );
 });
+
+test("command center uses staff sessions instead of webhook secret", () => {
+  const script = read("public/command-center/script.js");
+  const html = read("public/command-center/index.html");
+
+  assert.ok(
+    script.includes('h.Authorization = `Bearer ${state.staffToken}`')
+  );
+
+  assert.ok(
+    script.includes("/customer/access")
+  );
+
+  assert.ok(
+    script.includes("/staff/session")
+  );
+
+  assert.ok(
+    script.includes('"gsCommandCenterStaffToken"')
+  );
+
+  assert.doesNotMatch(
+    script,
+    /x-webhook-secret/
+  );
+
+  assert.doesNotMatch(
+    html,
+    /WEBHOOK_SECRET/
+  );
+
+  assert.match(
+    html,
+    /Staff 4-digit code/
+  );
+});

@@ -3,7 +3,8 @@
 
   const state = {
     apiBase: "https://good-shepherd-server-j06f.onrender.com",
-    secret: "",
+    staffToken: sessionStorage.getItem("gsCommandCenterStaffToken") || "",
+    staffExpiresAt: sessionStorage.getItem("gsCommandCenterStaffExpiresAt") || "",
     intervalMs: 5000,
     timer: null,
     selectedNodeId: null,
@@ -38,28 +39,52 @@
     .replaceAll("'", "&#039;");
   const attr = (v) => esc(JSON.stringify(v));
 
-  function makeHeaders({ secret = false, json = false, appWrite = false } = {}) {
+  function makeHeaders({ auth = true, json = false, appWrite = false } = {}) {
     const h = { Accept: "application/json" };
     if (json) h["Content-Type"] = "application/json";
-    if (secret && state.secret) h["x-webhook-secret"] = state.secret;
+    if (auth && state.staffToken) {
+      h.Authorization = `Bearer ${state.staffToken}`;
+    }
     if (appWrite) Object.assign(h, APP_HEADERS);
     return h;
   }
 
-  async function request(path, { method = "GET", body, secret = false, appWrite = false } = {}) {
+  function clearStaffSession() {
+    state.staffToken = "";
+    state.staffExpiresAt = "";
+    sessionStorage.removeItem("gsCommandCenterStaffToken");
+    sessionStorage.removeItem("gsCommandCenterStaffExpiresAt");
+  }
+
+  async function request(path, { method = "GET", body, auth = true, appWrite = false } = {}) {
     const response = await fetch(`${state.apiBase}${path}`, {
       method,
-      headers: makeHeaders({ secret, json: body !== undefined, appWrite }),
+      headers: makeHeaders({ auth, json: body !== undefined, appWrite }),
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store"
     });
+
     const text = await response.text();
     let data;
-    try { data = text ? JSON.parse(text) : {}; }
-    catch { throw new Error(`${path} returned non-JSON data (HTTP ${response.status})`); }
-    if (!response.ok || data?.success === false) {
-      throw new Error(data?.error || `${method} ${path} failed with HTTP ${response.status}`);
+
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      const error = new Error(
+        `${path} returned non-JSON data (HTTP ${response.status})`
+      );
+      error.status = response.status;
+      throw error;
     }
+
+    if (!response.ok || data?.success === false) {
+      const error = new Error(
+        data?.error || `${method} ${path} failed with HTTP ${response.status}`
+      );
+      error.status = response.status;
+      throw error;
+    }
+
     return data;
   }
 
@@ -69,10 +94,10 @@
     try {
       const [nodes, inventory, dashboard, firmware, residents] = await Promise.all([
         request("/nodes?includeArchived=true"),
-        request("/sensor-inventory?includeArchived=true", { secret: true }),
+        request("/sensor-inventory?includeArchived=true", {}),
         request("/ai/dashboard"),
-        request("/firmware/latest", { secret: true }).catch(() => null),
-        request("/residents", { secret: true })
+        request("/firmware/latest", {}).catch(() => null),
+        request("/residents", {})
       ]);
 
       state.data.nodes = Array.isArray(nodes.nodes) ? nodes.nodes : [];
@@ -105,9 +130,23 @@
       hideMessage();
     } catch (error) {
       setConnection("offline", "Connection failed");
-      showMessage(/unauthorized/i.test(error.message)
-        ? "Unauthorized: click Connection and enter WEBHOOK_SECRET."
-        : error.message, "error");
+
+      if (error.status === 401 || /unauthorized/i.test(error.message)) {
+        clearStaffSession();
+
+        showMessage(
+          "Staff session required. Click Connection and enter your 4-digit staff code.",
+          "error"
+        );
+
+        if (!settingsDialog.open) {
+          settingsDialog.showModal();
+        }
+
+        return;
+      }
+
+      showMessage(error.message, "error");
     }
   }
 
@@ -533,7 +572,7 @@
         state.commandInFlight = true;
         setAction("Sending command…");
         const result = await request("/sensor-commands", {
-          method: "POST", secret: true,
+          method: "POST",
           body: { nodeId: sensor.nodeId, commandType: action, payload: {}, requestedBy: "Good Shepherd Command Center" }
         });
         setAction(`Command queued: ${result.command?.status || "pending"}. Control lock remains active.`, "success");
@@ -547,7 +586,7 @@
         state.commandInFlight = true;
         setAction("Queueing firmware update…");
         await request("/firmware/update-node", {
-          method: "POST", secret: true,
+          method: "POST",
           body: { nodeId: sensor.nodeId, requestedBy: "Good Shepherd Command Center" }
         });
         setAction("Firmware update queued. Control lock remains active.", "success");
@@ -590,7 +629,7 @@
         if (!confirm(`Remove ${sensor.sourceName} from ${sensor.residentName}?`)) return;
         setAction("Removing assignment…");
         await request(`/sensors/${encodeURIComponent(sensor.nodeId)}/assignment`, {
-          method: "PATCH", secret: true, appWrite: true,
+          method: "PATCH", appWrite: true,
           body: {
             residentId: null, residentName: "Unassigned",
             locationName: "Unassigned Location", roomName: "",
@@ -609,7 +648,7 @@
         if (!confirm(`Restore ${sensor.nodeId}?`)) return;
         setAction("Restoring device…");
         await request(`/nodes/${encodeURIComponent(sensor.nodeId)}/restore`, {
-          method: "PATCH", secret: true
+          method: "PATCH"
         });
         setAction("Device restored.", "success");
         state.interactionLocked = false;
@@ -627,7 +666,7 @@
 
         setAction("Permanently deleting archived device…");
         const result = await request(`/nodes/${encodeURIComponent(sensor.nodeId)}`, {
-          method: "DELETE", secret: true
+          method: "DELETE"
         });
 
         const deletedSensors = Number(result?.cleanup?.sensorsDeleted || 0);
@@ -652,7 +691,7 @@
         if (prompt(`Type ARCHIVE to archive ${sensor.nodeId}.`) !== "ARCHIVE") return;
         setAction("Archiving device…");
         await request(`/nodes/${encodeURIComponent(sensor.nodeId)}/archive`, {
-          method: "PATCH", secret: true,
+          method: "PATCH",
           body: { reason: "Archived from Good Shepherd Command Center" }
         });
         state.selectedNodeId = null;
@@ -667,7 +706,7 @@
         state.commandInFlight = true;
         setAction("Queueing factory reset…");
         await request("/sensor-commands", {
-          method: "POST", secret: true,
+          method: "POST",
           body: { nodeId: sensor.nodeId, commandType: "factory_reset", payload: {}, requestedBy: "Good Shepherd Command Center" }
         });
         setAction("Factory reset queued. Control lock remains active.", "success");
@@ -729,7 +768,7 @@
     try {
       showMessage("Creating resident…");
       await request("/residents", {
-        method: "POST", secret: true, appWrite: true,
+        method: "POST", appWrite: true,
         body: { name, location, alertLevel }
       });
       residentDialog.close();
@@ -829,7 +868,7 @@
         const location = prompt("Location:", resident.location); if (location === null) return;
         setAction("Updating resident…");
         await request(`/residents/${encodeURIComponent(residentId)}`, {
-          method: "PATCH", secret: true, appWrite: true, body: { name, location }
+          method: "PATCH", appWrite: true, body: { name, location }
         });
         setAction("Resident updated.", "success");
         await loadData({ force: true });
@@ -840,7 +879,7 @@
         if (prompt(`Type DELETE ${resident.name} to delete this resident.`) !== `DELETE ${resident.name}`) return;
         setAction("Deleting resident…");
         await request(`/residents/${encodeURIComponent(residentId)}`, {
-          method: "DELETE", secret: true, appWrite: true
+          method: "DELETE", appWrite: true
         });
         setAction("Resident deleted.", "success");
         state.interactionLocked = false;
@@ -858,7 +897,7 @@
     if (!box) return;
     box.innerHTML = '<div class="muted">Loading…</div>';
     try {
-      const payload = await request(`/sensor-commands/${encodeURIComponent(nodeId)}`, { secret: true });
+      const payload = await request(`/sensor-commands/${encodeURIComponent(nodeId)}`, {});
       const commands = Array.isArray(payload.commands) ? payload.commands : [];
       box.innerHTML = commands.length ? commands.slice(0, 10).map((c) => `
         <div class="command-row"><strong><span>${esc(c.commandType)}</span>
@@ -937,15 +976,98 @@
     el("expandAllButton").textContent = open ? "Collapse all" : "Expand all";
   });
 
-  el("connectButton").addEventListener("click", (event) => {
+  el("connectButton").addEventListener("click", async (event) => {
     event.preventDefault();
-    state.apiBase = clean(el("apiBaseInput").value).replace(/\/+$/, "");
-    state.secret = el("secretInput").value;
-    state.intervalMs = Number(el("intervalInput").value) || 5000;
-    settingsDialog.close();
-    restartTimer();
-    loadData({ force: true });
+
+    const status = el("connectionStatus");
+    const code = clean(el("staffCodeInput").value);
+
+    if (!/^\d{4}$/.test(code)) {
+      status.textContent = "Enter the 4-digit staff code.";
+      status.className = "dialog-status error";
+      return;
+    }
+
+    state.apiBase =
+      clean(el("apiBaseInput").value).replace(/\/+$/, "");
+
+    state.intervalMs =
+      Number(el("intervalInput").value) || 5000;
+
+    status.textContent = "Signing in…";
+    status.className = "dialog-status saving";
+    el("connectButton").disabled = true;
+
+    try {
+      const access = await request(
+        "/customer/access",
+        {
+          method: "POST",
+          auth: false,
+          body: { code }
+        }
+      );
+
+      if (access?.mode !== "staff" || !access?.token) {
+        throw new Error(
+          "That code does not provide staff access."
+        );
+      }
+
+      state.staffToken = access.token;
+      state.staffExpiresAt = access.expiresAt || "";
+
+      sessionStorage.setItem(
+        "gsCommandCenterStaffToken",
+        state.staffToken
+      );
+
+      sessionStorage.setItem(
+        "gsCommandCenterStaffExpiresAt",
+        state.staffExpiresAt
+      );
+
+      el("staffCodeInput").value = "";
+
+      status.textContent = "Staff session connected.";
+      status.className = "dialog-status success";
+
+      settingsDialog.close();
+      restartTimer();
+
+      await loadData({ force: true });
+    } catch (error) {
+      clearStaffSession();
+
+      status.textContent = error.message;
+      status.className = "dialog-status error";
+    } finally {
+      el("connectButton").disabled = false;
+    }
   });
 
-  settingsDialog.showModal();
+  async function startCommandCenter() {
+    if (state.staffToken) {
+      try {
+        const session =
+          await request("/staff/session");
+
+        if (session?.mode === "staff") {
+          state.staffExpiresAt =
+            session.expiresAt || state.staffExpiresAt;
+
+          restartTimer();
+          await loadData({ force: true });
+          return;
+        }
+      } catch {
+        clearStaffSession();
+      }
+    }
+
+    settingsDialog.showModal();
+  }
+
+  startCommandCenter();
+
 })();

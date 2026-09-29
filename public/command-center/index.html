@@ -74,13 +74,21 @@
   <dialog id="settingsDialog">
     <form method="dialog" class="dialog-card">
       <h2>Connection</h2>
-      <p>The webhook secret is kept only in this browser tab and is never saved.</p>
+      <p>Sign in with the 4-digit staff code. The code is exchanged for a temporary staff session and is never stored.</p>
       <label>Render server URL
         <input id="apiBaseInput" type="url" value="https://good-shepherd-server-j06f.onrender.com">
       </label>
-      <label>WEBHOOK_SECRET
-        <input id="secretInput" type="password" autocomplete="off" placeholder="Paste secret">
+      <label>Staff 4-digit code
+        <input
+          id="staffCodeInput"
+          type="password"
+          inputmode="numeric"
+          maxlength="4"
+          pattern="[0-9]{4}"
+          autocomplete="off"
+          placeholder="4-digit code">
       </label>
+      <div id="connectionStatus" class="dialog-status muted">Staff access required.</div>
       <label>Refresh interval
         <select id="intervalInput">
           <option value="3000">3 seconds</option>
