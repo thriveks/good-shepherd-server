@@ -277,3 +277,61 @@ test("HTTP observability logs only safe request metadata", () => {
     /req\.query/
   );
 });
+
+test("resident-scoped staff queries preserve UUID index usage", () => {
+  const server = read("server.js");
+
+  assert.match(
+    server,
+    /const UUID_PATTERN/
+  );
+
+  const routes = [
+    ["/ai/human-presence-learning", "/ai/motion-events"],
+    ["/ai/motion-events", "/ai/action-logs"],
+    ["/ai/action-logs", "/cameras"],
+    ["/cameras", "/sensors"],
+    ["/sensors", "/resident-candidates"]
+  ];
+
+  for (const [startRoute, endRoute] of routes) {
+    const start = server.indexOf(
+      `app.get("${startRoute}"`
+    );
+
+    const end = server.indexOf(
+      `app.get("${endRoute}"`,
+      start + 1
+    );
+
+    assert.notEqual(start, -1);
+    assert.notEqual(end, -1);
+
+    const block = server.slice(start, end);
+
+    assert.doesNotMatch(
+      block,
+      /resident_id::text\s*=/
+    );
+
+    assert.match(
+      block,
+      /UUID_PATTERN\.test\(residentId\)/
+    );
+  }
+
+  assert.match(
+    server,
+    /authoritative_resident_id = \$1::uuid/
+  );
+
+  assert.match(
+    server,
+    /resident_id = \$2::uuid/
+  );
+
+  assert.match(
+    server,
+    /resident_id = \$3::uuid/
+  );
+});

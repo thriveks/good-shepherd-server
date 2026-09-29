@@ -74,6 +74,9 @@ const QRErrorCorrectLevel = require("./lib/qrcode/QRErrorCorrectLevel");
 const pbkdf2Async = promisify(pbkdf2);
 
 const app = express();
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 app.disable("x-powered-by");
 
 const TRUST_PROXY_HOPS = (() => {
@@ -10486,12 +10489,19 @@ app.get("/ai/human-presence-learning", async (req, res) => {
     }
     const residentId = cleanOptionalText(req.query.residentId);
 
+    if (residentId && !UUID_PATTERN.test(residentId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid residentId"
+      });
+    }
+
     const result = await pool.query(
       `
       WITH scoped AS (
         SELECT *
         FROM human_presence_behavioral_pattern_analyses
-        WHERE ($1::text IS NULL OR authoritative_resident_id::text = $1)
+        WHERE ($1::uuid IS NULL OR authoritative_resident_id = $1::uuid)
       ),
       grouped AS (
         SELECT
@@ -10632,10 +10642,17 @@ app.get("/ai/motion-events", async (req, res) => {
     const limit = Math.min(Math.max(requestedLimit, 1), 500);
     const residentId = cleanOptionalText(req.query.residentId);
 
+    if (residentId && !UUID_PATTERN.test(residentId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid residentId"
+      });
+    }
+
     const result = await pool.query(
       `
       ${motionEventSelectSQL()}
-      WHERE ($2::text IS NULL OR resident_id::text = $2)
+      WHERE ($2::uuid IS NULL OR resident_id = $2::uuid)
       ORDER BY timestamp DESC
       LIMIT $1
       `,
@@ -10666,10 +10683,17 @@ app.get("/ai/action-logs", async (req, res) => {
     const residentId = cleanOptionalText(req.query.residentId);
     const residentName = cleanOptionalText(req.query.residentName);
 
+    if (residentId && !UUID_PATTERN.test(residentId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid residentId"
+      });
+    }
+
     const result = await pool.query(
       `
       ${aiActionLogSelectSQL()}
-      WHERE ($2::text IS NULL OR resident_id::text = $2)
+      WHERE ($2::uuid IS NULL OR resident_id = $2::uuid)
         AND ($3::text IS NULL OR LOWER(TRIM(resident_name)) = LOWER(TRIM($3)))
       ORDER BY created_at DESC
       LIMIT $1
@@ -12221,12 +12245,19 @@ app.get("/cameras", async (req, res) => {
     const residentId = cleanText(req.query.residentId);
     const nodeId = cleanText(req.query.nodeId);
 
+    if (residentId && !UUID_PATTERN.test(residentId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid residentId"
+      });
+    }
+
     const result = await pool.query(
       `
       ${cameraSelectSQL()}
       WHERE ($1::boolean = TRUE OR is_deleted = FALSE)
         AND ($2::boolean = FALSE OR is_active = TRUE)
-        AND ($3::text IS NULL OR resident_id::text = $3)
+        AND ($3::uuid IS NULL OR resident_id = $3::uuid)
         AND ($4::text IS NULL OR assigned_node_id = $4)
       ORDER BY is_deleted ASC, source_name ASC, created_at ASC
       `,
@@ -12893,6 +12924,13 @@ app.get("/sensors", async (req, res) => {
     const residentId = cleanText(req.query.residentId);
     const nodeId = cleanText(req.query.nodeId);
 
+    if (residentId && !UUID_PATTERN.test(residentId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid residentId"
+      });
+    }
+
     const result = await pool.query(
       `
       ${sensorSelectSQL()}
@@ -12903,7 +12941,7 @@ app.get("/sensors", async (req, res) => {
           WHERE n.node_id = sensors.node_id
             AND n.is_archived = FALSE
         ))
-        AND ($3::text IS NULL OR resident_id::text = $3)
+        AND ($3::uuid IS NULL OR resident_id = $3::uuid)
         AND ($4::text IS NULL OR node_id = $4)
       ORDER BY is_deleted ASC, source_name ASC, created_at ASC
       `,
