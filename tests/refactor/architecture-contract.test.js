@@ -442,3 +442,17 @@ test("command center uses staff sessions instead of webhook secret", () => {
     /Staff 4-digit code/
   );
 });
+
+test("PostgreSQL pool enforces bounded query execution timeouts", () => {
+  const server = read("server.js");
+
+  assert.match(
+    server,
+    /statement_timeout:\s*runtimeConfig\.database\.statementTimeoutMs/
+  );
+
+  assert.match(
+    server,
+    /query_timeout:\s*runtimeConfig\.database\.queryTimeoutMs/
+  );
+});

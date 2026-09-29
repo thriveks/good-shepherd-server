@@ -36,6 +36,17 @@ function loadRuntimeConfig(env = process.env) {
     webhookSecret: cleanEnv(env.WEBHOOK_SECRET) || null,
     staffAccessCode: readFourDigitCode(env.STAFF_ACCESS_CODE),
 
+    database: {
+      statementTimeoutMs: readPositiveInteger(
+        env.DATABASE_STATEMENT_TIMEOUT_MS,
+        30000
+      ),
+      queryTimeoutMs: readPositiveInteger(
+        env.DATABASE_QUERY_TIMEOUT_MS,
+        35000
+      )
+    },
+
     mqtt: {
       enabled: readBoolean(env.MQTT_BRIDGE_ENABLED, true),
       host: cleanEnv(env.MQTT_HOST) || null,

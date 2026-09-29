@@ -53,3 +53,37 @@ test("valid production configuration has no startup issues", () => {
   assert.equal(config.mqtt.port, 8883);
   assert.deepEqual(runtimeConfigurationIssues(config), []);
 });
+
+test("database execution timeouts are bounded and configurable", () => {
+  const defaults = loadRuntimeConfig({
+    NODE_ENV: "test",
+    MQTT_BRIDGE_ENABLED: "false"
+  });
+
+  assert.equal(
+    defaults.database.statementTimeoutMs,
+    30000
+  );
+
+  assert.equal(
+    defaults.database.queryTimeoutMs,
+    35000
+  );
+
+  const configured = loadRuntimeConfig({
+    NODE_ENV: "test",
+    MQTT_BRIDGE_ENABLED: "false",
+    DATABASE_STATEMENT_TIMEOUT_MS: "45000",
+    DATABASE_QUERY_TIMEOUT_MS: "50000"
+  });
+
+  assert.equal(
+    configured.database.statementTimeoutMs,
+    45000
+  );
+
+  assert.equal(
+    configured.database.queryTimeoutMs,
+    50000
+  );
+});

@@ -275,6 +275,8 @@ const pool = new Pool({
   max: DATABASE_POOL_MAX,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+  statement_timeout: runtimeConfig.database.statementTimeoutMs,
+  query_timeout: runtimeConfig.database.queryTimeoutMs,
   keepAlive: true,
   application_name: "good-shepherd-server"
 });
