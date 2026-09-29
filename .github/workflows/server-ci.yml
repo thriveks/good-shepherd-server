@@ -1,0 +1,57 @@
+name: Server CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate server
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Run server tests
+        run: npm run test:refactor
+
+      - name: Validate runtime configuration
+        env:
+          NODE_ENV: test
+          MQTT_BRIDGE_ENABLED: "false"
+        run: npm run config:check
+
+      - name: Security audit
+        run: npm audit --omit=dev
+
+      - name: Whitespace safety
+        run: |
+          git diff --check
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          fi
