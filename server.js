@@ -90,6 +90,7 @@ app.set("trust proxy", TRUST_PROXY_HOPS);
 const runtimeConfig = loadRuntimeConfig();
 const PORT = runtimeConfig.port;
 const WEBHOOK_SECRET = runtimeConfig.webhookSecret;
+const SERVICE_API_SECRET = runtimeConfig.serviceApiSecret;
 let mqttV2Bridge = null;
 let activeHttpServer = null;
 let humanPresenceAdaptiveCaptureHandle = null;
@@ -4874,13 +4875,51 @@ function constantTimeTextEqual(firstValue, secondValue) {
   return first.length > 0 && timingSafeEqual(first, second);
 }
 
-function isAuthorizedServiceRequest(req) {
+function isAuthorizedDeviceSecretRequest(req) {
   if (!WEBHOOK_SECRET) {
     return runtimeConfig.isProduction === false;
   }
 
-  const incomingSecret = cleanText(req.header("x-webhook-secret"));
-  return constantTimeTextEqual(incomingSecret, WEBHOOK_SECRET);
+  const incomingSecret =
+    cleanText(req.header("x-webhook-secret"));
+
+  return constantTimeTextEqual(
+    incomingSecret,
+    WEBHOOK_SECRET
+  );
+}
+
+function isAuthorizedServiceRequest(req) {
+  if (SERVICE_API_SECRET) {
+    const incomingSecret =
+      cleanText(req.header("x-service-secret"));
+
+    return constantTimeTextEqual(
+      incomingSecret,
+      SERVICE_API_SECRET
+    );
+  }
+
+  // Staged-rollout compatibility:
+  //
+  // Until SERVICE_API_SECRET is explicitly configured,
+  // preserve the historical service-auth behavior so this
+  // server change can deploy without breaking existing
+  // internal callers.
+  //
+  // Once SERVICE_API_SECRET exists, this fallback is no
+  // longer reachable and WEBHOOK_SECRET becomes device-only.
+  if (!WEBHOOK_SECRET) {
+    return runtimeConfig.isProduction === false;
+  }
+
+  const incomingLegacySecret =
+    cleanText(req.header("x-webhook-secret"));
+
+  return constantTimeTextEqual(
+    incomingLegacySecret,
+    WEBHOOK_SECRET
+  );
 }
 
 async function isAuthorizedStaffOrServiceRequest(
@@ -4925,7 +4964,10 @@ function isAuthorizedSignedWebhook(req) {
     .update(req.rawWebhookBody)
     .digest("hex");
 
-  return constantTimeTextEqual(signatureText.toLowerCase(), expectedSignature);
+  return constantTimeTextEqual(
+    signatureText.toLowerCase(),
+    expectedSignature
+  );
 }
 
 function isAuthorizedWebhook(req) {
@@ -4937,10 +4979,12 @@ function isAuthorizedWebhook(req) {
     return isAuthorizedSignedWebhook(req);
   }
 
-  // Backward-compatible path for deployed devices while signed webhook
-  // authentication is rolled out. General staff/service APIs use the
-  // service-request check directly instead of pretending to be webhooks.
-  return isAuthorizedServiceRequest(req);
+  // Backward-compatible device path.
+  //
+  // WEBHOOK_SECRET now represents the device credential.
+  // It does not authorize broad service APIs once
+  // SERVICE_API_SECRET is configured.
+  return isAuthorizedDeviceSecretRequest(req);
 }
 
 async function requireAuthorizedRequest(req, res) {
@@ -4956,7 +5000,27 @@ async function requireAuthorizedRequest(req, res) {
   return true;
 }
 
+async function requireDeviceAuthorizedRequest(req, res) {
+  if (
+    isAuthorizedDeviceSecretRequest(req) ||
+    await isAuthorizedStaffOrServiceRequest(req)
+  ) {
+    return true;
+  }
+
+  res.status(401).json({
+    success: false,
+    error: "Unauthorized request"
+  });
+
+  return false;
+}
+
 async function requireFirmwareMetadataRequest(req, res) {
+  if (isAuthorizedDeviceSecretRequest(req)) {
+    return true;
+  }
+
   if (await isAuthorizedStaffOrServiceRequest(req)) {
     return true;
   }
@@ -13553,7 +13617,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
   let didBegin = false;
 
   try {
-    if (!(await requireAuthorizedRequest(req, res))) {
+    if (!(await requireDeviceAuthorizedRequest(req, res))) {
       return;
     }
 
@@ -13673,7 +13737,7 @@ const sensorCommandResultService = createSensorCommandResultService({
 
 app.post("/sensor-commands/:commandId/result", async (req, res) => {
   try {
-    if (!(await requireAuthorizedRequest(req, res))) {
+    if (!(await requireDeviceAuthorizedRequest(req, res))) {
       return;
     }
 

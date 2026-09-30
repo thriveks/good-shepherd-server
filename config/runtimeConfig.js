@@ -34,6 +34,7 @@ function loadRuntimeConfig(env = process.env) {
     port: readPositiveInteger(env.PORT, 3000),
 
     webhookSecret: cleanEnv(env.WEBHOOK_SECRET) || null,
+    serviceApiSecret: cleanEnv(env.SERVICE_API_SECRET) || null,
     staffAccessCode: readFourDigitCode(env.STAFF_ACCESS_CODE),
 
     database: {
