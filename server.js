@@ -9234,60 +9234,291 @@ app.get("/customer/check-ins", async (req, res) => {
 
 app.post("/customer/check-ins/:checkInId/respond", async (req, res) => {
   try {
-    const session = await requireCustomerSession(req, res); if (!session) return;
-    const responseCode = cleanText(req.body?.response);
-    const allowed = new Map([["safe","Resident confirmed safe"],["call_me","Resident requested a call"],["need_help","Resident requested help"]]);
-    if (!allowed.has(responseCode)) return res.status(400).json({ success:false, error:"Unsupported check-in response" });
-    const note = cleanText(req.body?.note);
-    const result = await pool.query(`
-      UPDATE resident_checkins SET status='responded',responded_at=NOW(),response_code=$3,response_note=$4
-      WHERE id=$1 AND resident_id=$2 AND responded_at IS NULL AND expires_at > NOW()
-      RETURNING id,resident_id AS "residentId",case_id AS "caseId",message,status,delivery_channel AS "deliveryChannel",
-                created_at AS "createdAt",sent_at AS "sentAt",responded_at AS "respondedAt",response_code AS "responseCode",
-                response_note AS "responseNote",expires_at AS "expiresAt"
-    `, [req.params.checkInId, session.residentId, responseCode, note || null]);
-    const checkIn = result.rows[0];
-    if (!checkIn) return res.status(404).json({ success:false, error:"This check-in is no longer active" });
-    if (checkIn.caseId) {
-      const responseLabel = allowed.get(responseCode);
-      await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,NULL,$3,'check_in_response',$4,$5,$6::jsonb)`, [
-        randomUUID(), checkIn.caseId, session.residentName, responseLabel, note || null, JSON.stringify({ checkInId:checkIn.id, responseCode })
-      ]);
+    const session = await requireCustomerSession(req, res);
+    if (!session) return;
 
-      // Resident responses are operational signals, not passive timeline notes.
-      // safe closes the current case; call_me elevates it to P2 contact-required;
-      // need_help elevates it immediately to P1. No case is auto-assigned here.
-      if (responseCode === 'safe') {
-        await pool.query(`
-          UPDATE monitoring_cases
-          SET status='resolved', resolved_at=NOW(), resolved_by_operator_id=NULL,
-              resolved_by_operator_name=$2, resolution=$3,
-              resident_response_code=$4, resident_response_label=$5, resident_response_at=NOW(), updated_at=NOW()
-          WHERE id=$1 AND status IN ('open','accepted','escalated')
-        `, [checkIn.caseId, session.residentName, note ? `Resident confirmed safe via check-in: ${note}` : 'Resident confirmed safe via check-in.', responseCode, responseLabel]);
-        await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,NULL,$3,'case_auto_resolved','Case satisfied by resident check-in',$4,$5::jsonb)`, [
-          randomUUID(), checkIn.caseId, session.residentName, note || 'Resident selected “I’m OK.”', JSON.stringify({ checkInId:checkIn.id, responseCode, automatic:true })
-        ]);
-      } else {
-        const priority = responseCode === 'need_help' ? 'P1' : 'P2';
-        await pool.query(`
-          UPDATE monitoring_cases
-          SET status='escalated', priority=$2, resident_response_code=$3, resident_response_label=$4,
-              resident_response_at=NOW(), updated_at=NOW()
-          WHERE id=$1 AND status IN ('open','accepted','escalated')
-        `, [checkIn.caseId, priority, responseCode, responseLabel]);
-        await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,NULL,$3,$4,$5,$6,$7::jsonb)`, [
-          randomUUID(), checkIn.caseId, session.residentName,
-          responseCode === 'need_help' ? 'resident_help_escalation' : 'resident_call_escalation',
-          responseCode === 'need_help' ? 'P1 — Resident requested help' : 'P2 — Resident requested a call',
-          note || null, JSON.stringify({ checkInId:checkIn.id, responseCode, priority, automatic:true })
-        ]);
-      }
+    const responseCode = cleanText(req.body?.response);
+
+    const allowed = new Map([
+      ["safe", "Resident confirmed safe"],
+      ["call_me", "Resident requested a call"],
+      ["need_help", "Resident requested help"]
+    ]);
+
+    if (!allowed.has(responseCode)) {
+      return res.status(400).json({
+        success: false,
+        error: "Unsupported check-in response"
+      });
     }
-    return res.json({ success:true, checkIn:customerCheckInPayload(checkIn) });
+
+    const note = cleanText(req.body?.note);
+
+    const checkIn = await withTransaction(
+      async (client) => {
+        const result = await client.query(
+          `
+            UPDATE resident_checkins
+            SET
+              status = 'responded',
+              responded_at = NOW(),
+              response_code = $3,
+              response_note = $4
+            WHERE
+              id = $1
+              AND resident_id = $2
+              AND responded_at IS NULL
+              AND expires_at > NOW()
+            RETURNING
+              id,
+              resident_id AS "residentId",
+              case_id AS "caseId",
+              message,
+              status,
+              delivery_channel AS "deliveryChannel",
+              created_at AS "createdAt",
+              sent_at AS "sentAt",
+              responded_at AS "respondedAt",
+              response_code AS "responseCode",
+              response_note AS "responseNote",
+              expires_at AS "expiresAt"
+          `,
+          [
+            req.params.checkInId,
+            session.residentId,
+            responseCode,
+            note || null
+          ]
+        );
+
+        const updatedCheckIn =
+          result.rows[0] || null;
+
+        if (!updatedCheckIn) {
+          return null;
+        }
+
+        if (updatedCheckIn.caseId) {
+          const responseLabel =
+            allowed.get(responseCode);
+
+          await client.query(
+            `
+              INSERT INTO monitoring_case_events (
+                id,
+                case_id,
+                operator_id,
+                operator_name,
+                event_type,
+                label,
+                note,
+                metadata
+              )
+              VALUES (
+                $1,
+                $2,
+                NULL,
+                $3,
+                'check_in_response',
+                $4,
+                $5,
+                $6::jsonb
+              )
+            `,
+            [
+              randomUUID(),
+              updatedCheckIn.caseId,
+              session.residentName,
+              responseLabel,
+              note || null,
+              JSON.stringify({
+                checkInId:
+                  updatedCheckIn.id,
+                responseCode
+              })
+            ]
+          );
+
+          // Resident responses are operational signals, not passive timeline
+          // notes. "safe" resolves the active case; "call_me" escalates to P2;
+          // "need_help" escalates immediately to P1. These writes intentionally
+          // share the same transaction as the resident_checkins update so a
+          // partial operational state cannot be committed.
+          if (responseCode === "safe") {
+            await client.query(
+              `
+                UPDATE monitoring_cases
+                SET
+                  status = 'resolved',
+                  resolved_at = NOW(),
+                  resolved_by_operator_id = NULL,
+                  resolved_by_operator_name = $2,
+                  resolution = $3,
+                  resident_response_code = $4,
+                  resident_response_label = $5,
+                  resident_response_at = NOW(),
+                  updated_at = NOW()
+                WHERE
+                  id = $1
+                  AND status IN (
+                    'open',
+                    'accepted',
+                    'escalated'
+                  )
+              `,
+              [
+                updatedCheckIn.caseId,
+                session.residentName,
+                note
+                  ? `Resident confirmed safe via check-in: ${note}`
+                  : "Resident confirmed safe via check-in.",
+                responseCode,
+                responseLabel
+              ]
+            );
+
+            await client.query(
+              `
+                INSERT INTO monitoring_case_events (
+                  id,
+                  case_id,
+                  operator_id,
+                  operator_name,
+                  event_type,
+                  label,
+                  note,
+                  metadata
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  NULL,
+                  $3,
+                  'case_auto_resolved',
+                  'Case satisfied by resident check-in',
+                  $4,
+                  $5::jsonb
+                )
+              `,
+              [
+                randomUUID(),
+                updatedCheckIn.caseId,
+                session.residentName,
+                note ||
+                  'Resident selected “I’m OK.”',
+                JSON.stringify({
+                  checkInId:
+                    updatedCheckIn.id,
+                  responseCode,
+                  automatic: true
+                })
+              ]
+            );
+          } else {
+            const priority =
+              responseCode === "need_help"
+                ? "P1"
+                : "P2";
+
+            await client.query(
+              `
+                UPDATE monitoring_cases
+                SET
+                  status = 'escalated',
+                  priority = $2,
+                  resident_response_code = $3,
+                  resident_response_label = $4,
+                  resident_response_at = NOW(),
+                  updated_at = NOW()
+                WHERE
+                  id = $1
+                  AND status IN (
+                    'open',
+                    'accepted',
+                    'escalated'
+                  )
+              `,
+              [
+                updatedCheckIn.caseId,
+                priority,
+                responseCode,
+                responseLabel
+              ]
+            );
+
+            await client.query(
+              `
+                INSERT INTO monitoring_case_events (
+                  id,
+                  case_id,
+                  operator_id,
+                  operator_name,
+                  event_type,
+                  label,
+                  note,
+                  metadata
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  NULL,
+                  $3,
+                  $4,
+                  $5,
+                  $6,
+                  $7::jsonb
+                )
+              `,
+              [
+                randomUUID(),
+                updatedCheckIn.caseId,
+                session.residentName,
+                responseCode === "need_help"
+                  ? "resident_help_escalation"
+                  : "resident_call_escalation",
+                responseCode === "need_help"
+                  ? "P1 — Resident requested help"
+                  : "P2 — Resident requested a call",
+                note || null,
+                JSON.stringify({
+                  checkInId:
+                    updatedCheckIn.id,
+                  responseCode,
+                  priority,
+                  automatic: true
+                })
+              ]
+            );
+          }
+        }
+
+        return updatedCheckIn;
+      }
+    );
+
+    if (!checkIn) {
+      return res.status(404).json({
+        success: false,
+        error: "This check-in is no longer active"
+      });
+    }
+
+    return res.json({
+      success: true,
+      checkIn:
+        customerCheckInPayload(checkIn)
+    });
   } catch (error) {
-    console.error("Customer check-in response failed:", error);
-    return res.status(500).json({ success:false, error:"Unable to record check-in response" });
+    console.error(
+      "Customer check-in response failed:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error:
+        "Unable to record check-in response"
+    });
   }
 });
 
