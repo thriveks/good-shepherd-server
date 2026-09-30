@@ -17,6 +17,8 @@ services:
           property: connectionString
       - key: WEBHOOK_SECRET
         sync: false
+      - key: SERVICE_API_SECRET
+        sync: false
       - key: STAFF_ACCESS_CODE
         sync: false
       - key: MQTT_BRIDGE_ENABLED
