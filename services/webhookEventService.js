@@ -1,6 +1,33 @@
 "use strict";
 
-const { randomUUID } = require("crypto");
+const { randomUUID, createHash } = require("crypto");
+
+function buildSignedWebhookReplayFingerprint(
+  timestampValue,
+  signatureValue
+) {
+  const timestampText =
+    String(timestampValue ?? "").trim();
+
+  const signatureText =
+    String(signatureValue ?? "")
+      .trim()
+      .replace(/^sha256=/i, "")
+      .toLowerCase();
+
+  if (
+    !timestampText ||
+    !/^[a-f0-9]{64}$/.test(signatureText)
+  ) {
+    return null;
+  }
+
+  return createHash("sha256")
+    .update(timestampText)
+    .update(".")
+    .update(signatureText)
+    .digest("hex");
+}
 
 class WebhookValidationError extends Error {
   constructor(message, statusCode = 400) {
@@ -34,7 +61,53 @@ function createWebhookEventService({
 }) {
   let acceptedWebhookCount = 0;
 
-  async function processWebhookEvent(body) {
+  async function findWebhookEventByRequestFingerprint(
+    requestFingerprint
+  ) {
+    if (!requestFingerprint) {
+      return null;
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        node_id AS "nodeId",
+        location_name AS "locationName",
+        source_key AS "sourceKey",
+        source_name AS "sourceName",
+        resident_name AS "residentName",
+        message,
+        alert_level AS "alertLevel",
+        time_text AS "timeText",
+        timestamp,
+        event_type AS "eventType",
+        sensor_type AS "sensorType",
+        event_payload AS "eventPayload"
+      FROM webhook_events
+      WHERE request_fingerprint = $1
+      LIMIT 1
+      `,
+      [requestFingerprint]
+    );
+
+    return result.rows[0] || null;
+  }
+
+  function duplicateWebhookResult(event) {
+    return {
+      duplicate: true,
+      event,
+      motionHistoryEvent: null,
+      resident: null,
+      sensor: null
+    };
+  }
+
+  async function processWebhookEvent(
+    body,
+    options = {}
+  ) {
     const {
       nodeId,
       locationName,
@@ -50,6 +123,30 @@ function createWebhookEventService({
 
     if (!message) {
       throw new WebhookValidationError("Missing required field: message");
+    }
+
+    const candidateRequestFingerprint =
+      cleanText(options.requestFingerprint)
+        .toLowerCase();
+
+    const requestFingerprint =
+      /^[a-f0-9]{64}$/.test(
+        candidateRequestFingerprint
+      )
+        ? candidateRequestFingerprint
+        : null;
+
+    if (requestFingerprint) {
+      const existingEvent =
+        await findWebhookEventByRequestFingerprint(
+          requestFingerprint
+        );
+
+      if (existingEvent) {
+        return duplicateWebhookResult(
+          existingEvent
+        );
+      }
     }
 
     const resolvedNodeId = cleanText(nodeId);
@@ -181,44 +278,75 @@ function createWebhookEventService({
       eventPayload: fullWebhookPayload
     };
 
-    await pool.query(
-      `
-      INSERT INTO webhook_events (
-        id,
-        node_id,
-        location_name,
-        source_key,
-        source_name,
-        resident_name,
-        message,
-        alert_level,
-        time_text,
-        timestamp,
-        event_type,
-        sensor_type,
-        event_payload,
-        acknowledged,
-        acknowledged_at,
-        resolution_note
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, FALSE, NULL, NULL)
-      `,
-      [
-        event.id,
-        event.nodeId,
-        event.locationName,
-        event.sourceKey,
-        event.sourceName,
-        event.residentName,
-        event.message,
-        event.alertLevel,
-        event.timeText,
-        event.timestamp,
-        event.eventType,
-        event.sensorType,
-        JSON.stringify(event.eventPayload)
-      ]
-    );
+    try {
+      await pool.query(
+        `
+        INSERT INTO webhook_events (
+          id,
+          node_id,
+          location_name,
+          source_key,
+          source_name,
+          resident_name,
+          message,
+          alert_level,
+          time_text,
+          timestamp,
+          event_type,
+          sensor_type,
+          event_payload,
+          acknowledged,
+          acknowledged_at,
+          resolution_note,
+          request_fingerprint
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7,
+          $8, $9, $10, $11, $12, $13::jsonb,
+          FALSE, NULL, NULL, $14
+        )
+        `,
+        [
+          event.id,
+          event.nodeId,
+          event.locationName,
+          event.sourceKey,
+          event.sourceName,
+          event.residentName,
+          event.message,
+          event.alertLevel,
+          event.timeText,
+          event.timestamp,
+          event.eventType,
+          event.sensorType,
+          JSON.stringify(event.eventPayload),
+          requestFingerprint
+        ]
+      );
+    } catch (error) {
+      /*
+       * The pre-check handles ordinary replay attempts.
+       * The unique index is the final concurrency barrier if two
+       * identical signed requests arrive at the same time.
+       */
+      if (
+        requestFingerprint &&
+        error?.code === "23505"
+      ) {
+        const existingEvent =
+          await findWebhookEventByRequestFingerprint(
+            requestFingerprint
+          );
+
+        if (existingEvent) {
+          return duplicateWebhookResult(
+            existingEvent
+          );
+        }
+      }
+
+      throw error;
+    }
 
     const motionHistoryEvent = await recordMotionHistoryEvent({
       event,
@@ -288,5 +416,6 @@ function createWebhookEventService({
 
 module.exports = {
   WebhookValidationError,
+  buildSignedWebhookReplayFingerprint,
   createWebhookEventService
 };

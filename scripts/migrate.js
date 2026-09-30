@@ -1,5 +1,10 @@
 "use strict";
 
+const webhookReplayFingerprintV1Migration =
+  require(
+    "./migrations/2026-09-30-webhook-replay-fingerprint-v1"
+  );
+
 const staffAppSessionsV1Migration =
   require(
     "./migrations/2026-09-28-staff-app-sessions-v1"
@@ -429,6 +434,11 @@ async function runMigrations() {
     await applyVersionedMigration(
       client,
       staffAppSessionsV1Migration
+    );
+
+    await applyVersionedMigration(
+      client,
+      webhookReplayFingerprintV1Migration
     );
 
     /*

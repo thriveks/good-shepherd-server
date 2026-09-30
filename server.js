@@ -30,6 +30,7 @@ const {
 
 const {
   WebhookValidationError,
+  buildSignedWebhookReplayFingerprint,
   createWebhookEventService
 } = require("./services/webhookEventService");
 
@@ -352,7 +353,8 @@ async function initializeDatabase() {
   );
 
   const requiredRuntimeMigrationVersions = [
-    "2026-09-28-staff-app-sessions-v1"
+    "2026-09-28-staff-app-sessions-v1",
+    "2026-09-30-webhook-replay-fingerprint-v1"
   ];
 
   const runtimeMigrationResult =
@@ -14289,11 +14291,26 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    const result = await webhookEventService.processWebhookEvent(req.body || {});
+    const requestFingerprint =
+      buildSignedWebhookReplayFingerprint(
+        req.header("x-webhook-timestamp"),
+        req.header("x-webhook-signature")
+      );
+
+    const result =
+      await webhookEventService.processWebhookEvent(
+        req.body || {},
+        {
+          requestFingerprint
+        }
+      );
 
     return res.status(200).json({
       success: true,
-      message: "Webhook event received",
+      message: result.duplicate
+        ? "Webhook event already received"
+        : "Webhook event received",
+      duplicate: result.duplicate === true,
       event: result.event,
       motionHistoryEvent: result.motionHistoryEvent,
       resident: result.resident,
