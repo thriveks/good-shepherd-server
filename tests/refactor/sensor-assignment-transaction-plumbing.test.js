@@ -94,24 +94,24 @@ test(
 );
 
 test(
-  "first-sensor route remains unchanged during transaction plumbing",
+  "first-sensor route activates the caller-owned transaction after plumbing",
   () => {
     const route =
       firstSensorRoute();
 
-    assert.doesNotMatch(
+    assert.match(
       route,
-      /\bwithTransaction\s*\(/
+      /await withTransaction\(/
     );
 
     assert.match(
       route,
-      /const assignment = await updateSensorAssignment\(\{/
+      /async \(client\) =>/
     );
 
-    assert.doesNotMatch(
+    assert.match(
       route,
-      /\},\s*client\s*\)/
+      /await updateSensorAssignment\([\s\S]*\},\s*client\s*\)/
     );
   }
 );

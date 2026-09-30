@@ -7995,9 +7995,6 @@ function clearFirstSensorClaimFailures(req) {
 }
 
 app.post("/customer/activate-first-sensor", async (req, res) => {
-  let createdResidentId = null;
-  let createdSessionTokenHash = null;
-
   try {
     if (firstSensorClaimRateLimited(req)) {
       return res.status(429).json({
@@ -8154,94 +8151,241 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
       });
     }
 
-    const accessCode = await generateUniqueResidentAccessCode();
-    createdResidentId = randomUUID();
+    const accessCode =
+      await generateUniqueResidentAccessCode();
 
-    const residentResult = await pool.query(
-      `
-      INSERT INTO residents (
-        id,
-        name,
-        location,
-        alert_level,
-        last_activity,
-        active_warnings,
-        status_text,
-        access_code,
-        is_deleted,
-        deleted_at,
-        created_at,
-        updated_at
-      )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        'Normal',
-        'Resident created during first sensor activation.',
-        0,
-        'Active monitoring',
-        $4,
-        FALSE,
-        NULL,
-        NOW(),
-        NOW()
-      )
-      RETURNING id, name, location
-      `,
-      [
-        createdResidentId,
-        residentName,
-        locationName,
-        accessCode
-      ]
-    );
+    const token =
+      randomBytes(32).toString("base64url");
 
-    const resident = residentResult.rows[0];
+    const sessionTokenHash =
+      hashSessionToken(token);
 
-    const token = randomBytes(32).toString("base64url");
-    createdSessionTokenHash = hashSessionToken(token);
     const expiresAt =
       new Date(
         Date.now() +
-        CUSTOMER_SESSION_DAYS * 24 * 60 * 60 * 1000
+        CUSTOMER_SESSION_DAYS *
+          24 *
+          60 *
+          60 *
+          1000
       );
 
-    await pool.query(
-      `
-      INSERT INTO customer_sessions (
-        token_hash,
-        resident_id,
-        expires_at
-      )
-      VALUES ($1, $2, $3)
-      `,
-      [
-        createdSessionTokenHash,
-        resident.id,
-        expiresAt.toISOString()
-      ]
+    const {
+      resident,
+      assignment
+    } = await withTransaction(
+      async (client) => {
+        /*
+         * Serialize first-home ownership claims for the physical node.
+         * This closes the race where two requests could both observe an
+         * unassigned sensor and create separate resident households.
+         */
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1))",
+          [
+            `first-sensor-claim:${nodeId}`
+          ]
+        );
+
+        /*
+         * Revalidate the exact physical node and BLE setup identity
+         * after obtaining the claim lock. The 90-second registration
+         * wait intentionally remains outside this transaction.
+         */
+        const lockedNodeResult =
+          await client.query(
+            `
+            SELECT
+              node_id AS "nodeId",
+              setup_id AS "setupId",
+              is_archived AS "isArchived"
+            FROM nodes
+            WHERE node_id = $1
+            FOR UPDATE
+            `,
+            [nodeId]
+          );
+
+        const lockedNode =
+          lockedNodeResult.rows[0] || null;
+
+        const lockedSetupId =
+          cleanText(
+            lockedNode?.setupId
+          ).toUpperCase();
+
+        if (
+          !lockedNode ||
+          lockedNode.isArchived ||
+          lockedSetupId !== setupId
+        ) {
+          recordFirstSensorClaimFailure(req);
+
+          throw httpError(
+            404,
+            "The nearby sensor could not be verified"
+          );
+        }
+
+        const lockedSensorResult =
+          await client.query(
+            `
+            ${sensorSelectSQL()}
+            WHERE node_id = $1
+              AND is_deleted = FALSE
+            ORDER BY created_at ASC
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [nodeId]
+          );
+
+        const lockedSensor =
+          lockedSensorResult.rows[0] ||
+          null;
+
+        const lockedSensorHasResident =
+          lockedSensor &&
+          (
+            cleanOptionalText(
+              lockedSensor.residentId
+            ) ||
+            (
+              cleanText(
+                lockedSensor.residentName
+              ) &&
+              cleanText(
+                lockedSensor.residentName
+              ).toLowerCase() !==
+                "unassigned"
+            )
+          );
+
+        if (lockedSensorHasResident) {
+          recordFirstSensorClaimFailure(req);
+
+          throw httpError(
+            409,
+            "This sensor has already been activated"
+          );
+        }
+
+        const residentId =
+          randomUUID();
+
+        const residentResult =
+          await client.query(
+            `
+            INSERT INTO residents (
+              id,
+              name,
+              location,
+              alert_level,
+              last_activity,
+              active_warnings,
+              status_text,
+              access_code,
+              is_deleted,
+              deleted_at,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              $1,
+              $2,
+              $3,
+              'Normal',
+              'Resident created during first sensor activation.',
+              0,
+              'Active monitoring',
+              $4,
+              FALSE,
+              NULL,
+              NOW(),
+              NOW()
+            )
+            RETURNING id, name, location
+            `,
+            [
+              residentId,
+              residentName,
+              locationName,
+              accessCode
+            ]
+          );
+
+        const resident =
+          residentResult.rows[0];
+
+        await client.query(
+          `
+          INSERT INTO customer_sessions (
+            token_hash,
+            resident_id,
+            expires_at
+          )
+          VALUES ($1, $2, $3)
+          `,
+          [
+            sessionTokenHash,
+            resident.id,
+            expiresAt.toISOString()
+          ]
+        );
+
+        const sensorMode =
+          cleanText(
+            node.sensorMode
+          ) ||
+          null;
+
+        const sensorType =
+          cleanText(
+            lockedSensor?.sensorType
+          ) ||
+          cleanText(
+            node.healthSensorType
+          ) ||
+          cleanText(
+            node.nodeName
+          ) ||
+          null;
+
+        const assignment =
+          await updateSensorAssignment(
+            {
+              nodeId,
+              residentId:
+                resident.id,
+              residentName:
+                resident.name,
+              locationName:
+                resident.location,
+              roomName,
+              sourceKey:
+                lockedSensor?.sourceKey ||
+                null,
+              sensorType,
+              sensorMode
+            },
+            client
+          );
+
+        return {
+          resident,
+          assignment
+        };
+      }
     );
 
-    const sensorMode =
-      cleanText(node.sensorMode) ||
-      null;
-
-    const sensorType =
-      cleanText(existingSensor?.sensorType) ||
-      cleanText(node.healthSensorType) ||
-      cleanText(node.nodeName) ||
-      null;
-
-    const assignment = await updateSensorAssignment({
-      nodeId,
+    /*
+     * updateSensorAssignment suppresses cache invalidation when it joins
+     * a caller-owned transaction. Refresh only after the outer transaction
+     * has committed successfully.
+     */
+    scheduleAIDashboardRefresh({
       residentId: resident.id,
-      residentName: resident.name,
-      locationName: resident.location,
-      roomName,
-      sourceKey: existingSensor?.sourceKey || null,
-      sensorType,
-      sensorMode
+      reason: "sensor_assignment_changed"
     });
 
     clearFirstSensorClaimFailures(req);
@@ -8259,38 +8403,6 @@ app.post("/customer/activate-first-sensor", async (req, res) => {
     });
   } catch (error) {
     console.error("First sensor activation failed:", error);
-
-    if (createdSessionTokenHash) {
-      await pool.query(
-        `DELETE FROM customer_sessions WHERE token_hash = $1`,
-        [createdSessionTokenHash]
-      ).catch((cleanupError) => {
-        console.warn(
-          "First sensor activation session cleanup failed:",
-          cleanupError?.message || cleanupError
-        );
-      });
-    }
-
-    if (createdResidentId) {
-      await pool.query(
-        `
-        DELETE FROM residents r
-        WHERE r.id = $1
-          AND NOT EXISTS (
-            SELECT 1
-            FROM sensors s
-            WHERE s.resident_id = r.id
-          )
-        `,
-        [createdResidentId]
-      ).catch((cleanupError) => {
-        console.warn(
-          "First sensor activation resident cleanup failed:",
-          cleanupError?.message || cleanupError
-        );
-      });
-    }
 
     return res.status(error.statusCode || 500).json({
       success: false,
