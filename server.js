@@ -4066,10 +4066,10 @@ function closeAIStreamClients() {
   customerAIStreamClients.clear();
 }
 
-async function incrementResidentDailyActivity({ resident, event, sensor }) {
+async function incrementResidentDailyActivity({ resident, event, sensor }, queryable = pool) {
   if (!resident?.id || !isPhysicalMotionEventRow(event)) return;
   const roomName = cleanText(sensor?.roomName) || inferRoomNameFromSourceName(event.sourceName) || 'Unknown room';
-  await pool.query(
+  await queryable.query(
     `
     INSERT INTO resident_activity_daily (
       resident_id, activity_date, motion_count, first_motion_at, last_motion_at, room_counts, hourly_counts, updated_at
@@ -5729,8 +5729,8 @@ function humanPresenceFirmwareReleaseSelectSQL() {
   `;
 }
 
-async function getDeviceMapping(sourceKey) {
-  const result = await pool.query(
+async function getDeviceMapping(sourceKey, queryable = pool) {
+  const result = await queryable.query(
     `
     SELECT
       source_key AS "sourceKey",
@@ -5779,8 +5779,8 @@ async function getNodeById(nodeId) {
   return result.rows[0] || null;
 }
 
-async function getResidentById(residentId) {
-  const result = await pool.query(
+async function getResidentById(residentId, queryable = pool) {
+  const result = await queryable.query(
     `
     ${residentSelectSQL()}
     WHERE id = $1
@@ -5792,7 +5792,7 @@ async function getResidentById(residentId) {
   return result.rows[0] || null;
 }
 
-async function getExistingSensorForDeviceIdentity({ sourceKey, nodeId }) {
+async function getExistingSensorForDeviceIdentity({ sourceKey, nodeId }, queryable = pool) {
   const resolvedSourceKey = cleanText(sourceKey);
   const resolvedNodeId = cleanText(nodeId);
   const lookupSourceKey = isEsp32NodeId(resolvedNodeId) ? "" : resolvedSourceKey;
@@ -5801,7 +5801,7 @@ async function getExistingSensorForDeviceIdentity({ sourceKey, nodeId }) {
     return null;
   }
 
-  const result = await pool.query(
+  const result = await queryable.query(
     `
     ${sensorSelectSQL()}
     WHERE is_deleted = FALSE
@@ -6056,14 +6056,14 @@ async function upsertNodeFromRegistration({
   return result.rows[0];
 }
 
-async function touchNodeFromWebhook(nodeId) {
+async function touchNodeFromWebhook(nodeId, queryable = pool) {
   const resolvedNodeId = cleanText(nodeId);
 
   if (!resolvedNodeId) {
     return null;
   }
 
-  const result = await pool.query(
+  const result = await queryable.query(
     `
     INSERT INTO nodes (
       node_id,
@@ -6596,7 +6596,7 @@ async function createCommand({ nodeId, commandType, payload, requestedBy }) {
   return result.rows[0];
 }
 
-async function findOrCreateResidentFromEvent({ residentName, locationName, alertLevel, message }) {
+async function findOrCreateResidentFromEvent({ residentName, locationName, alertLevel, message }, queryable = pool) {
   const name = cleanText(residentName);
   const location = cleanText(locationName) || "Unassigned location";
   const normalizedAlertLevel = normalizeAlertLevel(alertLevel);
@@ -6607,7 +6607,7 @@ async function findOrCreateResidentFromEvent({ residentName, locationName, alert
     return null;
   }
 
-  const existing = await pool.query(
+  const existing = await queryable.query(
     `
     ${residentSelectSQL()}
     WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
@@ -6643,7 +6643,7 @@ async function findOrCreateResidentFromEvent({ residentName, locationName, alert
   }
 
   if (existingResident) {
-    const result = await pool.query(
+    const result = await queryable.query(
       `
       UPDATE residents
       SET
@@ -6685,7 +6685,7 @@ async function findOrCreateResidentFromEvent({ residentName, locationName, alert
     return result.rows[0];
   }
 
-  const result = await pool.query(
+  const result = await queryable.query(
     `
     INSERT INTO residents (
       id,
@@ -7055,12 +7055,12 @@ async function upsertSensorFromEvent({
   return result.rows[0];
 }
 
-async function recordMotionHistoryEvent({ event, resident, sensor }) {
+async function recordMotionHistoryEvent({ event, resident, sensor }, queryable = pool) {
   if (!isPhysicalMotionEventRow(event)) {
     return null;
   }
 
-  const result = await pool.query(
+  const result = await queryable.query(
     `
     INSERT INTO motion_events (
       id,
