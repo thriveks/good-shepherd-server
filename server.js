@@ -6854,7 +6854,7 @@ async function upsertSensorFromEvent({
   forceUnassigned = false,
   allowDeviceBootstrap = false,
   assignmentPayload = null
-}) {
+}, queryable = null) {
   const resolvedSourceKey = cleanText(sourceKey);
 
   if (!resolvedSourceKey) {
@@ -6874,9 +6874,12 @@ async function upsertSensorFromEvent({
     : inferRoomNameFromSourceName(resolvedSourceName);
 
   if (isEsp32NodeId(nodeId)) {
-    const client = await pool.connect();
+    const ownsTransaction = !queryable;
+    const client = queryable || await pool.connect();
     try {
-      await client.query("BEGIN");
+      if (ownsTransaction) {
+        await client.query("BEGIN");
+      }
       const identity = await resolveCanonicalEsp32Sensor(client, {
         nodeId,
         reportedSourceKey: resolvedSourceKey
@@ -6990,17 +6993,23 @@ async function upsertSensorFromEvent({
           });
         }
       }
-      await client.query("COMMIT");
+      if (ownsTransaction) {
+        await client.query("COMMIT");
+      }
       return canonical;
     } catch (error) {
-      await client.query("ROLLBACK");
+      if (ownsTransaction) {
+        await client.query("ROLLBACK");
+      }
       throw error;
     } finally {
-      client.release();
+      if (ownsTransaction) {
+        client.release();
+      }
     }
   }
 
-  const result = await pool.query(
+  const result = await (queryable || pool).query(
     `
     INSERT INTO sensors (
       id,

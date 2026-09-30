@@ -108,7 +108,7 @@ test(
 );
 
 test(
-  "ESP32 sensor upsert still owns its existing transaction in plumbing phase",
+  "ESP32 sensor upsert can either own or join a transaction",
   () => {
     const start =
       server.indexOf(
@@ -129,22 +129,42 @@ test(
 
     assert.match(
       block,
-      /const client = await pool\.connect\(\)/
+      /}, queryable = null\) \{/
     );
 
     assert.match(
       block,
-      /client\.query\("BEGIN"\)/
+      /const ownsTransaction = !queryable/
     );
 
     assert.match(
       block,
-      /client\.query\("COMMIT"\)/
+      /const client = queryable \|\| await pool\.connect\(\)/
     );
 
     assert.match(
       block,
-      /client\.query\("ROLLBACK"\)/
+      /if \(ownsTransaction\) \{[\s\S]*client\.query\("BEGIN"\)/
+    );
+
+    assert.match(
+      block,
+      /if \(ownsTransaction\) \{[\s\S]*client\.query\("COMMIT"\)/
+    );
+
+    assert.match(
+      block,
+      /if \(ownsTransaction\) \{[\s\S]*client\.query\("ROLLBACK"\)/
+    );
+
+    assert.match(
+      block,
+      /if \(ownsTransaction\) \{[\s\S]*client\.release\(\)/
+    );
+
+    assert.match(
+      block,
+      /\(queryable \|\| pool\)\.query\s*\(/
     );
   }
 );
