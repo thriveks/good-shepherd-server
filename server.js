@@ -10298,58 +10298,438 @@ app.post("/monitoring/api/cases/:caseId/handoff/cancel", async (req, res) => {
 
 app.post("/monitoring/api/cases/:caseId/check-ins", async (req, res) => {
   try {
-    const operator = await requireMonitoringOperator(req, res); if (!operator) return;
-    const found = await pool.query(`SELECT id,resident_id AS "residentId",resident_name AS "residentName",status,assigned_operator_id AS "assignedOperatorId" FROM monitoring_cases WHERE id=$1 LIMIT 1`, [req.params.caseId]);
-    const incident = found.rows[0];
-    if (!incident) return res.status(404).json({ success:false, error:"Case not found" });
-    if (!['open','accepted','escalated'].includes(incident.status)) return res.status(409).json({ success:false, error:"This case is already closed" });
-    if (!incident.assignedOperatorId || String(incident.assignedOperatorId) !== String(operator.id)) return res.status(409).json({ success:false, error:"Accept this case before sending a check-in" });
-    const message = cleanText(req.body?.message) || "Good Shepherd is checking in. Are you okay?";
-    const checkInId = randomUUID();
-    await pool.query(`INSERT INTO resident_checkins (id,resident_id,case_id,created_by_operator_id,created_by_operator_name,message,status,delivery_channel) VALUES ($1,$2,$3,$4,$5,$6,'pending','in_app')`, [checkInId,incident.residentId,incident.id,operator.id,operator.displayName,message]);
+    const operator =
+      await requireMonitoringOperator(
+        req,
+        res
+      );
 
-    const devices = await pool.query(`SELECT device_token AS "deviceToken",apns_environment AS "apnsEnvironment" FROM customer_push_devices WHERE resident_id=$1 AND is_active=TRUE ORDER BY last_seen_at DESC LIMIT 10`, [incident.residentId]);
+    if (!operator) return;
+
+    const message =
+      cleanText(req.body?.message) ||
+      "Good Shepherd is checking in. Are you okay?";
+
+    const checkInId =
+      randomUUID();
+
+    // Phase 1 creates a durable check-in intent before any external APNs
+    // side effect occurs. Case validation, check-in creation, and device
+    // discovery share one short database transaction.
+    const intent =
+      await withTransaction(
+        async (client) => {
+          const found =
+            await client.query(
+              `
+                SELECT
+                  id,
+                  resident_id AS "residentId",
+                  resident_name AS "residentName",
+                  status,
+                  assigned_operator_id AS "assignedOperatorId"
+                FROM monitoring_cases
+                WHERE id = $1
+                LIMIT 1
+                FOR UPDATE
+              `,
+              [
+                req.params.caseId
+              ]
+            );
+
+          const incident =
+            found.rows[0];
+
+          if (!incident) {
+            throw httpError(
+              404,
+              "Case not found",
+              "MONITORING_CASE_NOT_FOUND"
+            );
+          }
+
+          if (
+            ![
+              "open",
+              "accepted",
+              "escalated"
+            ].includes(
+              incident.status
+            )
+          ) {
+            throw httpError(
+              409,
+              "This case is already closed",
+              "MONITORING_CASE_CLOSED"
+            );
+          }
+
+          if (
+            !incident.assignedOperatorId ||
+            String(
+              incident.assignedOperatorId
+            ) !== String(operator.id)
+          ) {
+            throw httpError(
+              409,
+              "Accept this case before sending a check-in",
+              "MONITORING_CASE_NOT_ASSIGNED"
+            );
+          }
+
+          await client.query(
+            `
+              INSERT INTO resident_checkins (
+                id,
+                resident_id,
+                case_id,
+                created_by_operator_id,
+                created_by_operator_name,
+                message,
+                status,
+                delivery_channel
+              )
+              VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                'pending',
+                'in_app'
+              )
+            `,
+            [
+              checkInId,
+              incident.residentId,
+              incident.id,
+              operator.id,
+              operator.displayName,
+              message
+            ]
+          );
+
+          const devices =
+            await client.query(
+              `
+                SELECT
+                  device_token AS "deviceToken",
+                  apns_environment AS "apnsEnvironment"
+                FROM customer_push_devices
+                WHERE
+                  resident_id = $1
+                  AND is_active = TRUE
+                ORDER BY last_seen_at DESC
+                LIMIT 10
+              `,
+              [
+                incident.residentId
+              ]
+            );
+
+          return {
+            incident,
+            devices:
+              devices.rows
+          };
+        }
+      );
+
+    // External network work must remain outside the PostgreSQL transaction.
+    // If APNs succeeds, the check-in already exists durably and the push can
+    // never point to a record that was rolled back.
     let pushDelivered = false;
     const deliveryResults = [];
-    if (devices.rows.length && apnsConfiguration().configured) {
-      const payload = {
-        aps: { alert: { title:"Good Shepherd Check-In", body:message }, sound:"default", category:"GOOD_SHEPHERD_CHECKIN" },
-        checkInId,
-        residentId:incident.residentId,
-        type:"resident_check_in"
-      };
-      const results = await Promise.all(devices.rows.map(async ({deviceToken,apnsEnvironment}) => ({
-        deviceToken,
-        apnsEnvironment: normalizeApnsEnvironment(apnsEnvironment),
-        result: await sendApnsNotification(deviceToken,payload,apnsEnvironment)
-      })));
-      pushDelivered = results.some(({result}) => result.delivered);
-      deliveryResults.push(...results.map(({apnsEnvironment,result}) => ({
-        delivered:result.delivered,
-        status:result.status || null,
-        reason:result.reason || null,
-        environment:apnsEnvironment
-      })));
 
-      // Apple explicitly tells us when a token has expired. Disable only those
-      // tokens; transport/configuration failures remain active for retry.
-      const expiredTokens = results.filter(({result}) => result.reason === "Unregistered").map(({deviceToken,apnsEnvironment}) => [deviceToken,apnsEnvironment]);
-      for (const [expiredToken, expiredEnvironment] of expiredTokens) {
-        await pool.query(`UPDATE customer_push_devices SET is_active=FALSE,updated_at=NOW() WHERE device_token=$1 AND apns_environment=$2`, [expiredToken,expiredEnvironment]);
-      }
+    if (
+      intent.devices.length &&
+      apnsConfiguration().configured
+    ) {
+      const payload = {
+        aps: {
+          alert: {
+            title:
+              "Good Shepherd Check-In",
+            body:
+              message
+          },
+          sound:
+            "default",
+          category:
+            "GOOD_SHEPHERD_CHECKIN"
+        },
+
+        checkInId,
+
+        residentId:
+          intent.incident.residentId,
+
+        type:
+          "resident_check_in"
+      };
+
+      const results =
+        await Promise.all(
+          intent.devices.map(
+            async ({
+              deviceToken,
+              apnsEnvironment
+            }) => ({
+              deviceToken,
+
+              apnsEnvironment:
+                normalizeApnsEnvironment(
+                  apnsEnvironment
+                ),
+
+              result:
+                await sendApnsNotification(
+                  deviceToken,
+                  payload,
+                  apnsEnvironment
+                )
+            })
+          )
+        );
+
+      pushDelivered =
+        results.some(
+          ({ result }) =>
+            result.delivered
+        );
+
+      deliveryResults.push(
+        ...results.map(
+          ({
+            apnsEnvironment,
+            result
+          }) => ({
+            delivered:
+              result.delivered,
+
+            status:
+              result.status || null,
+
+            reason:
+              result.reason || null,
+
+            environment:
+              apnsEnvironment
+          })
+        )
+      );
+
+      intent.expiredTokens =
+        results
+          .filter(
+            ({ result }) =>
+              result.reason ===
+              "Unregistered"
+          )
+          .map(
+            ({
+              deviceToken,
+              apnsEnvironment
+            }) => [
+              deviceToken,
+              apnsEnvironment
+            ]
+          );
+    } else {
+      intent.expiredTokens = [];
     }
-    const deliveryChannel = pushDelivered ? 'apns+in_app' : 'in_app';
-    const status = pushDelivered ? 'sent' : 'pending';
-    await pool.query(`UPDATE resident_checkins SET status=$2,delivery_channel=$3,sent_at=CASE WHEN $2='sent' THEN NOW() ELSE sent_at END WHERE id=$1`, [checkInId,status,deliveryChannel]);
-    await pool.query(`INSERT INTO monitoring_case_events (id,case_id,operator_id,operator_name,event_type,label,note,metadata) VALUES ($1,$2,$3,$4,'check_in_sent','Check-in sent',$5,$6::jsonb)`, [
-      randomUUID(),incident.id,operator.id,operator.displayName,pushDelivered ? 'Push notification and in-app check-in created.' : 'In-app check-in created; push delivery is not currently available.', JSON.stringify({checkInId,deliveryChannel,pushDelivered,deviceCount:devices.rows.length,deliveryResults})
-    ]);
-    await pool.query(`UPDATE monitoring_cases SET updated_at=NOW() WHERE id=$1`, [incident.id]);
-    await writeMonitoringAudit(operator, req, "check_in_sent", "case", incident.id, { checkInId, residentId:incident.residentId, deliveryChannel, pushDelivered, deviceCount:devices.rows.length });
-    return res.status(201).json({ success:true, checkIn:{ id:checkInId, residentId:incident.residentId, caseId:incident.id, message, status, deliveryChannel, pushDelivered } });
+
+    const deliveryChannel =
+      pushDelivered
+        ? "apns+in_app"
+        : "in_app";
+
+    const status =
+      pushDelivered
+        ? "sent"
+        : "pending";
+
+    // Phase 2 atomically records the complete database outcome after the
+    // external APNs attempt. No partial case event/audit/check-in-finalization
+    // state can commit.
+    await withTransaction(
+      async (client) => {
+        for (
+          const [
+            expiredToken,
+            expiredEnvironment
+          ] of intent.expiredTokens
+        ) {
+          await client.query(
+            `
+              UPDATE customer_push_devices
+              SET
+                is_active = FALSE,
+                updated_at = NOW()
+              WHERE
+                device_token = $1
+                AND apns_environment = $2
+            `,
+            [
+              expiredToken,
+              expiredEnvironment
+            ]
+          );
+        }
+
+        await client.query(
+          `
+            UPDATE resident_checkins
+            SET
+              status =
+                CASE
+                  WHEN responded_at IS NULL
+                    THEN $2
+                  ELSE status
+                END,
+              delivery_channel = $3,
+              sent_at =
+                CASE
+                  WHEN $2 = 'sent'
+                    THEN COALESCE(
+                      sent_at,
+                      NOW()
+                    )
+                  ELSE sent_at
+                END
+            WHERE id = $1
+          `,
+          [
+            checkInId,
+            status,
+            deliveryChannel
+          ]
+        );
+
+        await client.query(
+          `
+            INSERT INTO monitoring_case_events (
+              id,
+              case_id,
+              operator_id,
+              operator_name,
+              event_type,
+              label,
+              note,
+              metadata
+            )
+            VALUES (
+              $1,
+              $2,
+              $3,
+              $4,
+              'check_in_sent',
+              'Check-in sent',
+              $5,
+              $6::jsonb
+            )
+          `,
+          [
+            randomUUID(),
+            intent.incident.id,
+            operator.id,
+            operator.displayName,
+
+            pushDelivered
+              ? "Push notification and in-app check-in created."
+              : "In-app check-in created; push delivery is not currently available.",
+
+            JSON.stringify({
+              checkInId,
+              deliveryChannel,
+              pushDelivered,
+              deviceCount:
+                intent.devices.length,
+              deliveryResults
+            })
+          ]
+        );
+
+        await client.query(
+          `
+            UPDATE monitoring_cases
+            SET updated_at = NOW()
+            WHERE id = $1
+          `,
+          [
+            intent.incident.id
+          ]
+        );
+
+        await writeMonitoringAudit(
+          operator,
+          req,
+          "check_in_sent",
+          "case",
+          intent.incident.id,
+          {
+            checkInId,
+
+            residentId:
+              intent.incident.residentId,
+
+            deliveryChannel,
+            pushDelivered,
+
+            deviceCount:
+              intent.devices.length
+          },
+          client
+        );
+      }
+    );
+
+    return res.status(201).json({
+      success: true,
+
+      checkIn: {
+        id:
+          checkInId,
+
+        residentId:
+          intent.incident.residentId,
+
+        caseId:
+          intent.incident.id,
+
+        message,
+        status,
+        deliveryChannel,
+        pushDelivered
+      }
+    });
   } catch (error) {
-    console.error("Monitoring check-in send failed:", error);
-    return res.status(500).json({ success:false, error:"Failed to send resident check-in" });
+    console.error(
+      "Monitoring check-in send failed:",
+      error
+    );
+
+    return res
+      .status(
+        error.statusCode || 500
+      )
+      .json({
+        success: false,
+
+        error:
+          error.statusCode
+            ? error.message
+            : "Failed to send resident check-in",
+
+        ...(error.code
+          ? {
+              code:
+                error.code
+            }
+          : {})
+      });
   }
 });
 
