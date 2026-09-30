@@ -7293,19 +7293,22 @@ async function clearStaleSensorAssignmentsForNode(client, { nodeId, sourceKey, k
   return result.rows.length;
 }
 
-async function updateSensorAssignment({ nodeId, residentId, residentName, locationName, roomName, sourceName, sourceKey, sensorType, sensorMode }) {
+async function updateSensorAssignment({ nodeId, residentId, residentName, locationName, roomName, sourceName, sourceKey, sensorType, sensorMode }, queryable = null) {
   const resolvedNodeId = cleanText(nodeId);
 
   if (!resolvedNodeId) {
     throw new Error("Missing required field: nodeId");
   }
 
-  const client = await pool.connect();
+  const ownsTransaction = !queryable;
+  const client = queryable || await pool.connect();
   let didBegin = false;
 
   try {
-    await client.query("BEGIN");
-    didBegin = true;
+    if (ownsTransaction) {
+      await client.query("BEGIN");
+      didBegin = true;
+    }
 
     const resident = await findResidentForSensorAssignment(client, {
       residentId,
@@ -7531,8 +7534,10 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
       ]
     );
 
-    await client.query("COMMIT");
-    didBegin = false;
+    if (ownsTransaction) {
+      await client.query("COMMIT");
+      didBegin = false;
+    }
 
     const affectedResidentIds = new Set(
       [
@@ -7541,14 +7546,16 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
       ].filter(Boolean)
     );
 
-    if (affectedResidentIds.size === 0) {
-      scheduleAIDashboardRefresh();
-    } else {
-      for (const affectedResidentId of affectedResidentIds) {
-        scheduleAIDashboardRefresh({
-          residentId: affectedResidentId,
-          reason: "sensor_assignment_changed"
-        });
+    if (ownsTransaction) {
+      if (affectedResidentIds.size === 0) {
+        scheduleAIDashboardRefresh();
+      } else {
+        for (const affectedResidentId of affectedResidentIds) {
+          scheduleAIDashboardRefresh({
+            residentId: affectedResidentId,
+            reason: "sensor_assignment_changed"
+          });
+        }
       }
     }
 
@@ -7564,7 +7571,9 @@ async function updateSensorAssignment({ nodeId, residentId, residentName, locati
 
     throw error;
   } finally {
-    client.release();
+    if (ownsTransaction) {
+      client.release();
+    }
   }
 }
 
