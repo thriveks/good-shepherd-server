@@ -257,6 +257,10 @@
   ],
   [
     "POST",
+    "/customer/first-sensor-readiness"
+  ],
+  [
+    "POST",
     "/customer/logout"
   ],
   [

@@ -7994,6 +7994,171 @@ function clearFirstSensorClaimFailures(req) {
   firstSensorClaimAttempts.delete(firstSensorClaimKey(req));
 }
 
+const firstSensorReadinessChecks = new Map();
+const FIRST_SENSOR_READINESS_WINDOW_MS = 60 * 1000;
+const FIRST_SENSOR_READINESS_MAX_CHECKS = 40;
+
+function firstSensorReadinessRateLimited(req) {
+  const key = firstSensorClaimKey(req);
+  const now = Date.now();
+
+  pruneExpiredAttemptEntries(
+    firstSensorReadinessChecks,
+    FIRST_SENSOR_READINESS_WINDOW_MS,
+    now
+  );
+
+  const prior = firstSensorReadinessChecks.get(key);
+
+  if (
+    !prior ||
+    now - prior.startedAt >= FIRST_SENSOR_READINESS_WINDOW_MS
+  ) {
+    firstSensorReadinessChecks.set(
+      key,
+      {
+        startedAt: now,
+        attempts: 1
+      }
+    );
+
+    return false;
+  }
+
+  if (prior.attempts >= FIRST_SENSOR_READINESS_MAX_CHECKS) {
+    return true;
+  }
+
+  prior.attempts += 1;
+  firstSensorReadinessChecks.set(key, prior);
+
+  return false;
+}
+
+app.post("/customer/first-sensor-readiness", async (req, res) => {
+  try {
+    if (firstSensorReadinessRateLimited(req)) {
+      res.set("Retry-After", "5");
+
+      return res.status(429).json({
+        success: false,
+        error: "Too many setup checks. Please wait a moment and try again."
+      });
+    }
+
+    if (!requireMinimumIOSAppBuildForSetupWrites(req, res)) {
+      return;
+    }
+
+    const nodeId =
+      cleanText(req.body?.nodeId);
+
+    const setupId =
+      cleanText(req.body?.setupId).toUpperCase();
+
+    if (!nodeId || !isEsp32NodeId(nodeId)) {
+      recordFirstSensorClaimFailure(req);
+
+      return res.status(400).json({
+        success: false,
+        error: "Invalid Good Shepherd sensor"
+      });
+    }
+
+    if (!/^[A-Z0-9]{6}$/.test(setupId)) {
+      recordFirstSensorClaimFailure(req);
+
+      return res.status(400).json({
+        success: false,
+        error: "The nearby sensor could not be verified"
+      });
+    }
+
+    const nodeResult =
+      await pool.query(
+        `
+        SELECT
+          n.node_id AS "nodeId",
+          n.setup_id AS "setupId",
+          n.is_archived AS "isArchived",
+          EXISTS (
+            SELECT 1
+            FROM sensors s
+            WHERE s.node_id = n.node_id
+              AND s.is_deleted = FALSE
+              AND (
+                s.resident_id IS NOT NULL
+                OR (
+                  BTRIM(COALESCE(s.resident_name, '')) <> ''
+                  AND LOWER(
+                    BTRIM(
+                      COALESCE(s.resident_name, '')
+                    )
+                  ) <> 'unassigned'
+                )
+              )
+          ) AS "sensorHasResident"
+        FROM nodes n
+        WHERE n.node_id = $1
+        LIMIT 1
+        `,
+        [nodeId]
+      );
+
+    const node =
+      nodeResult.rows[0] || null;
+
+    const registeredSetupId =
+      cleanText(node?.setupId).toUpperCase();
+
+    /*
+     * Missing node, archived node, and setup-ID mismatch deliberately
+     * share the same pending response. The readiness probe must not
+     * reveal which part of an unverified physical identity matched.
+     */
+    if (
+      !node ||
+      node.isArchived ||
+      registeredSetupId !== setupId
+    ) {
+      return res.status(200).json({
+        success: true,
+        ready: false,
+        retryAfterMs: 2000
+      });
+    }
+
+    if (node.sensorHasResident) {
+      recordFirstSensorClaimFailure(req);
+
+      return res.status(409).json({
+        success: false,
+        ready: false,
+        error: "This sensor has already been activated"
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      ready: true,
+      retryAfterMs: 0
+    });
+  } catch (error) {
+    console.error(
+      "First sensor readiness check failed:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: publicErrorMessage(
+        error,
+        "Unable to verify this sensor"
+      )
+    });
+  }
+});
+
 app.post("/customer/activate-first-sensor", async (req, res) => {
   try {
     if (firstSensorClaimRateLimited(req)) {
