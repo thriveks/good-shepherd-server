@@ -39,6 +39,7 @@ class WebhookValidationError extends Error {
 
 function createWebhookEventService({
   pool,
+  withTransaction,
   cleanText,
   normalizeJsonObject,
   normalizeWebhookEventTypeFromPayload,
@@ -62,13 +63,14 @@ function createWebhookEventService({
   let acceptedWebhookCount = 0;
 
   async function findWebhookEventByRequestFingerprint(
-    requestFingerprint
+    requestFingerprint,
+    queryable = pool
   ) {
     if (!requestFingerprint) {
       return null;
     }
 
-    const result = await pool.query(
+    const result = await queryable.query(
       `
       SELECT
         id,
@@ -175,8 +177,41 @@ function createWebhookEventService({
       fullWebhookPayload.sensorType = resolvedSensorType;
     }
 
-    if (resolvedSourceKey) {
-      const mapping = await getDeviceMapping(resolvedSourceKey);
+    const transactionResult =
+      await withTransaction(async (client) => {
+        /*
+         * Serialize identical signed webhook requests before any
+         * authoritative state writes occur. The fast pre-check above
+         * handles normal retries; this in-transaction check closes the
+         * concurrent replay window.
+         */
+        if (requestFingerprint) {
+          await client.query(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            [
+              `webhook-replay:${requestFingerprint}`
+            ]
+          );
+
+          const existingEvent =
+            await findWebhookEventByRequestFingerprint(
+              requestFingerprint,
+              client
+            );
+
+          if (existingEvent) {
+            return duplicateWebhookResult(
+              existingEvent
+            );
+          }
+        }
+
+        if (resolvedSourceKey) {
+          const mapping =
+            await getDeviceMapping(
+              resolvedSourceKey,
+              client
+            );
 
       if (mapping) {
         if (!resolvedSourceName) resolvedSourceName = mapping.sourceName;
@@ -193,13 +228,22 @@ function createWebhookEventService({
     }
 
     if (resolvedNodeId) {
-      await touchNodeFromWebhook(resolvedNodeId);
+      await touchNodeFromWebhook(
+        resolvedNodeId,
+        client
+      );
     }
 
-    const existingSensor = await getExistingSensorForDeviceIdentity({
-      sourceKey: resolvedSourceKey,
-      nodeId: resolvedNodeId
-    });
+    const existingSensor =
+      await getExistingSensorForDeviceIdentity(
+        {
+          sourceKey:
+            resolvedSourceKey,
+          nodeId:
+            resolvedNodeId
+        },
+        client
+      );
 
     const preserveServerAssignment = Boolean(
       existingSensor &&
@@ -212,7 +256,10 @@ function createWebhookEventService({
       sensorIsExplicitlyUnassigned(existingSensor);
 
     let resident = existingSensor?.residentId
-      ? await getResidentById(existingSensor.residentId)
+      ? await getResidentById(
+          existingSensor.residentId,
+          client
+        )
       : null;
 
     if (preserveUnassignedState) {
@@ -227,12 +274,19 @@ function createWebhookEventService({
       resolvedResidentName = "Unassigned";
       resolvedLocationName = "Unassigned location";
     } else {
-      resident = await findOrCreateResidentFromEvent({
-        residentName: resolvedResidentName,
-        locationName: resolvedLocationName,
-        alertLevel: resolvedAlertLevel,
-        message
-      });
+      resident =
+        await findOrCreateResidentFromEvent(
+          {
+            residentName:
+              resolvedResidentName,
+            locationName:
+              resolvedLocationName,
+            alertLevel:
+              resolvedAlertLevel,
+            message
+          },
+          client
+        );
     }
 
     const sensor = await upsertSensorFromEvent({
@@ -249,7 +303,7 @@ function createWebhookEventService({
       forceUnassigned: preserveUnassignedState,
       allowDeviceBootstrap: false,
       assignmentPayload: fullWebhookPayload
-    });
+    }, client);
 
     if (sensor && isEsp32NodeId(resolvedNodeId)) {
       resolvedSourceName = sensor.sourceName;
@@ -258,7 +312,10 @@ function createWebhookEventService({
       resident = sensor.residentId
         ? (resident?.id === sensor.residentId
             ? resident
-            : await getResidentById(sensor.residentId))
+            : await getResidentById(
+                sensor.residentId,
+                client
+              ))
         : null;
     }
 
@@ -278,8 +335,7 @@ function createWebhookEventService({
       eventPayload: fullWebhookPayload
     };
 
-    try {
-      await pool.query(
+    await client.query(
         `
         INSERT INTO webhook_events (
           id,
@@ -323,52 +379,45 @@ function createWebhookEventService({
           requestFingerprint
         ]
       );
-    } catch (error) {
-      /*
-       * The pre-check handles ordinary replay attempts.
-       * The unique index is the final concurrency barrier if two
-       * identical signed requests arrive at the same time.
-       */
-      if (
-        requestFingerprint &&
-        error?.code === "23505"
-      ) {
-        const existingEvent =
-          await findWebhookEventByRequestFingerprint(
-            requestFingerprint
-          );
-
-        if (existingEvent) {
-          return duplicateWebhookResult(
-            existingEvent
-          );
-        }
-      }
-
-      throw error;
-    }
-
-    const motionHistoryEvent = await recordMotionHistoryEvent({
-      event,
-      resident,
-      sensor
-    });
+    const motionHistoryEvent =
+      await recordMotionHistoryEvent(
+        {
+          event,
+          resident,
+          sensor
+        },
+        client
+      );
 
     if (motionHistoryEvent) {
-      setImmediate(() => {
-        incrementResidentDailyActivity({ resident, event, sensor })
-          .catch((error) => {
-            logger.error?.(
-              "Resident daily activity aggregation failed:",
-              {
-                residentId: resident?.id || null,
-                eventId: event?.id || null,
-                error: error?.message || String(error)
-              }
-            );
-          });
-      });
+      await incrementResidentDailyActivity(
+        {
+          resident,
+          event,
+          sensor
+        },
+        client
+      );
     }
+
+    return {
+      event,
+      motionHistoryEvent,
+      resident,
+      sensor
+    };
+  });
+
+    if (transactionResult.duplicate === true) {
+      return transactionResult;
+    }
+
+    const {
+      event,
+      motionHistoryEvent,
+      resident,
+      sensor
+    } = transactionResult;
 
     const shouldInvalidateCustomerAI =
       Boolean(resident?.id) &&

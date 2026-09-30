@@ -170,16 +170,26 @@ test(
 );
 
 test(
-  "webhook transaction behavior is not activated during helper plumbing",
+  "webhook ingestion activates the caller-owned transaction after plumbing",
   () => {
-    assert.doesNotMatch(
+    assert.match(
       webhookService,
-      /\bwithTransaction\b/
+      /await withTransaction\(async \(client\) =>/
     );
 
-    assert.doesNotMatch(
+    assert.match(
       webhookService,
-      /\bqueryable\b/
+      /pg_advisory_xact_lock\(hashtext\(\$1\)\)/
+    );
+
+    assert.match(
+      webhookService,
+      /findWebhookEventByRequestFingerprint\([\s\S]*requestFingerprint,[\s\S]*client/
+    );
+
+    assert.match(
+      webhookService,
+      /incrementResidentDailyActivity\([\s\S]*client/
     );
   }
 );

@@ -222,7 +222,12 @@ test(
 
     assert.match(
       service,
-      /error\?\.code === "23505"/
+      /pg_advisory_xact_lock\(hashtext\(\$1\)\)/
+    );
+
+    assert.match(
+      service,
+      /findWebhookEventByRequestFingerprint\([\s\S]*requestFingerprint,[\s\S]*client/
     );
   }
 );

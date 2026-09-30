@@ -14946,6 +14946,7 @@ app.get("/device-mappings", async (req, res) => {
 
 const webhookEventService = createWebhookEventService({
   pool,
+  withTransaction,
   cleanText,
   normalizeJsonObject,
   normalizeWebhookEventTypeFromPayload,
