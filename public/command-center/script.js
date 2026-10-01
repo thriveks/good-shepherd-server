@@ -944,7 +944,7 @@
 
 
   async function commandById(nodeId, commandId) {
-    const payload = await request(\`/sensor-commands/\${encodeURIComponent(nodeId)}\`);
+    const payload = await request(`/sensor-commands/${encodeURIComponent(nodeId)}`);
     const commands = Array.isArray(payload.commands) ? payload.commands : [];
     return commands.find((item) => clean(item.commandId) === clean(commandId)) || null;
   }
@@ -993,7 +993,7 @@
 
         if (status === "success") {
           state.commandInFlight = false;
-          const message = \`Factory reset confirmed by \${clean(sourceName, nodeId)}. The sensor is rebooting into first-use setup.\`;
+          const message = `Factory reset confirmed by ${clean(sourceName, nodeId)}. The sensor is rebooting into first-use setup.`;
           setAction(message, "success");
           showMessage(message, "success");
           await loadCommands(nodeId);
@@ -1004,7 +1004,7 @@
         if (status === "failed") {
           state.commandInFlight = false;
           const message = commandError
-            ? \`Factory reset failed: \${commandError}\`
+            ? `Factory reset failed: ${commandError}`
             : "Factory reset failed before the sensor confirmed completion.";
           setAction(message, "error");
           showMessage(message, "error");
@@ -1015,7 +1015,7 @@
         readFailures += 1;
         if (readFailures >= 3) {
           setAction(
-            \`Factory reset is still awaiting confirmation. Status checks are temporarily failing: \${error.message}\`,
+            `Factory reset is still awaiting confirmation. Status checks are temporarily failing: ${error.message}`,
             "error"
           );
         }
@@ -1093,23 +1093,23 @@
       if (fleetResultsDialog?.open) {
         el("fleetResultsTitle").textContent = "Fleet factory reset";
         el("fleetResultsSummary").textContent =
-          \`\${targets.length} queued · \${successCount} confirmed · \${failedCount} failed · \` +
-          \`\${runningCount} received · \${pendingCount} waiting\`;
+          `${targets.length} queued · ${successCount} confirmed · ${failedCount} failed · ` +
+          `${runningCount} received · ${pendingCount} waiting`;
 
         el("fleetResultsList").innerHTML = rows.map((item) => {
           const success = item.status === "success";
           const failed = item.status === "failed";
           const detail = factoryResetStatusLabel(item.status);
-          return \`<div class="fleet-result-row \${success ? "success" : failed ? "error" : ""}">
-            <strong>\${esc(item.nodeId)}</strong>
-            <span>\${esc(detail)}\${item.error ? \` · \${esc(item.error)}\` : ""}</span>
-          </div>\`;
+          return `<div class="fleet-result-row ${success ? "success" : failed ? "error" : ""}">
+            <strong>${esc(item.nodeId)}</strong>
+            <span>${esc(detail)}${item.error ? ` · ${esc(item.error)}` : ""}</span>
+          </div>`;
         }).join("");
       }
 
       if (terminalCount === targets.length) {
         showMessage(
-          \`Fleet factory reset finished: \${successCount} confirmed, \${failedCount} failed.\`,
+          `Fleet factory reset finished: ${successCount} confirmed, ${failedCount} failed.`,
           failedCount ? "error" : "success"
         );
         await loadData({ force: true });
@@ -1181,7 +1181,8 @@
           failedCount += 1;
         } else if (item.status === "running") {
           runningCount += 1;
-        } else {          pendingCount += 1;
+        } else {
+          pendingCount += 1;
         }
       });
 
@@ -2200,7 +2201,8 @@
       );
 
       showMessage(
-        `${assignmentSensor.sourceName} assigned to ${residentName}${roomName ? ` · ${roomName}` : ""}.`,        "success"
+        `${assignmentSensor.sourceName} assigned to ${residentName}${roomName ? ` · ${roomName}` : ""}.`,
+        "success"
       );
 
       state.interactionLocked = false;
