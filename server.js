@@ -7657,66 +7657,15 @@ async function prepareNodeForReconfigure(client, nodeId) {
   );
 }
 
-async function prepareNodeForFactoryReset(client, nodeId) {
-  const sensorResult = await client.query(
-    `
-    SELECT id, source_key AS "sourceKey"
-    FROM sensors
-    WHERE node_id = $1
-    FOR UPDATE
-    `,
-    [nodeId]
-  );
-
-  const sensorIds = sensorResult.rows.map((row) => row.id);
-  const sourceKeys = sensorResult.rows.map((row) => row.sourceKey).filter(Boolean);
-
-  // Keep historical events, but detach them from the installation being reset.
-  if (sensorIds.length > 0) {
-    await client.query(
-      `UPDATE motion_events SET sensor_id = NULL WHERE sensor_id = ANY($1::uuid[])`,
-      [sensorIds]
-    );
-  }
-
-  await client.query(`DELETE FROM sensors WHERE node_id = $1`, [nodeId]);
-
-  if (sourceKeys.length > 0) {
-    await client.query(
-      `DELETE FROM device_mappings WHERE source_key = ANY($1::text[])`,
-      [sourceKeys]
-    );
-  }
-
-  // Remove the old live-health/assignment picture immediately. The node itself
-  // is archived only while the factory-reset command is waiting for the ESP32.
-  await client.query(`DELETE FROM node_health WHERE node_id = $1`, [nodeId]);
-  await client.query(
-    `
-    UPDATE nodes
-    SET
-      node_name = 'Good Shepherd Local Node',
-      location_name = 'Unassigned Location',
-      status = 'Pending Setup',
-      local_ip = NULL,
-      local_config_port = NULL,
-      camera_count = 0,
-      camera_summary = '[]'::jsonb,
-      wifi_ssid = NULL,
-      wifi_rssi = NULL,
-      setup_state = 'unassigned',
-      is_archived = TRUE,
-      archived_at = NOW(),
-      archived_reason = 'Factory reset pending'
-    WHERE node_id = $1
-    `,
-    [nodeId]
-  );
-
-  await client.query(
-    `UPDATE cameras SET assigned_node_id = NULL, updated_at = NOW() WHERE assigned_node_id = $1`,
-    [nodeId]
-  );
+async function prepareNodeForFactoryReset(_client, _nodeId) {
+  // Queueing a factory reset is intentionally non-destructive.
+  //
+  // The physical ESP32 may still be waiting for its command poll, temporarily
+  // offline, or occupied by an active BLE session. Preserve the current server
+  // installation until the device itself reports factory_reset success.
+  //
+  // finalizeSuccessfulFactoryReset() owns the destructive cleanup after the
+  // physical sensor has acknowledged the reset.
 }
 
 async function finalizeSuccessfulFactoryReset(client, nodeId) {
@@ -7895,7 +7844,7 @@ async function failStaleSensorCommands(client, nodeId) {
       completed_at = NOW(),
       error = 'Expired pending sensor command'
     WHERE node_id = $1
-      AND command_type IN ('reconfigure', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable', 'high_res_capture')
+      AND command_type IN ('reconfigure', 'factory_reset', 'reboot', 'ping', 'identify', 'locate', 'update_firmware', 'high_res_enable', 'high_res_disable', 'high_res_capture')
       AND status = 'pending'
       AND (
         (command_type = 'update_firmware'
@@ -14555,10 +14504,7 @@ app.get("/sensor-commands/:nodeId/pending", async (req, res) => {
       WHERE node_id = $1
         AND status = 'pending'
         AND command_type IN ('reconfigure', 'update_firmware', 'identify', 'locate', 'ping', 'reboot', 'factory_reset', 'high_res_enable', 'high_res_disable', 'high_res_capture')
-        AND (
-          command_type = 'factory_reset'
-          OR requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
-        )
+        AND requested_at >= NOW() - ($2::int * INTERVAL '1 minute')
       ORDER BY requested_at ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
