@@ -9412,7 +9412,7 @@ app.get("/", async (req, res) => {
 
 app.get("/events", async (req, res) => {
   try {
-    if (!(await requireAuthorizedRequest(req, res))) {
+    if (!(await requireDeviceAuthorizedRequest(req, res))) {
       return;
     }
     const includeAcknowledged = parseBooleanQuery(req.query.includeAcknowledged);
