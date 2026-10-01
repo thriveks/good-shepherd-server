@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Good Shepherd Command Center</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=fleet-management-ipad-audit-20261001">
 </head>
 <body>
   <header class="topbar">
@@ -55,6 +55,31 @@
         </select>
       </label>
       <button id="expandAllButton" type="button">Expand all</button>
+      <button id="fleetModeButton" type="button">Manage fleet</button>
+      <button id="selectVisibleButton" type="button" class="hidden">Select visible</button>
+    </section>
+
+    <section id="fleetBar" class="fleet-bar hidden" aria-live="polite">
+      <div class="fleet-bar-summary">
+        <strong id="fleetCount">0 sensors selected</strong>
+        <span id="fleetSummary" class="muted"></span>
+      </div>
+      <div class="fleet-actions">
+        <button type="button" data-fleet-action="ping">Ping</button>
+        <button type="button" data-fleet-action="identify">Identify</button>
+        <button type="button" data-fleet-action="health">Health check</button>
+        <button type="button" data-fleet-action="firmware">Update firmware</button>
+        <button type="button" data-fleet-action="assign">Assign / move</button>
+        <button type="button" data-fleet-action="unassign">Unassign</button>
+        <button type="button" data-fleet-action="reboot" class="warning">Restart</button>
+        <button type="button" data-fleet-action="reconfigure" class="warning">Reconfigure</button>
+        <button type="button" data-fleet-action="cleanup">Clean queues</button>
+        <button type="button" data-fleet-action="resident-edit">Edit residents</button>
+        <button type="button" data-fleet-action="archive" class="danger">Archive</button>
+        <button type="button" data-fleet-action="restore">Restore</button>
+        <button type="button" data-fleet-action="factory" class="danger">Factory reset</button>
+        <button id="clearFleetSelectionButton" type="button">Clear selection</button>
+      </div>
     </section>
 
     <section id="messageBox" class="message hidden" role="status"></section>
@@ -64,12 +89,18 @@
         <h2 id="treeHeading">Resident → Room → Sensor</h2>
         <div id="tree" class="tree" aria-live="polite"></div>
       </div>
-      <aside>
-        <h2>Selected details and controls</h2>
+
+      <aside id="detailsPanel" class="details-panel">
+        <div class="details-panel-heading">
+          <h2>Selected details and controls</h2>
+          <button id="closeDetailsButton" type="button" class="drawer-close" aria-label="Close controls">Close</button>
+        </div>
         <div id="details" class="details muted">Select a resident, room, or sensor.</div>
       </aside>
     </section>
   </main>
+
+  <div id="detailsBackdrop" class="details-backdrop hidden" aria-hidden="true"></div>
 
   <dialog id="settingsDialog">
     <form method="dialog" class="dialog-card">
@@ -103,7 +134,6 @@
       </div>
     </form>
   </dialog>
-
 
   <dialog id="residentDialog">
     <form id="residentForm" class="dialog-card">
@@ -149,6 +179,99 @@
     </form>
   </dialog>
 
-  <script src="script.js"></script>
+  <dialog id="fleetAssignmentDialog">
+    <form id="fleetAssignmentForm" class="dialog-card">
+      <h2>Assign / move selected sensors</h2>
+      <p id="fleetAssignmentSummary" class="muted"></p>
+      <label>Resident
+        <select id="fleetAssignmentResidentSelect" required></select>
+      </label>
+      <label>Location
+        <input id="fleetAssignmentLocationInput" required>
+      </label>
+      <label>Room
+        <input id="fleetAssignmentRoomInput" placeholder="Bedroom, kitchen, room 4…">
+      </label>
+      <div id="fleetAssignmentStatus" class="dialog-status muted">Ready to save.</div>
+      <div class="dialog-actions">
+        <button id="cancelFleetAssignmentButton" type="button">Cancel</button>
+        <button id="saveFleetAssignmentButton" type="submit">Move selected sensors</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="fleetResidentDialog">
+    <form id="fleetResidentForm" class="dialog-card">
+      <h2>Update selected residents</h2>
+      <p id="fleetResidentSummary" class="muted"></p>
+
+      <label class="option-row">
+        <input id="fleetResidentApplyLocation" type="checkbox">
+        <span>Change location for all selected residents</span>
+      </label>
+      <label>New location
+        <input id="fleetResidentLocationInput" autocomplete="off" placeholder="Home, facility, office…">
+      </label>
+
+      <label class="option-row">
+        <input id="fleetResidentApplyAlert" type="checkbox">
+        <span>Change alert level for all selected residents</span>
+      </label>
+      <label>Alert level
+        <select id="fleetResidentAlertSelect">
+          <option value="Normal">Normal</option>
+          <option value="Caution">Caution</option>
+          <option value="Critical">Critical</option>
+        </select>
+      </label>
+
+      <div id="fleetResidentStatus" class="dialog-status muted">Choose the fields to update.</div>
+      <div class="dialog-actions">
+        <button id="cancelFleetResidentButton" type="button">Cancel</button>
+        <button id="saveFleetResidentButton" type="submit">Update residents</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="fleetOtaDialog">
+    <form id="fleetOtaForm" class="dialog-card wide-dialog">
+      <h2>Fleet firmware deployment</h2>
+      <div id="fleetOtaSummary"></div>
+      <div id="fleetOtaFamilies" class="ota-family-list"></div>
+
+      <label class="option-row">
+        <input id="fleetOtaIncludeOffline" type="checkbox">
+        <span>Queue updates for offline devices too</span>
+      </label>
+      <p class="muted">Offline devices may not receive the command before the server expires it. Online-only is the safer default.</p>
+
+      <div id="fleetOtaStatus" class="dialog-status muted">Ready.</div>
+      <div class="dialog-actions">
+        <button id="cancelFleetOtaButton" type="button">Cancel</button>
+        <button id="startFleetOtaButton" type="submit">Queue firmware updates</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="fleetResultsDialog" class="fleet-results-dialog">
+    <form method="dialog" class="dialog-card wide-dialog fleet-results-card">
+      <div class="dialog-title-row">
+        <h2 id="fleetResultsTitle">Fleet results</h2>
+        <button
+          id="closeFleetResultsTopButton"
+          type="button"
+          class="dialog-close-button"
+          aria-label="Close fleet results"
+          title="Close">×</button>
+      </div>
+      <div id="fleetResultsSummary" class="dialog-status muted"></div>
+      <div id="fleetResultsList" class="fleet-results"></div>
+      <div class="dialog-actions fleet-results-actions">
+        <button id="closeFleetResultsButton" type="button">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="script.js?v=factory-reset-confirmation-20261001"></script>
 </body>
 </html>
